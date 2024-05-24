@@ -89,9 +89,9 @@ enum consts {
 };
 
 /*
- * System-wide CPU utilization
+ * System-wide stats
  */
-struct sys_cpu_util {
+struct sys_stat {
 	volatile u64	last_update_clk;
 	volatile u64	util;		/* average of the CPU utilization */
 	volatile u64	load_factor;	/* system load in % (1000 = 100%) for running all runnables within a LAVD_TARGETED_LATENCY_NS */
