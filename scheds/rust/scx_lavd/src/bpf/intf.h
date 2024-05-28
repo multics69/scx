@@ -80,10 +80,16 @@ enum consts {
 	LAVD_CPU_UTIL_INTERVAL_NS	= (100 * NSEC_PER_MSEC), /* 100 msec */
 	LAVD_CPU_ID_HERE		= ((u32)-2),
 	LAVD_CPU_ID_NONE		= ((u32)-1),
+	LAVD_CPU_ID_MAX			= 16, /* TODO: should be extended */
 
 	LAVD_PREEMPT_KICK_LAT_PRIO	= 15,
 	LAVD_PREEMPT_KICK_MARGIN	= (LAVD_SLICE_MIN_NS >> 3),
 	LAVD_PREEMPT_TICK_MARGIN	= (LAVD_SLICE_MIN_NS >> 8),
+
+	LAVE_TC_PER_CORE_MAX_CTUIL	= 500, /* TODO: maximum per-core CPU utilization */
+	LAVD_TC_SYS_WIDE_MAX_CUTIL	= 500, /* TODO: maximum system-wide CPU utilization */
+	LAVD_TC_NR_OVRFLW		= 2, /* num of overflow cores */
+
 
 	LAVD_GLOBAL_DSQ			= 0,
 };
@@ -108,17 +114,18 @@ struct sys_stat {
 	volatile s64	inc1k_high;	/* increment from high LC to priority mapping */
 
 	volatile u64	avg_perf_cri;	/* average performance criticality */
+
+	volatile int	nr_active;	/* number of active cores */
 };
 
 /*
  * Per-CPU context
  */
 struct cpu_ctx {
-	volatile u64	util;		/* average of the CPU utilization */
-
 	/* 
 	 * Information used to keep track of CPU utilization
 	 */
+	volatile u64	util;		/* average of the CPU utilization */
 	volatile u64	idle_total;	/* total idle time so far */
 	volatile u64	idle_start_clk;	/* when the CPU becomes idle */
 
@@ -150,6 +157,14 @@ struct cpu_ctx {
 	volatile u16	lat_prio;	/* latency priority */
 	volatile u8	is_online;	/* is this CPU online? */
 	s32		cpu_id;		/* cpu id */
+
+	/*
+	 * Fields for core compaction
+	 *
+	 * NOTE: The followings MUST be placed at the end of this struct.
+	 */
+	struct bpf_cpumask __kptr *tmp_a_mask;	/* temporary cpu mask */
+	struct bpf_cpumask __kptr *tmp_o_mask;	/* temporary cpu mask */
 };
 
 struct task_ctx {
