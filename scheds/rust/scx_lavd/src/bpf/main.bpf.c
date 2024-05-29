@@ -916,10 +916,9 @@ static void do_core_compaction(void)
 				bpf_cpumask_set_cpu(cpu, ovrflw);
 				bpf_cpumask_clear_cpu(cpu, active);
 			}
-			scx_bpf_kick_cpu(cpu, 0); /* __COMPAT_SCX_KICK_IDLE); /* TODO */
+			scx_bpf_kick_cpu(cpu, __COMPAT_SCX_KICK_IDLE);
 		}
 		else {
-			scx_bpf_kick_cpu(cpu, 0); /* SCX_KICK_PREEMPT); /* TODO */
 clear_bits:
 			bpf_cpumask_clear_cpu(cpu, active);
 			bpf_cpumask_clear_cpu(cpu, ovrflw);
@@ -2009,10 +2008,17 @@ static s32 pick_cpu(struct task_struct *p, struct task_ctx *taskc,
 
 	/*
 	 * Finally, if the task cannot run on either active or overflow cores,
-	 * stay on the previous core. 
+	 * stay on the previous core (if it is okay) or one of its taskset.
 	 */
-	cpu_id = prev_cpu;
+	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		cpu_id = prev_cpu;
+	else
+		cpu_id = bpf_cpumask_any_distribute(p->cpus_ptr);
 
+	/*
+	 * Note that we don't need to kick the picked CPU here since the
+	 * ops.select_cpu() path internally triggers kicking cpu if necessary.
+	 */
 unlock_out:
 	bpf_rcu_read_unlock();
 	return cpu_id;
@@ -2140,7 +2146,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *active, *ovrflw, *cpumask;
 	struct task_struct *p;
-	bool out_of_active;
+	bool ret;
 
 	bpf_rcu_read_lock();
 
@@ -2164,20 +2170,46 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
-	 * If a task cannot run on the active CPU, it can be run here.
+	 * If this CPU is not either in active or overflow CPUs, it tries to
+	 * find and run a task pinned to run on this CPU.
 	 */
 	__COMPAT_DSQ_FOR_EACH(p, LAVD_GLOBAL_DSQ, 0) {
-		cpuc = get_cpu_ctx();
-		if (!cpuc) {
-			scx_bpf_error("Failed to lookup the current cpu_ctx.");
+		p = bpf_task_from_pid(p->pid);
+		if (!p)
 			goto unlock_out;
+
+		/*
+		 * If a task can run either on active or overflow CPUs,
+		 * just go on the next task.
+		 */
+		if (bpf_cpumask_intersects(cast_mask(active), p->cpus_ptr))
+			goto release_break;
+		if (bpf_cpumask_intersects(cast_mask(ovrflw), p->cpus_ptr))
+			goto release_break;
+
+		/*
+		 * Otherwise, check if the task can run on this CPU.
+		 */
+		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			ret = __COMPAT_scx_bpf_consume_task(BPF_FOR_EACH_ITER, p);
+			// debugln("     => ooa: %s[%d] at %d => %d",
+			// 		p->comm, p->pid, cpu, ret);
+			if (!ret) {
+				/*
+				 * FIXME: This should not be necessary but in
+				 * reality the above
+				 * __COMPAT_scx_bpf_consume_task never succeed.
+				 */
+				scx_bpf_consume(LAVD_GLOBAL_DSQ);
+				// goto release_continue;
+			}
 		}
 
-		out_of_active = !bpf_cpumask_intersects(cast_mask(active),
-							p->cpus_ptr);
-		if (out_of_active)
-			__COMPAT_scx_bpf_consume_task(BPF_FOR_EACH_ITER, p);
+release_break:
+		bpf_task_release(p);
 		break;
+release_continue:
+		bpf_task_release(p);
 	}
   
 unlock_out:
@@ -2514,13 +2546,11 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 		cpuc->idle_start_clk = bpf_ktime_get_ns();
 		cpuc->lat_prio = LAVD_LAT_PRIO_IDLE;
 		cpuc->stopping_tm_est_ns = LAVD_TIME_INFINITY_NS;
-		debugln("   >>>> going idle: %d", cpu);
 	}
 	/*
 	 * The CPU is exiting from the idle state.
 	 */
 	else {
-		debugln("   >>>> exiting idle: %d", cpu);
 		/*
 		 * If idle_start_clk is zero, that means entering into the idle
 		 * is not captured by the scx (i.e., the scx scheduler is
