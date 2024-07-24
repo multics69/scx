@@ -57,6 +57,10 @@ struct Opts {
     #[clap(long = "no-freq-scaling", action = clap::ArgAction::SetTrue)]
     no_freq_scaling: bool,
 
+    /// Disable preemption
+    #[clap(long = "no-preemption", action = clap::ArgAction::SetTrue)]
+    no_preemption: bool,
+
     /// The number of scheduling samples to be reported every second (default: 1)
     #[clap(short = 's', long, default_value = "1")]
     nr_sched_samples: u64,
@@ -143,6 +147,7 @@ impl<'a> Scheduler<'a> {
         skel.struct_ops.lavd_ops_mut().exit_dump_len = opts.exit_dump_len;
         skel.rodata_mut().no_core_compaction = opts.no_core_compaction;
         skel.rodata_mut().no_freq_scaling = opts.no_freq_scaling;
+        skel.rodata_mut().no_preemption = opts.no_preemption;
         skel.rodata_mut().verbose = opts.verbose;
         let intrspc = introspec::init(opts);
 

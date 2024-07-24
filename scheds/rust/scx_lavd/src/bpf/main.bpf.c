@@ -228,6 +228,7 @@ static u64		cur_svc_time;
  */
 const volatile bool	no_freq_scaling;
 const volatile bool	no_core_compaction;
+const volatile bool	no_preemption;	
 const volatile u8	verbose;
 
 UEI_DEFINE(uei);
@@ -1623,8 +1624,8 @@ static bool kick_cpu(struct cpu_ctx *victim_cpuc, u64 victim_last_kick_clk)
 	return ret;
 }
 
-static bool try_find_and_kick_victim_cpu(const struct cpumask *cpumask,
-					 struct task_ctx *taskc)
+static bool __try_find_and_kick_victim_cpu(const struct cpumask *cpumask,
+					   struct task_ctx *taskc)
 {
 	struct cpu_ctx *victim_cpuc;
 	u64 victim_last_kick_clk;
@@ -1647,9 +1648,17 @@ static bool try_find_and_kick_victim_cpu(const struct cpumask *cpumask,
 	return ret;
 }
 
-static bool try_yield_current_cpu(struct task_struct *p_run,
-				  struct cpu_ctx *cpuc_run,
-				  struct task_ctx *taskc_run)
+static bool try_find_and_kick_victim_cpu(const struct cpumask *cpumask,
+					 struct task_ctx *taskc)
+{
+	if (no_preemption)
+		return false;
+	return __try_find_and_kick_victim_cpu(cpumask, taskc);
+}
+
+static bool __try_yield_current_cpu(struct task_struct *p_run,
+				    struct cpu_ctx *cpuc_run,
+				    struct task_ctx *taskc_run)
 {
 	struct task_struct *p_wait;
 	struct task_ctx *taskc_wait;
@@ -1700,6 +1709,16 @@ static bool try_yield_current_cpu(struct task_struct *p_run,
 	bpf_rcu_read_unlock();
 
 	return ret;
+}
+
+static bool try_yield_current_cpu(struct task_struct *p_run,
+				  struct cpu_ctx *cpuc_run,
+				  struct task_ctx *taskc_run)
+{
+	if (no_preemption)
+		return false;
+
+	return __try_yield_current_cpu(p_run, cpuc_run, taskc_run);
 }
 
 static void put_global_rq(struct task_struct *p, struct task_ctx *taskc,
