@@ -294,8 +294,8 @@ impl<'a> Scheduler<'a> {
 
         if mseq % 32 == 1 {
             info!(
-                "| {:6} | {:7} | {:17} | {:5} \
-                   | {:4} | {:4} | {:12} \
+                "| {:6} | {:7} | {:17} \
+                   | {:5} | {:4} | {:4} \
                    | {:14} | {:8} | {:7} \
                    | {:8} | {:7} | {:8} \
                    | {:7} | {:9} | {:9} \
@@ -309,11 +309,10 @@ impl<'a> Scheduler<'a> {
                 "cpu",
                 "vtmc",
                 "vddln_ns",
-                "eli_ns",
                 "slc_ns",
                 "grdy_rt",
                 "lat_cri",
-                "thr_lc",
+                "avg_lc",
                 "st_prio",
                 "slc_bst",
                 "run_freq",
@@ -337,8 +336,8 @@ impl<'a> Scheduler<'a> {
         let tx_stat: &str = c_tx_st_str.to_str().unwrap();
 
         info!(
-            "| {:6} | {:7} | {:17} | {:5} \
-               | {:4} | {:4} | {:12} \
+            "| {:6} | {:7} | {:17} \
+               | {:5} | {:4} | {:4} \
                | {:14} | {:8} | {:7} \
                | {:8} | {:7} | {:8} \
                | {:7} | {:9} | {:9} \
@@ -352,11 +351,10 @@ impl<'a> Scheduler<'a> {
             tx.cpu_id,
             tc.victim_cpu,
             tc.vdeadline_delta_ns,
-            tc.eligible_delta_ns,
             tc.slice_ns,
             tc.greedy_ratio,
             tc.lat_cri,
-            tx.thr_lat_cri,
+            tx.avg_lat_cri,
             tx.static_prio,
             tc.slice_boost_prio,
             tc.run_freq,
