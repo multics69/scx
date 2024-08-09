@@ -69,10 +69,6 @@ struct Opts {
     #[clap(short = 's', long, default_value = "1")]
     nr_sched_samples: u64,
 
-    /// PID to be tracked all its scheduling activities if specified
-    #[clap(short = 'p', long, default_value = "0")]
-    pid_traced: u64,
-
     /// Exit debug dump buffer length. 0 indicates default.
     #[clap(long, default_value = "0")]
     exit_dump_len: u32,
@@ -102,9 +98,6 @@ impl introspec {
         if opts.nr_sched_samples > 0 {
             intrspc.cmd = LAVD_CMD_SCHED_N;
             intrspc.arg = opts.nr_sched_samples;
-        } else if opts.pid_traced > 0 {
-            intrspc.cmd = LAVD_CMD_PID;
-            intrspc.arg = opts.pid_traced;
         } else {
             intrspc.cmd = LAVD_CMD_NOP;
         }
