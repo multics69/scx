@@ -412,9 +412,9 @@ static bool is_lat_cri(struct task_ctx *taskc, struct sys_stat *stat_cur)
 
 static bool is_perf_cri(struct task_ctx *taskc, struct sys_stat *stat_cur)
 {
-	if (taskc->on_big && taskc->on_little)
+	if (READ_ONCE(taskc->on_big) && READ_ONCE(taskc->on_little))
 		return taskc->perf_cri >= stat_cur->avg_perf_cri;
-	return taskc->on_big;
+	return READ_ONCE(taskc->on_big);
 }
 
 static bool is_greedy(struct task_ctx *taskc)
@@ -1883,19 +1883,84 @@ static s64 pick_any_bit(u64 bitmap, u64 nr_set)
 	return -ENOENT;
 }
 
-static bool consume_task(struct cpu_ctx *cpuc)
+static bool consume_dsq(u64 dsq_id, u64 now)
 {
-	struct cpdom_ctx *cpdomc, *cpdomc_pick;
-	u64 dsq_id = cpuc->cpdom_id;
-	u64 nr_nbr;
+	struct cpdom_ctx *cpdomc;
 
 	/*
-	 * Try to consume from CPU's associated DSQ.
+	 * Update the last consume clock of the compute domain.
+	 */
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
+	if (!cpdomc) {
+		scx_bpf_error("Failed to lookup cpdom_ctx for %llu", dsq_id);
+		return false;
+	}
+	WRITE_ONCE(cpdomc->last_consume_clk, now);
+
+	/*
+	 * Try to consume a task on the associated DSQ.
 	 */
 	if (scx_bpf_consume(dsq_id)) {
 		__sync_fetch_and_add(&nr_queued_task, -1);
 		return true;
 	}
+
+	return false;
+}
+
+static bool consume_starving_task(struct cpu_ctx *cpuc, u64 now)
+{
+	struct cpdom_ctx *cpdomc;
+	u64 dsq_id = cpuc->cpdom_poll_pos;
+	u64 dl;
+	bool ret = false;
+	int i;
+
+	bpf_for(i, 0, LAVD_CPDOM_MAX_NR) {
+		dsq_id = (dsq_id + i) % LAVD_CPDOM_MAX_NR;
+
+		if (dsq_id == cpuc->cpdom_id)
+			continue;
+	
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
+		if (!cpdomc) {
+			scx_bpf_error("Failed to lookup cpdom_ctx for %llu", dsq_id);
+			goto out;
+		}
+	
+		if (cpdomc->is_active) {
+			dl = READ_ONCE(cpdomc->last_consume_clk) + LAVD_CPDOM_STARV_NS;
+			if (dl < now) {
+				ret = consume_dsq(dsq_id, now);
+			}
+			goto out;
+		}
+	}
+out:
+	cpuc->cpdom_poll_pos = (dsq_id + 1) % LAVD_CPDOM_MAX_NR;
+	return ret;
+}
+
+static bool consume_task(struct cpu_ctx *cpuc, u64 now)
+{
+	struct cpdom_ctx *cpdomc, *cpdomc_pick;
+	u64 dsq_id;
+	u64 nr_nbr;
+
+	/*
+	 * If there is a starving DSQ, try to consume it first.
+	 */
+	if (consume_starving_task(cpuc, now)) {
+		__sync_fetch_and_add(&nr_queued_task, -1);
+		return true;
+	}
+
+	/*
+	 * Try to consume from CPU's associated DSQ.
+	 */
+	dsq_id = cpuc->cpdom_id;
+	if (consume_dsq(dsq_id, now))
+		return true;
 
 	/*
 	 * If there is no task in the assssociated DSQ, traverse neighbor
@@ -1926,10 +1991,8 @@ static bool consume_task(struct cpu_ctx *cpuc)
 			if (!cpdomc_pick->is_active)
 				continue;
 	
-			if (scx_bpf_consume(dsq_id)) {
-				__sync_fetch_and_add(&nr_queued_task, -1);
+			if (consume_dsq(dsq_id, now))
 				return true;
-			}
 		}
 	}
 	
@@ -1938,6 +2001,7 @@ static bool consume_task(struct cpu_ctx *cpuc)
 
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
+	u64 now = bpf_ktime_get_ns();
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *active, *ovrflw;
 	struct task_struct *p;
@@ -1954,7 +2018,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 * If all CPUs are using, directly consume without checking CPU masks.
 	 */
 	if (use_full_cpus()) {
-		consume_task(cpuc);
+		consume_task(cpuc, now);
 		return;
 	}
 
@@ -1975,7 +2039,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	if (bpf_cpumask_test_cpu(cpu, cast_mask(active)) ||
 	    bpf_cpumask_test_cpu(cpu, cast_mask(ovrflw))) {
-		consume_task(cpuc);
+		consume_task(cpuc, now);
 		goto unlock_out;
 	}
 
@@ -1990,7 +2054,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		 * kworker, etc).
 		 */
 		if (is_kernel_task(p)) {
-			consume_task(cpuc);
+			consume_task(cpuc, now);
 			bpf_cpumask_set_cpu(cpu, ovrflw);
 			break;
 		}
@@ -2022,7 +2086,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		 * cores. We will optimize this path after introducing per-core
 		 * DSQ.
 		 */
-		consume_task(cpuc);
+		consume_task(cpuc, now);
 
 		/*
 		 * This is the first time a particular pinned user-space task
@@ -2499,8 +2563,8 @@ static void set_on_core_type(struct task_ctx *taskc,
 			break;
 	}
 
-	taskc->on_big = on_big;
-	taskc->on_little = on_little;
+	WRITE_ONCE(taskc->on_big, on_big);
+	WRITE_ONCE(taskc->on_little, on_little);
 }
 
 void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
@@ -2573,7 +2637,7 @@ s32 BPF_STRUCT_OPS(lavd_init_task, struct task_struct *p,
 	return 0;
 }
 
-static s32 init_cpdoms(void)
+static s32 init_cpdoms(u64 now)
 {
 	struct cpdom_ctx *cpdomc;
 	int err;
@@ -2587,6 +2651,7 @@ static s32 init_cpdoms(void)
 			scx_bpf_error("Failed to lookup cpdom_ctx for %d", i);
 			return -ESRCH;
 		}
+		WRITE_ONCE(cpdomc->last_consume_clk, now);
 
 		/*
 		 * Create an associated DSQ.
@@ -2733,6 +2798,7 @@ static s32 init_per_cpu_ctx(u64 now)
 		cpu_ctx_init_online(cpuc, cpu, now);
 		cpuc->capacity = get_cpuperf_cap(cpu, in_kernel_cap);
 		cpuc->offline_clk = now;
+		cpuc->cpdom_poll_pos = cpu % LAVD_CPDOM_MAX_NR;
 
 		sum_capacity += cpuc->capacity;
 	}
@@ -2816,7 +2882,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 	/*
 	 * Create compute domains.
 	 */
-	err = init_cpdoms();
+	err = init_cpdoms(now);
 	if (err)
 		return err;
 
