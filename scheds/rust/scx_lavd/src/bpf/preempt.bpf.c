@@ -279,6 +279,12 @@ static bool try_yield_current_cpu(struct task_struct *p_run,
 	bool ret = false;
 
 	/*
+	 * If a task holds a lock, never yield.
+	 */
+	if (is_lock_holder(taskc_run))
+		return false;
+
+	/*
 	 * If there is a higher priority task waiting on the global rq, the
 	 * current running task yield the CPU by shrinking its time slice to
 	 * zero.

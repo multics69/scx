@@ -1317,11 +1317,7 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p_run)
 	if (!cpuc_run || !taskc_run)
 		goto freq_out;
 
-	/*
-	 * If a task holds a lock, nver yield.
-	 */
-	if (!is_lock_holder(taskc_run))
-		preempted = try_yield_current_cpu(p_run, cpuc_run, taskc_run);
+	preempted = try_yield_current_cpu(p_run, cpuc_run, taskc_run);
 
 	/*
 	 * Update performance target of the current CPU if the current running
