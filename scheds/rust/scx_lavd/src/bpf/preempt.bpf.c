@@ -14,7 +14,7 @@ struct preemption_info {
 
 static u64 get_est_stopping_time(struct task_ctx *taskc)
 {
-	return bpf_ktime_get_ns() + taskc->run_time_ns;
+	return scx_bpf_now_ns() + taskc->run_time_ns;
 }
 
 static int comp_preemption_info(struct preemption_info *prm_a,
@@ -100,7 +100,7 @@ static struct cpu_ctx *find_victim_cpu(const struct cpumask *cpumask,
 	 * least latency critical task. Hence, we use the 'power of two random
 	 * choices' technique.
 	 */
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 	struct cpu_ctx *cpuc;
 	struct preemption_info prm_task, prm_cpus[2], *victim_cpu;
 	int cpu, nr_cpus;
