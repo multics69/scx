@@ -1991,7 +1991,7 @@ void on_wakeup(struct task_struct *p, struct task_ctx *taskc)
 void BPF_STRUCT_OPS(layered_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *taskc;
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 
 	if (!(taskc = lookup_task_ctx(p)))
 		return;
@@ -2149,6 +2149,15 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 		used = task_layer->slice_ns;
 	p->scx.dsq_vtime += used * 100 / p->scx.weight;
 	cpuc->maybe_idle = true;
+}
+
+void BPF_STRUCT_OPS(layered_quiescent, struct task_struct *p, u64 deq_flags)
+{
+	struct task_ctx *tctx;
+
+	if ((tctx = lookup_task_ctx(p)))
+		adj_load(tctx->layer, -(s64)p->scx.weight, scx_bpf_now_ns());
+>>>>>>> 64e41e61 (scheds: use scx_bpf_now_ns())
 }
 
 bool BPF_STRUCT_OPS(layered_yield, struct task_struct *from, struct task_struct *to)
@@ -2394,7 +2403,7 @@ static void dump_layer_cpumask(int id)
 
 void BPF_STRUCT_OPS(layered_dump, struct scx_dump_ctx *dctx)
 {
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 	u64 dsq_id;
 	int i, j;
 	struct layer *layer;
