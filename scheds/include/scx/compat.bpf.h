@@ -34,6 +34,11 @@
 	(bpf_ksym_exists(scx_bpf_dispatch_vtime_from_dsq) ?			\
 	 scx_bpf_dispatch_vtime_from_dsq((it), (p), (dsq_id), (enq_flags)) : false)
 
+#define scx_bpf_now_ns()							\
+	(bpf_ksym_exists(scx_bpf_now_ns) ?					\
+	 scx_bpf_now_ns() :							\
+	 bpf_ktime_get_ns())
+
 /*
  * Define sched_ext_ops. This may be expanded to define multiple variants for
  * backward compatibility. See compat.h::SCX_OPS_LOAD/ATTACH().

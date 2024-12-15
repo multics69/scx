@@ -1952,7 +1952,7 @@ void on_wakeup(struct task_struct *p, struct task_ctx *tctx)
 void BPF_STRUCT_OPS(layered_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx;
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 
 	if (!(tctx = lookup_task_ctx(p)))
 		return;
@@ -1998,7 +1998,7 @@ void BPF_STRUCT_OPS(layered_running, struct task_struct *p)
 
 	cctx->current_preempt = layer->preempt;
 	cctx->current_exclusive = layer->exclusive;
-	tctx->running_at = bpf_ktime_get_ns();
+	tctx->running_at = scx_bpf_now_ns();
 	cctx->layer_idx = tctx->layer;
 
 	/*
@@ -2044,7 +2044,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	if (!(layer = lookup_layer(lidx)) || !(costc = lookup_cpu_cost(-1)))
 		return;
 
-	used = bpf_ktime_get_ns() - tctx->running_at;
+	used = scx_bpf_now_ns() - tctx->running_at;
 	if (used < layer->min_exec_ns) {
 		lstat_inc(LSTAT_MIN_EXEC, layer, cctx);
 		lstat_add(LSTAT_MIN_EXEC_NS, layer, cctx, layer->min_exec_ns - used);
@@ -2078,7 +2078,7 @@ void BPF_STRUCT_OPS(layered_quiescent, struct task_struct *p, u64 deq_flags)
 	struct task_ctx *tctx;
 
 	if ((tctx = lookup_task_ctx(p)))
-		adj_load(tctx->layer, -(s64)p->scx.weight, bpf_ktime_get_ns());
+		adj_load(tctx->layer, -(s64)p->scx.weight, scx_bpf_now_ns());
 }
 
 bool BPF_STRUCT_OPS(layered_yield, struct task_struct *from, struct task_struct *to)
@@ -2316,7 +2316,7 @@ int dump_cost(void)
 
 void BPF_STRUCT_OPS(layered_dump, struct scx_dump_ctx *dctx)
 {
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 	u64 dsq_id;
 	int i, j, idx;
 	struct layer *layer;

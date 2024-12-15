@@ -496,7 +496,7 @@ static void update_stat_for_running(struct task_struct *p,
 {
 	struct sys_stat *stat_cur = get_sys_stat_cur();
 	u64 wait_period, interval;
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 	u64 wait_freq_ft, wake_freq_ft, perf_cri;
 
 	/*
@@ -597,7 +597,7 @@ static void update_stat_for_stopping(struct task_struct *p,
 				     struct task_ctx *taskc,
 				     struct cpu_ctx *cpuc)
 {
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 	u64 suspended_duration, task_run_time;
 
 	/*
@@ -1250,7 +1250,7 @@ static bool consume_task(s32 cpu, struct cpu_ctx *cpuc, u64 now)
 
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 	struct cpu_ctx *cpuc;
 	struct task_ctx *taskc;
 	struct bpf_cpumask *active, *ovrflw;
@@ -1264,6 +1264,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	}
 
+	#if 0
 	if (prev) {
 		taskc = get_task_ctx(prev);
 		if (!taskc) {
@@ -1277,9 +1278,12 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		 */
 		if ((prev->scx.flags & SCX_TASK_QUEUED) &&
 		    is_lock_holder(taskc)) {
-			goto lock_holder_extenstion;
+			prev->scx.slice = calc_time_slice(prev, taskc);
+			reset_lock_futex_boost(taskc, cpuc);
+			return;
 		}
 	}
+	#endif
 
 	dsq_id = cpuc->cpdom_id;
 
@@ -1390,6 +1394,7 @@ consume_out:
 	if (consume_task(cpu, cpuc, now))
 		return;
 
+	#if 0
 	/*
 	 * Reset prev task's lock and futex boost count
 	 * for a lock holder to be boosted only once.
@@ -1399,11 +1404,11 @@ consume_out:
 		 * If nothing to run, continue to run the previous task.
 		 */
 		if (prev->scx.flags & SCX_TASK_QUEUED) {
-lock_holder_extenstion:
 			prev->scx.slice = calc_time_slice(prev, taskc);
 		}
 		reset_lock_futex_boost(taskc, cpuc);
 	}
+	#endif
 }
 
 void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p_run)
@@ -1486,7 +1491,7 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Update wake frequency.
 	 */
-	now = bpf_ktime_get_ns();
+	now = scx_bpf_now_ns();
 	interval = now - waker_taskc->last_runnable_clk;
 	waker_taskc->wake_freq = calc_avg_freq(waker_taskc->wake_freq, interval);
 	waker_taskc->last_runnable_clk = now;
@@ -1548,7 +1553,7 @@ static bool slice_fully_consumed(struct cpu_ctx *cpuc, struct task_ctx *taskc)
 	 * Sanity check just to make sure the runtime is positive.
 	 */
 	if (taskc->last_stopping_clk < taskc->last_running_clk) {
-		scx_bpf_error("run_time_ns is negative: 0x%llu - 0x%llu",
+		scx_bpf_error("run_time_ns is negative: %llu - %llu",
 			      taskc->last_stopping_clk, taskc->last_running_clk);
 	}
 
@@ -1622,7 +1627,7 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	/*
 	 * When a task @p goes to sleep, its associated wait_freq is updated.
 	 */
-	now = bpf_ktime_get_ns();
+	now = scx_bpf_now_ns();
 	interval = now - taskc->last_quiescent_clk;
 	taskc->wait_freq = calc_avg_freq(taskc->wait_freq, interval);
 	taskc->last_quiescent_clk = now;
@@ -1658,7 +1663,7 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
 	 * When a cpu becomes online, reset its cpu context and trigger the
 	 * recalculation of the global cpu load.
 	 */
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 	struct cpu_ctx *cpuc;
 
 	cpuc = get_cpu_ctx_id(cpu);
@@ -1677,7 +1682,7 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
 	 * When a cpu becomes offline, trigger the recalculation of the global
 	 * cpu load.
 	 */
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 	struct cpu_ctx *cpuc;
 
 	cpuc = get_cpu_ctx_id(cpu);
@@ -1708,7 +1713,7 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 	 * The CPU is entering into the idle state.
 	 */
 	if (idle) {
-		cpuc->idle_start_clk = bpf_ktime_get_ns();
+		cpuc->idle_start_clk = scx_bpf_now_ns();
 		cpuc->lat_cri = 0;
 		cpuc->stopping_tm_est_ns = LAVD_TIME_INFINITY_NS;
 	}
@@ -1729,7 +1734,7 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 			 * timer already took the idle_time duration. Hence the
 			 * idle duration should not be accumulated.
 			 */
-			u64 duration = bpf_ktime_get_ns() - old_clk;
+			u64 duration = scx_bpf_now_ns() - old_clk;
 			bool ret = __sync_bool_compare_and_swap(
 					&cpuc->idle_start_clk, old_clk, 0);
 			if (ret)
@@ -1781,7 +1786,7 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
 static void init_task_ctx(struct task_struct *p, struct task_ctx *taskc)
 {
 	struct sys_stat *stat_cur = get_sys_stat_cur();
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 
 	memset(taskc, 0, sizeof(*taskc));
 	taskc->last_running_clk = now; /* for run_time_ns */
@@ -2077,7 +2082,7 @@ unlock_out:
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 {
-	u64 now = bpf_ktime_get_ns();
+	u64 now = scx_bpf_now_ns();
 	int err;
 
 	/*
