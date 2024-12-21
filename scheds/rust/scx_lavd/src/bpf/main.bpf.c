@@ -1145,9 +1145,7 @@ static bool consume_dsq(u64 dsq_id)
 	/*
 	 * Try to consume a task on the associated DSQ.
 	 */
-	if (scx_bpf_dsq_move_to_local(dsq_id))
-		return true;
-	return false;
+	return scx_bpf_dsq_move_to_local(dsq_id);
 }
 
 static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
@@ -1294,7 +1292,7 @@ static bool consume_task(struct cpu_ctx *cpuc)
 	 * If the current compute domain is a stealer, try to steal
 	 * a task from any of stealee domains probabilistically.
 	 */
-	if (cpdomc->is_stealer && try_to_steal_task(cpdomc))
+	if (READ_ONCE(cpdomc->is_stealer) && try_to_steal_task(cpdomc))
 		goto x_domain_migration_out;
 
 	/*
