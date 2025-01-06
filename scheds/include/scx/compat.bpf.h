@@ -34,9 +34,9 @@
 	(bpf_ksym_exists(scx_bpf_dispatch_vtime_from_dsq) ?			\
 	 scx_bpf_dispatch_vtime_from_dsq((it), (p), (dsq_id), (enq_flags)) : false)
 
-#define scx_bpf_now_ns()							\
-	(bpf_ksym_exists(scx_bpf_now_ns) ?					\
-	 scx_bpf_now_ns() :							\
+#define scx_bpf_now()								\
+	(bpf_ksym_exists(scx_bpf_now) ?						\
+	 scx_bpf_now() :							\
 	 bpf_ktime_get_ns())
 
 /*
