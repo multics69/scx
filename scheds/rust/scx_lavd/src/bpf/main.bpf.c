@@ -1046,6 +1046,9 @@ static bool try_kick_task_idle_cpu(struct task_struct *p,
 static bool can_direct_dispatch(struct task_struct *p, u64 enq_flags,
 				s32 prev_cpu)
 {
+#pragma push_macro("SCX_ENQ_CPU_SELECTED")
+#undef SCX_ENQ_CPU_SELECTED
+
 	/*
 	 * If a task is re-enqueued since the prev_cpu is taken by a higher
 	 * scheduling class (e.g., RT), directly dispatching to the prev_cpu
@@ -1070,6 +1073,8 @@ static bool can_direct_dispatch(struct task_struct *p, u64 enq_flags,
 	}
 
 	return false;
+
+#pragma pop_macro("SCX_ENQ_CPU_SELECTED")
 }
 
 void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
