@@ -1330,9 +1330,10 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct cpu_ctx *cpuc;
 	struct task_ctx *taskc;
-	struct bpf_cpumask *active, *ovrflw;
+	struct bpf_cpumask *active, *ovrflw, *cpdom_mask, *new_mask;
 	struct task_struct *p;
 	u64 dsq_id;
+	s32 new_cpu;
 	bool try_consume = false;
 
 	cpuc = get_cpu_ctx_id(cpu);
@@ -1371,7 +1372,9 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 
 	active = active_cpumask;
 	ovrflw = ovrflw_cpumask;
-	if (!active || !ovrflw) {
+	cpdom_mask = MEMBER_VPTR(cpdom_cpumask, [cpuc->cpdom_id]);
+	new_mask = cpuc->tmp_t_mask;
+	if (!active || !ovrflw || !cpdom_mask || !new_mask) {
 		scx_bpf_error("Failed to prepare cpumasks.");
 		goto unlock_out;
 	}
@@ -1414,22 +1417,43 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 			break;
 
 		/*
-		 * If a task can run on this CPU but not on either active
-		 * or overflow set, extend the overflow set and go.
+		 * If the task can run on either the active or overflow set,
+		 * try another task.
 		 */
-		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
-		    !bpf_cpumask_intersects(cast_mask(active), p->cpus_ptr) &&
-		    !bpf_cpumask_intersects(cast_mask(ovrflw), p->cpus_ptr)) {
+		if(bpf_cpumask_intersects(cast_mask(active), p->cpus_ptr) ||
+		   bpf_cpumask_intersects(cast_mask(ovrflw), p->cpus_ptr)) {
+			bpf_task_release(p);
+			continue;
+		}
+
+		/*
+		 * Now, we know that the task cannot run on either the
+		 * active or overflow set. Then, let's consider to extend
+		 * the overflow set.
+		 */
+		if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			/*
+			 * Luckily, if the task can run on this CPU,
+			 * extend the overflow set and go.
+			 */
 			bpf_cpumask_set_cpu(cpu, ovrflw);
 			bpf_task_release(p);
 			try_consume = true;
 			break;
+		} else {
+			/*
+			 * Otherwise, choose an arbitrary CPU in this compute
+			 * domain as a new overflow CPU. Then, continue to look
+			 * for my own task.
+			 */
+			bpf_cpumask_and(new_mask,
+					p->cpus_ptr, cast_mask(cpdom_mask));
+			new_cpu = bpf_cpumask_any_distribute(new_mask);
+			if (new_cpu < nr_cpu_ids &&
+			    !bpf_cpumask_test_and_set_cpu(new_cpu, ovrflw))
+				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
+			bpf_task_release(p);
 		}
-
-		/*
-		 * Otherwise, try another task.
-		 */
-		bpf_task_release(p);
 	}
 
 unlock_out:

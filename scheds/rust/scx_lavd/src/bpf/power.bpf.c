@@ -87,15 +87,26 @@ static bool clear_cpu_periodically(u32 cpu, struct bpf_cpumask *cpumask)
 	return clear;
 }
 
+static const volatile u16 *get_cpu_order(void)
+{
+	/*
+	 * Decide a cpuorder to use according to its power mode.
+	 */
+	if (is_powersave_mode)
+		return cpu_order_powersave;
+	else
+		return cpu_order_performance;
+}
+
 static void do_core_compaction(void)
 {
 	struct sys_stat *stat_cur = get_sys_stat_cur();
+	const volatile u16 *cpu_order = get_cpu_order();
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *active, *ovrflw;
 	int nr_cpus, nr_active, nr_active_old, cpu, i;
 	u32 sum_capacity = 0, big_capacity = 0;
 	bool clear;
-	const volatile u16 *cpu_order;
 
 	bpf_rcu_read_lock();
 
@@ -108,14 +119,6 @@ static void do_core_compaction(void)
 		scx_bpf_error("Failed to prepare cpumasks.");
 		goto unlock_out;
 	}
-
-	/*
-	 * Decide a cpuorder to use according to its power mode.
-	 */
-	if (is_powersave_mode)
-		cpu_order = cpu_order_powersave;
-	else
-		cpu_order = cpu_order_performance;
 
 	/*
 	 * Assign active and overflow cores
