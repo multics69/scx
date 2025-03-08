@@ -710,6 +710,77 @@ s32 find_idle_cpu_in(struct bpf_cpumask *cpumask,
 }
 
 static __always_inline
+s32 find_idle_cpu2(struct task_struct *p, struct task_ctx *taskc, s32 prev_cpu,
+		  u64 wake_flags, bool reserve_cpu, bool *found_idle)
+{
+	struct sys_stat *stat_cur = get_sys_stat_cur();
+
+	/*
+	 * TODO: +40mins
+	 *
+	 * - idle mask = system-wide idle mask
+	 *
+	 * - DETERMINE sticky_cpu and sticky domain
+	 *	- For sync wake-up
+	 *		- If the wakee's cpu type matches and can run @p,
+	 *		  keep the wakee cpu as a candidate.
+	 *	- For all cases,
+	 *		- If the previous cpus matches in type and can run @p,
+	 *		  keep the previous cpu as a candidate.
+	 *
+	 *	- CASE 1. We have two candiates.
+	 *		- Chose the less loaded cpu and compute domain.
+	 *	- CASE 2. We have one candidate.
+	 *		- Choose the one.
+	 *	- CASE 3. We have no candidate.
+	 *		- Randomly choose two CPUs in the active set,
+	 *		  which mateches @p's type and can run @p. 
+	 *		- Choose a less loaded CPU and compute domain.
+	 *		- If the loads are the same, prefer the wakee's cpu.
+	 *	- ASSERT: @p can run on the stickt cpu
+	 *
+	 * - CHECK the sticky cpu
+	 *	- if the sticky cpu is idle and belongs to
+	 *	  either active or overflow sets, choose the sticky cpu and go.
+	 *
+	 * - CHECK the sticky compute domain 
+	 * - for sticky compute domain
+	 *      - my_cpdom = compute domain ∩ p->cpus_ptr
+	 *      - if my_cpdom ∩ idle mask is empty, skip this.
+	 *
+	 *	- (if big) turbo	∩ my_cpdom
+	 *	- active		∩ my_cpdom
+	 *	- overflow		∩ my_cpdom
+	 *	- the rest		∩ my_cpdom
+	 *		- if there is an idle cpu,
+	 *		  add the chosen idle cpu to the overflow set and go.
+	 *
+	 * - CHECK the neighbor domains of the sticky cpu
+	 * - for each neighbor compute domain in a distance order
+	 *   within a domain, traverse in a random order
+	 *      - my_cpdom = compute domain ∩ p->cpus_ptr
+	 *      - if my_cpdom ∩ idle mask is empty, skip this.
+	 *
+	 *	- (if big) turbo	∩ my_cpdom
+	 *	- active		∩ my_cpdom
+	 *	- overflow		∩ my_cpdom
+	 *	- the rest		∩ my_cpdom
+	 *		- if there is an idle cpu,
+	 *		  add the chosen idle cpu to the overflow set and go.
+	 *
+	 * - NO CPU is chosen so far, meaning no idle 
+	 *
+	 * - !!! cannot run on either active or overflow set?
+	 * - !!! fast path for no reserve idle?
+	 * - !!! temporal stickiness to reduce the cpdom migration?
+	 * - !!! no idle cpu?
+	 */
+
+	return prev_cpu;
+}
+
+
+static __always_inline
 s32 find_idle_cpu(struct task_struct *p, struct task_ctx *taskc, s32 prev_cpu,
 		  u64 wake_flags, bool reserve_cpu, bool *is_idle)
 {
