@@ -718,7 +718,6 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	u64 dsq_id;
 	s32 cpu_id;
 	struct pick_ctx ictx = {
-		.p = p,
 		.taskc = taskc,
 		.prev_cpu = prev_cpu,
 		.wake_flags = wake_flags,
@@ -732,7 +731,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * Find an idle cpu and reserve it since the task @p will run
 	 * on the idle cpu.
 	 */
-	cpu_id = pick_idle_cpu(&ictx, &found_idle);
+	cpu_id = pick_idle_cpu(&ictx, p, &found_idle);
 	if (found_idle) {
 		/*
 		 * If there is an idle cpu and its associated DSQ is empty,
