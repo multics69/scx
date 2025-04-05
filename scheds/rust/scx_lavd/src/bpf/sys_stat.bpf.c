@@ -30,7 +30,6 @@ struct sys_stat_ctx {
 	u64		duration_total;
 	u64		idle_total;
 	u64		compute_total;
-	u64		tot_svc_time;
 	u64		nr_queued_task;
 	s32		max_lat_cri;
 	s32		avg_lat_cri;
@@ -131,12 +130,6 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 			c->compute_total = 0;
 			break;
 		}
-
-		/*
-		 * Accumulate cpus' loads.
-		 */
-		c->tot_svc_time += cpuc->tot_svc_time;
-		cpuc->tot_svc_time = 0;
 
 		/*
 		 * Accumulate statistics.
@@ -265,7 +258,6 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 static void update_sys_stat_next(struct sys_stat_ctx *c)
 {
 	static int cnt = 0;
-	u64 avg_svc_time = 0;
 
 	/*
 	 * Update the CPU utilization to the next version.
@@ -298,11 +290,6 @@ static void update_sys_stat_next(struct sys_stat_ctx *c)
 
 	stat_next->nr_violation =
 		calc_avg32(stat_cur->nr_violation, c->nr_violation);
-
-	if (c->nr_sched > 0)
-		avg_svc_time = c->tot_svc_time / c->nr_sched;
-	stat_next->avg_svc_time =
-		calc_avg(stat_cur->avg_svc_time, avg_svc_time);
 
 	stat_next->nr_queued_task =
 		calc_avg(stat_cur->nr_queued_task, c->nr_queued_task);
