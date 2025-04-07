@@ -710,7 +710,7 @@ impl<'a> Scheduler<'a> {
         let c_tx_cm_str: &CStr = unsafe { CStr::from_ptr(c_tx_cm) };
         let tx_comm: &str = c_tx_cm_str.to_str().unwrap();
 
-        let c_tx_st: *const c_char = (&tx.stat as *const [c_char; 5]) as *const c_char;
+        let c_tx_st: *const c_char = (&tx.stat as *const [c_char; 4]) as *const c_char;
         let c_tx_st_str: &CStr = unsafe { CStr::from_ptr(c_tx_st) };
         let tx_stat: &str = c_tx_st_str.to_str().unwrap();
 

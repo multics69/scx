@@ -28,7 +28,6 @@ struct sys_stat_ctx {
 	u64		duration_total;
 	u64		idle_total;
 	u64		compute_total;
-	u64		tot_svc_time;
 	u64		nr_queued_task;
 	s32		max_lat_cri;
 	s32		avg_lat_cri;
@@ -127,12 +126,6 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 			c->compute_total = 0;
 			break;
 		}
-
-		/*
-		 * Accumulate cpus' loads.
-		 */
-		c->tot_svc_time += cpuc->tot_svc_time;
-		cpuc->tot_svc_time = 0;
 
 		/*
 		 * Accumulate statistics.
@@ -240,7 +233,7 @@ static u32 clamp_time_slice_ns(u32 slice)
 static void calc_sys_stat(struct sys_stat_ctx *c)
 {
 	static int cnt = 0;
-	u64 avg_svc_time = 0, nr_queued, slice;
+	u64 nr_queued, slice;
 
 	c->duration_total = c->duration * nr_cpus_onln;
 	if (c->duration_total > c->idle_total)
@@ -288,12 +281,7 @@ static void calc_sys_stat(struct sys_stat_ctx *c)
 	}
 
 	sys_stat.nr_stealee = c->nr_stealee;
-
 	sys_stat.nr_violation = calc_avg32(sys_stat.nr_violation, c->nr_violation);
-
-	if (c->nr_sched > 0)
-		avg_svc_time = c->tot_svc_time / c->nr_sched;
-	sys_stat.avg_svc_time = calc_avg(sys_stat.avg_svc_time, avg_svc_time);
 	sys_stat.nr_queued_task = calc_avg(sys_stat.nr_queued_task, c->nr_queued_task);
 
 	/*

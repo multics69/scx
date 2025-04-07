@@ -53,10 +53,9 @@ enum {
 	LAVD_CPDOM_MAX_NR		= 16, /* maximum number of compute domain */
 	LAVD_CPDOM_MAX_DIST		= 4,  /* maximum distance from one compute domain to another */
 
-	LAVD_STATUS_STR_LEN		= 4, /* {LR: Latency-critical, Regular}
+	LAVD_STATUS_STR_LEN		= 3, /* {LR: Latency-critical, Regular}
 						{HI: performance-Hungry, performance-Insensitive}
-						{BT: Big, liTtle}
-						{EG: Eligible, Greedy} */
+						{BT: Big, liTtle} */
 };
 
 /*
@@ -65,7 +64,6 @@ enum {
 struct sys_stat {
 	u64	last_update_clk;
 	u64	util;		/* average of the CPU utilization */
-
 	u64	avg_svc_time;	/* average service time per task */
 	u64	nr_queued_task;
 	u64	slice;		/* base time slice */
@@ -112,7 +110,6 @@ struct task_ctx {
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
 	u64	wake_freq;		/* waking-up frequency in a second */
-	u64	svc_time;		/* total CPU time consumed for this task */
 	u64	dsq_id;			/* DSQ id where a task run for statistics */
 
 	/*
@@ -123,7 +120,6 @@ struct task_ctx {
 	u32	perf_cri;		/* performance criticality of a task */
 	u32	slice_ns;		/* time slice */
 	s8	futex_boost;		/* futex acquired or not */
-	u8	is_greedy;		/* task's overscheduling ratio compared to its nice priority */
 	u8	need_lock_boost;	/* need to boost lock for deadline calculation */
 	u8	lock_holder_xted;	/* slice is already extended for a lock holder task */
 	u8	wakeup_ft;		/* regular wakeup = 1, sync wakeup = 2 */

@@ -228,9 +228,10 @@ static bool try_find_and_kick_victim_cpu(struct task_struct *p,
 	u64 now;
 
 	/*
-	 * Don't even try to perform expensive preemption for greedy tasks.
+	 * First check if it is worth to try to kick other CPU
+	 * at the expense of IPI.
 	 */
-	if (!is_eligible(taskc))
+	if (!is_worth_kick_other_task(taskc))
 		return false;
 
 	/*
