@@ -192,15 +192,10 @@
 char _license[] SEC("license") = "GPL";
 
 /*
- * Logical current clock
+ * Current global vruntime.
  */
-static u64		cur_logical_clk;
-
-/*
- * Current service time
- */
-static u64		cur_svc_time;
-
+static u64 vruntime_now __attribute__((aligned(CACHELINE_SIZE)))
+			= LAVD_TARGETED_LATENCY_NS;
 
 /*
  * The minimum and maximum of time slice
@@ -219,43 +214,6 @@ const volatile u64	slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
 #include "lock.bpf.c"
 #include "idle.bpf.c"
 #include "balance.bpf.c"
-
-static u32 calc_greedy_ratio(struct task_ctx *taskc)
-{
-	u32 ratio;
-
-	if (!have_scheduled(taskc)) {
-		ratio = LAVD_GREEDY_RATIO_NEW;
-		goto out;
-	}
-
-	/*
-	 * The greedy ratio of a task represents how much time the task
-	 * overspent CPU time compared to the ideal, fair CPU allocation. It is
-	 * the ratio of task's actual service time to average service time in a
-	 * system.
-	 */
-	ratio = (1000 * taskc->svc_time) / sys_stat.avg_svc_time;
-
-out:
-	taskc->is_greedy = ratio > 1000;
-	return ratio;
-}
-
-static u32 calc_greedy_factor(u32 greedy_ratio)
-{
-	/*
-	 * For all under-utilized tasks, we treat them equally.
-	 */
-	if (greedy_ratio <= 1000)
-		return 1000;
-
-	/*
-	 * For over-utilized tasks, we give some mild penalty.
-	 */
-	return 1000 + ((greedy_ratio - 1000) / LAVD_LC_GREEDY_PENALTY);
-
-}
 
 static u64 calc_runtime_factor(u64 runtime, u64 weight_ft)
 {
@@ -405,35 +363,41 @@ static u64 calc_adjusted_runtime(struct task_ctx *taskc)
 	 * (acc_runtime) task. To avoid the starvation of CPU-bound tasks,
 	 * which rarely sleep, limit the impact of acc_runtime.
 	 */
-	runtime = taskc->avg_runtime +
-		  min(taskc->acc_runtime, LAVD_ACC_RUNTIME_MAX);
-
-	/*
-	 * Convert highly skewed runtime distribution to
-	 * mildly skewed distribution.
-	 */
-	u64 adj_runtime = log2_u64(runtime + 1);
-	return adj_runtime * adj_runtime;
+	runtime = 100 * (taskc->avg_runtime +
+			 min(taskc->acc_runtime, LAVD_ACC_RUNTIME_MAX)) / 2;
+	return runtime;
 }
 
-static u64 calc_virtual_deadline_delta(struct task_struct *p,
-				       struct task_ctx *taskc)
+static u64 calc_deadline(struct task_struct *p, struct task_ctx *taskc)
 {
-	u64 deadline, adjusted_runtime;
-	u32 greedy_ratio, greedy_ft;
+	u64 vruntime_min, base, aruntime, deadline;
 
 	/*
-	 * Calculate the deadline based on runtime,
-	 * latency criticality, and greedy ratio.
+	 * Calculate the task's deadline based on the following four factors:
+	 *   1) Task's total vruntime executed:
+	 *      We limit the maximum difference of the task's total vruntime
+	 *      to LAVD_TARGETED_LATENCY_NS to avoid excessive prioritization
+	 *      of mostly sleeping tasks. This enforces the fairnes within
+	 *      LAVD_TARGETED_LATENCY_NS.
+	 *   2) Task's average running time:
+	 *      This prioritizes a short-running task.
+	 *   3) Task's accumulated running time since wake-up:
+	 *      This prioritizes a recently woken-up task.
+	 *   4) Task's latency criticality:
+	 *      This prioritizes a task in the task chain (wake/blocking
+	 *      frequency) with more contextual hints (e.g., affinitized task).
 	 */
 	calc_perf_cri(p, taskc);
 	calc_lat_cri(p, taskc);
-	greedy_ratio = calc_greedy_ratio(taskc);
-	greedy_ft = calc_greedy_factor(greedy_ratio);
-	adjusted_runtime = calc_adjusted_runtime(taskc);
 
-	deadline = (adjusted_runtime * greedy_ft) / taskc->lat_cri;
+	vruntime_min = vruntime_now - LAVD_TARGETED_LATENCY_NS;
+	if (time_before(p->scx.dsq_vtime, vruntime_min))
+		base = vruntime_min;
+	else
+		base = p->scx.dsq_vtime;
 
+	aruntime = calc_adjusted_runtime(taskc);
+	deadline = base + (aruntime / taskc->lat_cri);
 	return deadline;
 }
 
@@ -494,41 +458,6 @@ static u64 get_suspended_duration_and_reset(struct cpu_ctx *cpuc)
 	return duration;
 }
 
-static void advance_cur_logical_clk(struct task_struct *p)
-{
-	u64 vlc, clc, ret_clc;
-	u64 nr_queued, delta, new_clk;
-	int i;
-
-	vlc = READ_ONCE(p->scx.dsq_vtime);
-	clc = READ_ONCE(cur_logical_clk);
-
-	bpf_for(i, 0, LAVD_MAX_RETRY) {
-		/*
-		 * The clock should not go backward, so do nothing.
-		 */
-		if (vlc <= clc)
-			return;
-
-		/*
-		 * Advance the clock up to the task's deadline. When overloaded,
-		 * advance the clock slower so other can jump in the run queue.
-		 */
-		nr_queued = max(sys_stat.nr_queued_task, 1);
-		delta = (vlc - clc) / nr_queued;
-		new_clk = clc + delta;
-
-		ret_clc = __sync_val_compare_and_swap(&cur_logical_clk, clc, new_clk);
-		if (ret_clc == clc) /* CAS success */
-			return;
-
-		/*
-		 * Retry with the updated clc
-		 */
-		clc = ret_clc;
-	}
-}
-
 static void update_stat_for_running(struct task_struct *p,
 				    struct task_ctx *taskc,
 				    struct cpu_ctx *cpuc, u64 now)
@@ -545,14 +474,15 @@ static void update_stat_for_running(struct task_struct *p,
 	 * is not turned on.
 	 */
 	if (p->scx.slice == SCX_SLICE_DFL) {
-		p->scx.dsq_vtime = READ_ONCE(cur_logical_clk);
+		p->scx.dsq_vtime = vruntime_now;
 		p->scx.slice = calc_time_slice(taskc);
 	}
 
 	/*
-	 * Update the current logical clock.
+	 * Advance the global vruntime. It is racy but don't care.
 	 */
-	advance_cur_logical_clk(p);
+	if (time_before(vruntime_now, p->scx.dsq_vtime))
+		vruntime_now = p->scx.dsq_vtime;
 
 	/*
 	 * Since this is the start of a new schedule for @p, we update run
@@ -639,8 +569,7 @@ static void update_stat_for_stopping(struct task_struct *p,
 	taskc->acc_runtime += task_runtime;
 	taskc->avg_runtime = calc_avg(taskc->avg_runtime, taskc->acc_runtime);
 	taskc->last_stopping_clk = now;
-
-	taskc->svc_time += task_runtime / p->scx.weight;
+	p->scx.dsq_vtime += scale_by_task_weight_inverse(p, task_runtime);
 
 	/*
 	 * Count how many times a task completely consumed the assigned time
@@ -663,34 +592,11 @@ static void update_stat_for_stopping(struct task_struct *p,
 	taskc->lat_cri_waker = 0;
 
 	/*
-	 * Increase total service time of this CPU.
-	 */
-	cpuc->tot_svc_time += taskc->svc_time;
-
-	/*
-	 * Update the current service time if necessary.
-	 */
-	if (READ_ONCE(cur_svc_time) < taskc->svc_time)
-		WRITE_ONCE(cur_svc_time, taskc->svc_time);
-
-	/*
 	 * Reset task's lock and futex boost count
 	 * for a lock holder to be boosted only once.
 	 */
 	reset_lock_futex_boost(taskc, cpuc);
 	taskc->lock_holder_xted = false;
-}
-
-static u64 calc_when_to_run(struct task_struct *p, struct task_ctx *taskc)
-{
-	u64 deadline_delta;
-
-	/*
-	 * Before enqueueing a task to a run queue, we should decide when a
-	 * task should be scheduled.
-	 */
-	deadline_delta = calc_virtual_deadline_delta(p, taskc);
-	return READ_ONCE(cur_logical_clk) + deadline_delta;
 }
 
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -730,7 +636,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		dsq_id = cpuc->cpdom_id;
 
 		if (!scx_bpf_dsq_nr_queued(dsq_id)) {
-			p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+			p->scx.dsq_vtime = calc_deadline(p, taskc);
 			p->scx.slice = calc_time_slice(taskc);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
 			return cpu_id;
@@ -769,7 +675,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Calculate when a task can be scheduled for how long.
 	 */
 	taskc->wakeup_ft += !!(enq_flags & SCX_ENQ_WAKEUP);
-	p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+	p->scx.dsq_vtime = calc_deadline(p, taskc);
 	p->scx.slice = calc_time_slice(taskc);
 
 	/*
@@ -1096,11 +1002,6 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	update_stat_for_running(p, taskc, cpuc, now);
 
 	/*
-	 * Calculate the task's time slice.
-	 */
-	p->scx.slice = calc_time_slice(taskc);
-
-	/*
 	 * Calculate the task's CPU performance target and update if the new
 	 * target is higher than the current one. The CPU's performance target
 	 * urgently increases according to task's target but it decreases
@@ -1347,30 +1248,20 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 
 void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
 {
-	struct task_ctx *taskc;
-
 	/*
-	 * Set task's service time to the current, minimum service time.
+	 * Initialize the task's vruntime to the current global vruntime.
 	 */
-	taskc = get_task_ctx(p);
-	if (!taskc) {
-		scx_bpf_error("task_ctx_stor first lookup failed");
-		return;
-	}
-
-	taskc->svc_time = READ_ONCE(cur_svc_time);
+	p->scx.dsq_vtime = vruntime_now;
 }
 
 static void init_task_ctx(struct task_struct *p, struct task_ctx *taskc)
 {
 	u64 now = scx_bpf_now();
 
-	__builtin_memset(taskc, 0, sizeof(*taskc));
 	taskc->is_affinitized = bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids;
 	taskc->last_running_clk = now; /* for avg_runtime */
 	taskc->last_stopping_clk = now; /* for avg_runtime */
 	taskc->avg_runtime = slice_max_ns;
-	taskc->svc_time = sys_stat.avg_svc_time * LAVD_NEW_PROC_PENALITY;
 
 	set_on_core_type(taskc, p->cpus_ptr);
 }
@@ -1717,13 +1608,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 	 * Initialize the low cpu watermark for autopilot mode.
 	 */
 	init_autopilot_low_util();
-
-	/*
-	 * Initilize the current logical clock and service time.
-	 */
-	WRITE_ONCE(cur_logical_clk, 0);
-	WRITE_ONCE(cur_svc_time, 0);
-
 	return err;
 }
 

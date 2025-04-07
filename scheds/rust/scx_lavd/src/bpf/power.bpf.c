@@ -303,7 +303,7 @@ static int do_autopilot(void)
 		return do_set_power_profile(LAVD_PM_POWERSAVE, sys_stat.util);
 
 	/*
-	 * If the CPU utiulization is moderate (say > 5%, <= 30%), we run the
+	 * If the CPU utiulization is moderate (say > 5%, <= 70%), we run the
 	 * scheduler in balanced mode. Actually, balanced mode can save energy
 	 * consumption only under moderate CPU load.
 	 */

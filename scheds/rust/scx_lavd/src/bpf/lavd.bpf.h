@@ -27,8 +27,7 @@ enum consts_internal  {
 	LAVD_LC_FREQ_MAX		= 1000000,
 	LAVD_LC_RUNTIME_MAX		= LAVD_TIME_ONE_SEC,
 	LAVD_LC_WEIGHT_BOOST		= 128, /* 2^7 */
-	LAVD_LC_GREEDY_PENALTY		= 20,  /* 20% */
-	LAVD_LC_FREQ_OVER_RUNTIME	= 100,  /* 100x */
+	LAVD_LC_FREQ_OVER_RUNTIME       = 100,  /* 100x */
 
 	LAVD_SLICE_BOOST_MAX_FT		= 3, /* maximum additional 3x of slice */
 	LAVD_SLICE_BOOST_MAX_STEP	= 6, /* 6 slice exhausitions in a row */
@@ -91,11 +90,6 @@ struct cpu_ctx {
 	volatile u32	cur_util;	/* CPU utilization of the current interval */
 	volatile u64	idle_total;	/* total idle time so far */
 	volatile u64	idle_start_clk;	/* when the CPU becomes idle */
-
-	/*
-	 * Information used to keep track of load
-	 */
-	volatile u64	tot_svc_time;	/* total service time on a CPU */
 
 	/*
 	 * Information used to keep track of latency criticality
