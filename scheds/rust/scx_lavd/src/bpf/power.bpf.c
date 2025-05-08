@@ -173,9 +173,15 @@ static void do_core_compaction(void)
 			bpf_cpumask_set_cpu(cpu, active);
 			bpf_cpumask_clear_cpu(cpu, ovrflw);
 
+			/*
+			 * Accumulate the capacity of active CPUs and
+			 * turn on the is_active flag.
+			 */
 			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpu]);
-			if (cpdomc)
+			if (cpdomc) {
+				cpdomc->cap_sum_temp += cpuc->capacity;
 				WRITE_ONCE(cpdomc->is_active, true);
+			}
 			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
 			/*
@@ -213,19 +219,17 @@ static void do_core_compaction(void)
 	sys_stat.nr_active = nr_active;
 
 	/*
-	 * Maintain cpdomc->is_active reflecting the active set.
+	 * Update the sum of capacity for active CPUs in this domain.
 	 */
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
 			break;
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-		cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
-		if (!cpdomc || !cd_cpumask || !cpdomc->is_active)
+		if (!cpdomc)
 			continue;
-
-		if (!bpf_cpumask_intersects(cast_mask(active), cast_mask(cd_cpumask)))
-			WRITE_ONCE(cpdomc->is_active, false);
+		WRITE_ONCE(cpdomc->cap_sum_active_cpus, cpdomc->cap_sum_temp);
+		WRITE_ONCE(cpdomc->cap_sum_temp, 0);
 	}
 
 unlock_out:
@@ -446,21 +450,41 @@ static int reinit_active_cpumask_for_performance(void)
 	if (have_little_core) {
 		bpf_for(cpu, 0, nr_cpu_ids) {
 			cpuc = get_cpu_ctx_id(cpu);
-			if (!cpuc) {
-				err = -ESRCH;
-				goto unlock_out;
+			if (!cpuc)
+				continue;
+			if (!cpuc->is_online) {
+				bpf_cpumask_clear_cpu(cpu, active);
+				bpf_cpumask_clear_cpu(cpu, ovrflw);
+				continue;
 			}
 
 			if (cpuc->big_core) {
 				bpf_cpumask_set_cpu(cpu, active);
 				bpf_cpumask_clear_cpu(cpu, ovrflw);
-			}
-			else {
+			} else {
 				bpf_cpumask_set_cpu(cpu, ovrflw);
 				bpf_cpumask_clear_cpu(cpu, active);
 			}
+
+			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpu]);
+			if (cpdomc) {
+				cpdomc->cap_sum_temp += cpuc->capacity;
+				WRITE_ONCE(cpdomc->is_active, true);
+			}
 		}
 	} else {
+		bpf_for(cpu, 0, nr_cpu_ids) {
+			cpuc = get_cpu_ctx_id(cpu);
+			if (!cpuc || !cpuc->is_online)
+				continue;
+
+			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpu]);
+			if (cpdomc) {
+				cpdomc->cap_sum_temp += cpuc->capacity;
+				WRITE_ONCE(cpdomc->is_active, true);
+			}
+		}
+
 		online_cpumask = scx_bpf_get_online_cpumask();
 		nr_cpus_onln = bpf_cpumask_weight(online_cpumask);
 		bpf_cpumask_copy(active, online_cpumask);
@@ -470,14 +494,15 @@ static int reinit_active_cpumask_for_performance(void)
 	}
 
 	/*
-	 * Make all compute domains active.
+	 * Update cap_sum_active_cpus.
 	 */
 	bpf_for(dsq_id, 0, nr_cpdoms) {
 		if (dsq_id >= LAVD_CPDOM_MAX_NR)
 			break;
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
-		cpdomc->is_active = true;
+		WRITE_ONCE(cpdomc->cap_sum_active_cpus, cpdomc->cap_sum_temp);
+		WRITE_ONCE(cpdomc->cap_sum_temp, 0);
 	}
 	sys_stat.nr_active = nr_cpus_onln;
 
