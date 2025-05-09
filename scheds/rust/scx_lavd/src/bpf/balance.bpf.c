@@ -7,37 +7,54 @@
 /*
  * To be included to the main.bpf.c
  */
+
 static void plan_x_cpdom_migration(void)
 {
 	struct cpdom_ctx *cpdomc;
 	u64 dsq_id;
-	u32 avg_nr_q_tasks_per_cpu = 0, x_mig_delta;
 	u32 stealer_threshold, stealee_threshold, nr_stealee = 0;
+	u64 avg_sc_load = 0, x_mig_delta, util, q_len, nr_nz_cpdoms = 0;
 
 	/*
-	 * Calcualte average queued tasks per CPU per compute domain.
+	 * The load balancing aims for two goals:
+	 *
+	 * 1) The *non-scaled* CPU utilizations of all active CPUs should be
+	 * the same or similar. This helps to maintain low latency
+	 * when the system is underloaded.
+	 *
+	 * 2) The *scaled* queue lengths of active compute domains should be
+	 * the same or similar. Using scaled queue length allows putting more
+	 * tasks to the powerful compute domains. This helps to maintain high
+	 * throughput when the system is overloaded.
+	 */
+
+	/*
+	 * Calcualte scaled load for each compute domain.
 	 */
 	bpf_for(dsq_id, 0, nr_cpdoms) {
 		if (dsq_id >= LAVD_CPDOM_MAX_NR)
 			break;
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
-		cpdomc->nr_q_tasks_per_cpu = (cpdomc->nr_queued_task << LAVD_SHIFT) / cpdomc->nr_cpus;
-		avg_nr_q_tasks_per_cpu += cpdomc->nr_q_tasks_per_cpu;
+
+		util = (cpdomc->cur_util_sum << LAVD_SHIFT) / cpdomc->nr_active_cpus;
+		q_len = (cpdomc->nr_queued_task << (LAVD_SHIFT * 3)) / cpdomc->cap_sum_active_cpus;
+		cpdomc->sc_load = q_len + util;
+
+		if (cpdomc->sc_load > 0) {
+			avg_sc_load += cpdomc->sc_load;
+			nr_nz_cpdoms++;
+		}
 	}
-	avg_nr_q_tasks_per_cpu /= nr_cpdoms;
+	if (nr_nz_cpdoms)
+		avg_sc_load /= nr_nz_cpdoms;
 
 	/*
 	 * Determine stealer and stealee domains.
-	 *
-	 * A stealer domain, whose per-CPU queue length is shorter than
-	 * the average, will steal a task from any of stealee domain,
-	 * whose per-CPU queue length is longer than the average.
-	 * Compute domain around average will not do anything.
 	 */
-	x_mig_delta = avg_nr_q_tasks_per_cpu >> LAVD_CPDOM_MIGRATION_SHIFT;
-	stealer_threshold = avg_nr_q_tasks_per_cpu - x_mig_delta;
-	stealee_threshold = avg_nr_q_tasks_per_cpu + x_mig_delta;
+	x_mig_delta = avg_sc_load >> LAVD_CPDOM_MIGRATION_SHIFT;
+	stealer_threshold = avg_sc_load - x_mig_delta;
+	stealee_threshold = avg_sc_load + x_mig_delta;
 
 	bpf_for(dsq_id, 0, nr_cpdoms) {
 		if (dsq_id >= LAVD_CPDOM_MAX_NR)
@@ -45,22 +62,34 @@ static void plan_x_cpdom_migration(void)
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
 
-		/* XXX: check active or overflow set? */
-
-		if (cpdomc->nr_q_tasks_per_cpu < stealer_threshold) {
+		/*
+		 * Under-loaded active domains become a stealer.
+		 */
+		if (cpdomc->nr_active_cpus &&
+		    cpdomc->nr_q_tasks_per_cpu < stealer_threshold) {
 			WRITE_ONCE(cpdomc->is_stealer, true);
 			WRITE_ONCE(cpdomc->is_stealee, false);
+			continue;
 		}
-		else if (cpdomc->nr_q_tasks_per_cpu > stealee_threshold) {
+
+		/*
+		 * Over-loaded or non-active domains become a stealee.
+		 */
+		if (!cpdomc->nr_active_cpus ||
+		    cpdomc->nr_q_tasks_per_cpu > stealee_threshold) {
 			WRITE_ONCE(cpdomc->is_stealer, false);
 			WRITE_ONCE(cpdomc->is_stealee, true);
 			nr_stealee++;
+			continue;
 		}
-		else {
-			WRITE_ONCE(cpdomc->is_stealer, false);
-			WRITE_ONCE(cpdomc->is_stealee, false);
-		}
+
+		/*
+		 * Otherwise, keep tasks as it is.
+		 */
+		WRITE_ONCE(cpdomc->is_stealer, false);
+		WRITE_ONCE(cpdomc->is_stealee, false);
 	}
+
 	sys_stat.nr_stealee = nr_stealee;
 }
 

@@ -55,7 +55,7 @@ enum consts_internal  {
 	LAVD_AP_HIGH_UTIL		= p2s(70), /* 70%: balanced mode when 10% < cpu util <= 70%,
 							  performance mode when cpu util > 70% */
 
-	LAVD_CPDOM_MIGRATION_SHIFT	= 3, /* 1/2**3 = +/- 12.5% */
+	LAVD_CPDOM_MIGRATION_SHIFT	= 3, /* 1/2**3 = [-12.5%, +12.5%] */
 	LAVD_CPDOM_X_PROB_FT		= (LAVD_SYS_STAT_INTERVAL_NS /
 					   (2 * LAVD_SLICE_MAX_NS_DFL)), /* roughly twice per interval */
 
@@ -78,6 +78,7 @@ struct cpdom_ctx {
 	u16	nr_active_cpus;			    /* the number of active CPUs in this compute domain */
 	u16	nr_acpus_temp;			    /* temp for nr_active_cpus */
 	u32	nr_q_tasks_per_cpu;		    /* the number of queued tasks per CPU in this domain (x1000) */
+	u32	sc_load;			    /* scaled load considering DSQ length and CPU utilization */
 	u32	nr_queued_task;			    /* the number of queued tasks in this domain */
 	u32	cur_util_sum;			    /* the sum of CPU utilization in the current interval */
 	u32	cap_sum_active_cpus;		    /* the sum of capacities of active CPUs in this domain */
