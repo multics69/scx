@@ -45,6 +45,8 @@ static void plan_x_cpdom_migration(void)
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
 
+		/* XXX: check active or overflow set? */
+
 		if (cpdomc->nr_q_tasks_per_cpu < stealer_threshold) {
 			WRITE_ONCE(cpdomc->is_stealer, true);
 			WRITE_ONCE(cpdomc->is_stealee, false);

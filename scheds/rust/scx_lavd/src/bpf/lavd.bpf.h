@@ -72,10 +72,11 @@ struct cpdom_ctx {
 	u8	node_id;			    /* numa domain id */
 	u8	is_big;				    /* is it a big core or little core? */
 	u8	is_valid;			    /* is this a valid compute domain? */
-	u8	is_active;			    /* is there an active CPU in this domain? */
 	u8	is_stealer;			    /* this domain should steal tasks from others */
 	u8	is_stealee;			    /* stealer doamin should steal tasks from this domain */
 	u16	nr_cpus;			    /* the number of CPUs in this compute domain */
+	u16	nr_active_cpus;			    /* the number of active CPUs in this compute domain */
+	u16	nr_acpus_temp;			    /* temp for nr_active_cpus */
 	u32	nr_q_tasks_per_cpu;		    /* the number of queued tasks per CPU in this domain (x1000) */
 	u32	nr_queued_task;			    /* the number of queued tasks in this domain */
 	u32	cur_util_sum;			    /* the sum of CPU utilization in the current interval */

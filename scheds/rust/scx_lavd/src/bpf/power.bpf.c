@@ -175,12 +175,12 @@ static void do_core_compaction(void)
 
 			/*
 			 * Accumulate the capacity of active CPUs and
-			 * turn on the is_active flag.
+			 * increase the number of active CPUs.
 			 */
 			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpu]);
 			if (cpdomc) {
 				cpdomc->cap_sum_temp += cpuc->capacity;
-				WRITE_ONCE(cpdomc->is_active, true);
+				cpdomc->nr_acpus_temp++;
 			}
 			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
@@ -219,7 +219,7 @@ static void do_core_compaction(void)
 	sys_stat.nr_active = nr_active;
 
 	/*
-	 * Update the sum of capacity for active CPUs in this domain.
+	 * Update nr_active_cpus and cap_sum_active_cpus.
 	 */
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
@@ -228,6 +228,8 @@ static void do_core_compaction(void)
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
 		if (!cpdomc)
 			continue;
+		WRITE_ONCE(cpdomc->nr_active_cpus, cpdomc->nr_acpus_temp);
+		WRITE_ONCE(cpdomc->nr_acpus_temp, 0);
 		WRITE_ONCE(cpdomc->cap_sum_active_cpus, cpdomc->cap_sum_temp);
 		WRITE_ONCE(cpdomc->cap_sum_temp, 0);
 	}
@@ -468,8 +470,8 @@ static int reinit_active_cpumask_for_performance(void)
 
 			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpu]);
 			if (cpdomc) {
+				cpdomc->nr_acpus_temp++;
 				cpdomc->cap_sum_temp += cpuc->capacity;
-				WRITE_ONCE(cpdomc->is_active, true);
 			}
 		}
 	} else {
@@ -480,8 +482,8 @@ static int reinit_active_cpumask_for_performance(void)
 
 			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpu]);
 			if (cpdomc) {
+				cpdomc->nr_acpus_temp++;
 				cpdomc->cap_sum_temp += cpuc->capacity;
-				WRITE_ONCE(cpdomc->is_active, true);
 			}
 		}
 
@@ -494,13 +496,15 @@ static int reinit_active_cpumask_for_performance(void)
 	}
 
 	/*
-	 * Update cap_sum_active_cpus.
+	 * Update nr_active_cpus and cap_sum_active_cpus.
 	 */
 	bpf_for(dsq_id, 0, nr_cpdoms) {
 		if (dsq_id >= LAVD_CPDOM_MAX_NR)
 			break;
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
+		WRITE_ONCE(cpdomc->nr_active_cpus, cpdomc->nr_acpus_temp);
+		WRITE_ONCE(cpdomc->nr_acpus_temp, 0);
 		WRITE_ONCE(cpdomc->cap_sum_active_cpus, cpdomc->cap_sum_temp);
 		WRITE_ONCE(cpdomc->cap_sum_temp, 0);
 	}
