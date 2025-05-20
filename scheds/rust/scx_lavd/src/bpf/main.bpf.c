@@ -181,6 +181,7 @@
  * Author: Changwoo Min <changwoo@igalia.com>
  */
 #include <scx/common.bpf.h>
+#include <scx/ravg_impl.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
 #include <errno.h>
@@ -407,10 +408,18 @@ static u64 calc_adjusted_runtime(struct task_ctx *taskc)
 }
 
 static u64 calc_virtual_deadline_delta(struct task_struct *p,
-				       struct task_ctx *taskc)
+				       struct task_ctx *taskc, u64 now)
 {
 	u64 deadline, adjusted_runtime;
 	u32 greedy_ratio, greedy_ft;
+
+	/*
+	 * Read and cache the running avg values.
+	 */
+	taskc->avg_runtime = get_ravg(&taskc->avg_runtime_, now);
+	taskc->run_freq = get_ravg(&taskc->run_freq_, now);
+	taskc->wait_freq = get_ravg(&taskc->wait_freq_, now);
+	taskc->wake_freq = get_ravg(&taskc->wake_freq_, now);
 
 	/*
 	 * Calculate the deadline based on runtime,
@@ -529,8 +538,9 @@ static void update_stat_for_running(struct task_struct *p,
 	 */
 	if (have_scheduled(taskc)) {
 		wait_period = time_delta(now, taskc->last_quiescent_clk);
+		taskc->avg_runtime = get_ravg(&taskc->avg_runtime_, now);
 		interval = taskc->avg_runtime + wait_period;
-		taskc->run_freq = calc_avg_freq(taskc->run_freq, interval);
+		calc_ravg_freq(&taskc->run_freq_, interval, now);
 	}
 
 	/*
@@ -606,7 +616,7 @@ static void update_stat_for_stopping(struct task_struct *p,
 	suspended_duration = get_suspended_duration_and_reset(cpuc);
 	task_runtime = time_delta(now, taskc->last_running_clk + suspended_duration);
 	taskc->acc_runtime += task_runtime;
-	taskc->avg_runtime = calc_avg(taskc->avg_runtime, taskc->acc_runtime);
+	calc_ravg(&taskc->avg_runtime_, taskc->acc_runtime, now);
 	taskc->last_stopping_clk = now;
 
 	taskc->svc_time += task_runtime / p->scx.weight;
@@ -642,7 +652,7 @@ static void update_stat_for_stopping(struct task_struct *p,
 	taskc->lock_holder_xted = false;
 }
 
-static u64 calc_when_to_run(struct task_struct *p, struct task_ctx *taskc)
+static u64 calc_when_to_run(struct task_struct *p, struct task_ctx *taskc, u64 now)
 {
 	u64 deadline_delta;
 
@@ -650,7 +660,7 @@ static u64 calc_when_to_run(struct task_struct *p, struct task_ctx *taskc)
 	 * Before enqueueing a task to a run queue, we should decide when a
 	 * task should be scheduled.
 	 */
-	deadline_delta = calc_virtual_deadline_delta(p, taskc);
+	deadline_delta = calc_virtual_deadline_delta(p, taskc, now);
 	return READ_ONCE(cur_logical_clk) + deadline_delta;
 }
 
@@ -691,7 +701,8 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		dsq_id = cpuc->cpdom_id;
 
 		if (!scx_bpf_dsq_nr_queued(dsq_id)) {
-			p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+			u64 now = scx_bpf_now();
+			p->scx.dsq_vtime = calc_when_to_run(p, taskc, now);
 			p->scx.slice = calc_time_slice(taskc);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
 			return cpu_id;
@@ -719,7 +730,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *taskc;
 	s32 task_cpu, cpu = -ENOENT;
-	u64 dsq_id;
+	u64 dsq_id, now;
 	bool is_idle = false;
 
 	taskc = get_task_ctx(p);
@@ -729,8 +740,9 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Calculate when a task can be scheduled for how long.
 	 */
+	now = scx_bpf_now();
 	taskc->wakeup_ft += !!(enq_flags & SCX_ENQ_WAKEUP);
-	p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+	p->scx.dsq_vtime = calc_when_to_run(p, taskc, now);
 	p->scx.slice = calc_time_slice(taskc);
 
 	/*
@@ -1015,7 +1027,7 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	 */
 	now = scx_bpf_now();
 	interval = time_delta(now, waker_taskc->last_runnable_clk);
-	waker_taskc->wake_freq = calc_avg_freq(waker_taskc->wake_freq, interval);
+	calc_ravg_freq(&waker_taskc->wake_freq_, interval, now);
 	waker_taskc->last_runnable_clk = now;
 
 	/*
@@ -1109,7 +1121,7 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	 */
 	now = scx_bpf_now();
 	interval = time_delta(now, taskc->last_quiescent_clk);
-	taskc->wait_freq = calc_avg_freq(taskc->wait_freq, interval);
+	calc_ravg_freq(&taskc->wait_freq_, interval, now);
 	taskc->last_quiescent_clk = now;
 }
 
@@ -1354,7 +1366,7 @@ static void init_task_ctx(struct task_struct *p, struct task_ctx *taskc)
 	taskc->is_affinitized = bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids;
 	taskc->last_running_clk = now; /* for avg_runtime */
 	taskc->last_stopping_clk = now; /* for avg_runtime */
-	taskc->avg_runtime = slice_max_ns;
+	calc_ravg(&taskc->avg_runtime_, slice_max_ns, now);
 	taskc->svc_time = sys_stat.avg_svc_time;
 
 	set_on_core_type(taskc, p->cpus_ptr);

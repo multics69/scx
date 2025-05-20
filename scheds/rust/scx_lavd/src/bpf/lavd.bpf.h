@@ -36,6 +36,7 @@ enum consts_internal  {
 	LAVD_SLICE_MIN_NS_DFL		= (500ULL * NSEC_PER_USEC), /* min time slice */
 	LAVD_SLICE_MAX_NS_DFL		= (5ULL * NSEC_PER_MSEC), /* max time slice */
 	LAVD_ACC_RUNTIME_MAX		= (LAVD_TARGETED_LATENCY_NS * 10),
+	LAVD_RAVG_HL			= ((u32)1000000000), /* 1 sec: half life for running average */
 
 	LAVD_LC_FREQ_MAX		= 1000000,
 	LAVD_LC_RUNTIME_MAX		= LAVD_TIME_ONE_SEC,

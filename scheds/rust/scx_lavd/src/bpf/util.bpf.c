@@ -159,6 +159,22 @@ static u64 calc_avg(u64 old_val, u64 new_val)
 	return (old_val - (old_val >> 2)) + (new_val >> 2);
 }
 
+static void calc_ravg(struct ravg_data *rd, u64 new_val, u64 now)
+{
+	ravg_accumulate(rd, new_val, now, LAVD_RAVG_HL);
+}
+
+static void calc_ravg_freq(struct ravg_data *rd, u64 interval, u64 now)
+{
+	u64 new_freq = LAVD_TIME_ONE_SEC / interval;
+	ravg_accumulate(rd, new_freq, now, LAVD_RAVG_HL);
+}
+
+static u64 get_ravg(struct ravg_data *rd, u64 now)
+{
+	return ravg_read(rd, now, LAVD_RAVG_HL);
+}
+
 static u64 calc_asym_avg(u64 old_val, u64 new_val)
 {
 	/*

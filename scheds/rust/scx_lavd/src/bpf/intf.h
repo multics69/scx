@@ -44,6 +44,8 @@ extern struct task_struct *bpf_iter_task_next(struct bpf_iter_task *it) __weak _
 extern void bpf_iter_task_destroy(struct bpf_iter_task *it) __weak __ksym;
 #endif /* __KERNEL__ */
 
+#include <scx/ravg.bpf.h>
+
 /*
  * common constants
  */
@@ -110,11 +112,23 @@ struct task_ctx {
 	/*
 	 * Task running statistics for latency criticality calculation
 	 */
-	u64	acc_runtime;		/* accmulated runtime from runnable to quiescent state */
+	struct ravg_data avg_runtime_;	/* average runtime per schedule */
+	struct ravg_data run_freq_;	/* scheduling frequency in a second */
+	struct ravg_data wait_freq_;	/* waiting frequency in a second */
+	struct ravg_data wake_freq_;	/* waking-up frequency in a second */
+
+	/*
+	 * Cached read of ravg values.
+	 */
 	u64	avg_runtime;		/* average runtime per schedule */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
 	u64	wake_freq;		/* waking-up frequency in a second */
+
+	/*
+	 * Other task running statistics for latency criticality calculation
+	 */
+	u64	acc_runtime;		/* accmulated runtime from runnable to quiescent state */
 	u64	svc_time;		/* total CPU time consumed for this task scaled by task's weight */
 	u64	dsq_id;			/* DSQ id where a task run for statistics */
 
