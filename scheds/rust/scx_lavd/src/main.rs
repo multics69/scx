@@ -392,14 +392,14 @@ impl FlatTopology {
 
     /// Build a flat-structured list of CPUs in a preference order
     fn build_cpu_fids(
-        topo: &Topology,
+        sys_topo: &Topology,
         em: &Result<EnergyModel>,
         prefer_powersave: bool,
     ) -> Option<Vec<CpuFlatId>> {
         let mut cpu_fids = Vec::new();
 
         // Build a vector of cpu flat ids.
-        for (&node_adx, node) in topo.nodes.iter() {
+        for (&node_adx, node) in sys_topo.nodes.iter() {
             for (llc_rdx, (_llc_adx, llc)) in node.llcs.iter().enumerate() {
                 for (core_rdx, (_core_adx, core)) in llc.cores.iter().enumerate() {
                     for (cpu_rdx, (cpu_adx, cpu)) in core.cpus.iter().enumerate() {
@@ -432,32 +432,93 @@ impl FlatTopology {
         let mut cpu_fids = cpu_fids2;
 
         // Sort the cpu_fids
-        match prefer_powersave {
-            true => {
-                // Sort the cpu_fids by node, llc, cpu_cap, ^smt_level, ^cache_size, perf_dom, core, and cpu order
+        let has_biglittle = sys_topo.has_little_cores();
+        let smt_enabled = sys_topo.smt_enabled;
+
+        match (prefer_powersave, has_biglittle, smt_enabled) {
+            // 1. powersave,      no  big/little,     no  SMT
+            // 2. powersave,      no  big/little,     yes SMT
+            //     * within the same LLC domain
+            //         - node_adx, llc_rdx,
+            //     * prefer more capable CPU with higher capacity
+            //       and larger cache
+            //         - ^cpu_cap (chip binning), ^cache_size,
+            //     * prefere the SMT core within the same performance domain
+            //         - pd_adx, core_rdx, ^smt_level, cpu_rdx
+            (true, false, _) => {
+                cpu_fids.sort_by(|a, b| {
+                    a.node_adx
+                        .cmp(&b.node_adx)
+                        .then_with(|| a.llc_rdx.cmp(&b.llc_rdx))
+                        .then_with(|| b.cpu_cap.cmp(&a.cpu_cap))
+                        .then_with(|| b.cache_size.cmp(&a.cache_size))
+                        .then_with(|| a.pd_adx.cmp(&b.pd_adx))
+                        .then_with(|| a.core_rdx.cmp(&b.core_rdx))
+                        .then_with(|| b.smt_level.cmp(&a.smt_level))
+                        .then_with(|| a.cpu_rdx.cmp(&b.cpu_rdx))
+                });
+            }
+            // 3. powersave,      yes big/little,     no  SMT
+            // 4. powersave,      yes big/little,     yes SMT
+            //     * within the same LLC domain
+            //         - node_adx, llc_rdx,
+            //     * prefer energy-efficient LITTLE CPU with a larger cache
+            //         - cpu_cap (big/little), ^cache_size,
+            //     * prefere the SMT core within the same performance domain
+            //         - pd_adx, core_rdx, ^smt_level, cpu_rdx
+            (true, true, _) => {
                 cpu_fids.sort_by(|a, b| {
                     a.node_adx
                         .cmp(&b.node_adx)
                         .then_with(|| a.llc_rdx.cmp(&b.llc_rdx))
                         .then_with(|| a.cpu_cap.cmp(&b.cpu_cap))
-                        .then_with(|| b.smt_level.cmp(&a.smt_level))
                         .then_with(|| b.cache_size.cmp(&a.cache_size))
                         .then_with(|| a.pd_adx.cmp(&b.pd_adx))
                         .then_with(|| a.core_rdx.cmp(&b.core_rdx))
+                        .then_with(|| b.smt_level.cmp(&a.smt_level))
                         .then_with(|| a.cpu_rdx.cmp(&b.cpu_rdx))
                 });
             }
-            false => {
-                // Sort the cpu_fids by node, llc, ^cpu_cap, cpu_pos, smt_level, ^cache_size, perf_dom, and core order
-                // For performance mode, prioritize CPU capacity over physical position for ARM big.LITTLE systems
+            // 5. performance,    no  big/little,     yes SMT
+            //     * within the same LLC domain
+            //         - node_adx, llc_rdx,
+            //     * prefer a CPU with a larger cache
+            //         - ^cache_size,
+            //     * prefere the non-SMT core
+            //         - smt_level, cpu_rdx,
+            //         - ^cpu_cap (chip binning), pd_adx, core_rdx
+            (false, false, true) => {
                 cpu_fids.sort_by(|a, b| {
                     a.node_adx
-                        .cmp(&b.node_adx) // NUMA node first
-                        .then_with(|| a.llc_rdx.cmp(&b.llc_rdx)) // LLC locality
-                        .then_with(|| b.cpu_cap.cmp(&a.cpu_cap)) // CPU performance first (^cpu_cap)
-                        .then_with(|| a.cpu_rdx.cmp(&b.cpu_rdx)) // Physical position as tie-breaker
-                        .then_with(|| a.smt_level.cmp(&b.smt_level))
+                        .cmp(&b.node_adx)
+                        .then_with(|| a.llc_rdx.cmp(&b.llc_rdx))
                         .then_with(|| b.cache_size.cmp(&a.cache_size))
+                        .then_with(|| a.smt_level.cmp(&b.smt_level))
+                        .then_with(|| a.cpu_rdx.cmp(&b.cpu_rdx))
+                        .then_with(|| b.cpu_cap.cmp(&a.cpu_cap))
+                        .then_with(|| a.pd_adx.cmp(&b.pd_adx))
+                        .then_with(|| a.core_rdx.cmp(&b.core_rdx))
+                });
+            }
+            // 6. performance,    no  big/little,     no  SMT
+            // 7. performance,    yes big/little,     no  SMT
+            // 8. performance,    yes big/little,     yes SMT
+            //     * within the same LLC domain
+            //         - node_adx, llc_rdx,
+            //     * prefer more capable CPU with higher capacity
+            //       (chip binning) and larger cache
+            //         - ^cpu_cap, ^cache_size,
+            //     * prefere the non-SMT core
+            //         - smt_level, cpu_rdx, pd_adx, core_rdx
+            _ => {
+                cpu_fids.sort_by(|a, b| {
+                    a.node_adx
+                        .cmp(&b.node_adx)
+                        .then_with(|| a.llc_rdx.cmp(&b.llc_rdx))
+                        .then_with(|| b.cpu_cap.cmp(&a.cpu_cap))
+                        .then_with(|| b.cache_size.cmp(&a.cache_size))
+                        .then_with(|| a.smt_level.cmp(&b.smt_level))
+                        .then_with(|| a.cpu_rdx.cmp(&b.cpu_rdx))
                         .then_with(|| a.pd_adx.cmp(&b.pd_adx))
                         .then_with(|| a.core_rdx.cmp(&b.core_rdx))
                 });
