@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use log::debug;
 
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialOrd)]
 pub struct PerfState {
@@ -76,6 +77,16 @@ impl EnergyModel {
         }
         None
     }
+
+    pub fn get_total_performance(&self) -> usize {
+        let mut total = 0;
+
+        for (_, pd) in self.perf_doms.iter() {
+            total += pd.get_total_performance();
+        }
+
+        total
+    }
 }
 
 impl PerfDomain {
@@ -101,7 +112,7 @@ impl PerfDomain {
     /// @util is in %, ranging [0, 100].
     pub fn get_ps_by_util(&self, util: f32) -> Option<&Arc<PerfState>> {
         let util = clamp(util, 0.0, 100.0);
-        let (perf_max, _) = self.perf_table.iter().rev().next().unwrap();
+        let (perf_max, _) = self.perf_table.last_key_value().unwrap();
         let perf_max = *perf_max as f32;
         let req_perf = (perf_max as f32 * (util / 100.0)) as usize;
         for (perf, ps) in self.perf_table.iter() {
@@ -110,6 +121,11 @@ impl PerfDomain {
             }
         }
         None
+    }
+
+    pub fn get_total_performance(&self) -> usize {
+        let (_, ps) = self.perf_table.last_key_value().unwrap();
+        ps.performance * self.span.weight()
     }
 }
 
