@@ -100,39 +100,10 @@ static u64 calc_weight_factor(struct task_struct *p, struct task_ctx *taskc)
 	return weight_ft;
 }
 
-static void calc_perf_cri(struct task_struct *p, struct task_ctx *taskc)
-{
-	u64 wait_freq_ft, wake_freq_ft, perf_cri = LAVD_SCALE;
-
-	/*
-	 * A task is more CPU-performance sensitive when it meets the following
-	 * conditions:
-	 *
-	 * - It is in the middle of the task graph (high wait and wake
-	 *   frequencies).
-	 * - Its runtime and frequency are high;
-	 * - Its nice priority is high;
-	 *
-	 * We use the log-ed value since the raw value follows the highly
-	 * skewed distribution.
-	 *
-	 * Note that we use unadjusted weight to reflect the pure task priority.
-	 */
-	if (have_little_core) {
-		wait_freq_ft = calc_freq_factor(taskc->wait_freq);
-		wake_freq_ft = calc_freq_factor(taskc->wake_freq);
-		perf_cri = log2_u64(wait_freq_ft * wake_freq_ft);
-		perf_cri += log2_u64(max(taskc->run_freq, 1) *
-				     max(taskc->avg_runtime, 1) * p->scx.weight);
-	}
-
-	taskc->perf_cri = perf_cri;
-}
-
 static void calc_lat_cri(struct task_struct *p, struct task_ctx *taskc)
 {
 	u64 weight_ft, wait_freq_ft, wake_freq_ft, runtime_ft;
-	u64 lat_cri;
+	u64 lat_cri, perf_cri = LAVD_SCALE;
 
 	/*
 	 * Adjust task's weight based on the scheduling context, such as
@@ -171,6 +142,28 @@ static void calc_lat_cri(struct task_struct *p, struct task_ctx *taskc)
 	 * latency-critcial, inherit waker's latency criticality.
 	 */
 	taskc->lat_cri = max(lat_cri, taskc->lat_cri_waker);
+
+	/*
+	 * A task is more CPU-performance sensitive when it meets the following
+	 * conditions:
+	 *
+	 * - It is in the middle of the task graph (high wait and wake
+	 *   frequencies).
+	 * - Its runtime and frequency are high;
+	 * - Its nice priority is high;
+	 *
+	 * We use the log-ed value since the raw value follows the highly
+	 * skewed distribution.
+	 *
+	 * Note that we use unadjusted weight to reflect the pure task priority.
+	 */
+	if (have_little_core) {
+		perf_cri = log2_u64(wait_freq_ft * wake_freq_ft);
+		perf_cri += log2_u64(max(taskc->run_freq, 1) *
+				     max(taskc->avg_runtime, 1) * p->scx.weight);
+	}
+
+	taskc->perf_cri = perf_cri;
 }
 
 static u64 calc_adjusted_runtime(struct task_ctx *taskc)
@@ -198,7 +191,6 @@ static u64 calc_virtual_deadline_delta(struct task_struct *p,
 	 * Calculate the deadline based on runtime,
 	 * latency criticality, and greedy ratio.
 	 */
-	calc_perf_cri(p, taskc);
 	calc_lat_cri(p, taskc);
 	greedy_ratio = calc_greedy_ratio(taskc);
 	greedy_ft = calc_greedy_factor(greedy_ratio);
