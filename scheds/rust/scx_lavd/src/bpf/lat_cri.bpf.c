@@ -8,102 +8,97 @@
  * To be included to the main.bpf.c
  */
 
-static u32 calc_greedy_ratio(struct task_ctx *taskc)
-{
-	u32 ratio;
-
-	/*
-	 * The greedy ratio of a task represents how much time the task
-	 * overspent CPU time compared to the ideal, fair CPU allocation. It is
-	 * the ratio of task's actual service time to average service time in a
-	 * system.
-	 */
-	ratio = (taskc->svc_time << LAVD_SHIFT) / sys_stat.avg_svc_time;
-	taskc->is_greedy = ratio > LAVD_SCALE;
-	return ratio;
-}
-
-static u32 calc_greedy_factor(u32 greedy_ratio)
-{
-	/*
-	 * For all under-utilized tasks, we treat them equally.
-	 */
-	if (greedy_ratio <= LAVD_SCALE)
-		return LAVD_SCALE;
-
-	/*
-	 * For over-utilized tasks, we give some mild penalty.
-	 */
-	return LAVD_SCALE + ((greedy_ratio - LAVD_SCALE) / LAVD_LC_GREEDY_PENALTY);
-}
-
-static inline u64 calc_runtime_factor(u64 runtime)
-{
-	return rsigmoid_u64(runtime, LAVD_LC_RUNTIME_MAX);
-}
-
-static inline u64 calc_freq_factor(u64 freq)
-{
-	return sigmoid_u64(freq, LAVD_LC_FREQ_MAX);
-}
-
 static u64 calc_weight_factor(struct task_struct *p, struct task_ctx *taskc)
 {
 	u64 weight_boost = 1;
-	u64 weight_ft;
 
 	/*
 	 * Prioritize a wake-up task since this is a clear sign of immediate
 	 * consumer. If it is a synchronous wakeup, double the prioritization.
 	 */
-	weight_boost += taskc->wakeup_ft * LAVD_LC_WEIGHT_BOOST;
+	weight_boost += taskc->wakeup_ft;
 
 	/*
 	 * Prioritize a kernel task since many kernel tasks serve
 	 * latency-critical jobs.
 	 */
 	if (is_kernel_task(p))
-		weight_boost += LAVD_LC_WEIGHT_BOOST;
+		weight_boost++;
 
 	/*
 	 * Further prioritize kworkers.
 	 */
 	if (is_kernel_worker(p))
-		weight_boost += LAVD_LC_WEIGHT_BOOST;
+		weight_boost++;
 
 	/*
 	 * Prioritize an affinitized task since it has restrictions
 	 * in placement so it tends to be delayed.
 	 */
 	if (taskc->is_affinitized)
-		weight_boost += LAVD_LC_WEIGHT_BOOST;
+		weight_boost++;
 
 	/*
 	 * Prioritize a pinned task since it has restrictions in placement
 	 * so it tends to be delayed.
 	 */
 	if (is_pinned(p) || is_migration_disabled(p))
-		weight_boost += LAVD_LC_WEIGHT_BOOST;
+		weight_boost++;
 
 	/*
 	 * Prioritize a lock holder for faster system-wide forward progress.
 	 */
 	if (taskc->need_lock_boost) {
 		taskc->need_lock_boost = false;
-		weight_boost += LAVD_LC_WEIGHT_BOOST;
+		weight_boost++;
 	}
 
 	/*
 	 * Respect nice priority.
 	 */
-	weight_ft = p->scx.weight * weight_boost;
-	return weight_ft;
+	return sqrt_u64(p->scx.weight * weight_boost + 1);
+}
+
+static u64 calc_wait_factor(struct task_ctx *taskc)
+{
+	return sqrt_u64(taskc->wait_freq + 1);
+}
+
+static u64 calc_wake_factor(struct task_ctx *taskc)
+{
+	return sqrt_u64(taskc->wake_freq + 1);
+}
+
+static inline u64 calc_runtime_factor(struct task_ctx *taskc)
+{
+	u64 ft = 1, delta;
+
+	if (LAVD_LC_RUNTIME_MAX > taskc->avg_runtime) {
+		delta = LAVD_LC_RUNTIME_MAX - taskc->avg_runtime;
+		return sqrt_u64(delta / LAVD_SLICE_MIN_NS_DFL);
+	}
+	return ft;
+}
+
+static u64 calc_sum_runtime_factor(struct task_struct *p, struct task_ctx *taskc)
+{
+	u64 sum = max(taskc->run_freq, 1) * max(taskc->avg_runtime, 1);
+	return sqrt_u64((sum >> LAVD_SHIFT) * p->scx.weight);
 }
 
 static void calc_lat_cri(struct task_struct *p, struct task_ctx *taskc)
 {
-	u64 weight_ft, wait_freq_ft, wake_freq_ft, runtime_ft;
+	u64 weight_ft, wait_ft, wake_ft, runtime_ft, sum_runtime_ft;
 	u64 lat_cri, perf_cri = LAVD_SCALE;
+
+	/*
+	 * A task is more latency-critical as its wait or wake frequencies
+	 * (i.e., wait_freq and wake_freq) are higher, and its runtime is
+	 * shorter.
+	 */
+	wait_ft = calc_wait_factor(taskc);
+	wake_ft = calc_wake_factor(taskc);
+	runtime_ft = calc_runtime_factor(taskc);
 
 	/*
 	 * Adjust task's weight based on the scheduling context, such as
@@ -112,29 +107,12 @@ static void calc_lat_cri(struct task_struct *p, struct task_ctx *taskc)
 	weight_ft = calc_weight_factor(p, taskc);
 
 	/*
-	 * A task is more latency-critical as its wait or wake frequencies
-	 * (i.e., wait_freq and wake_freq) are higher.
-	 *
-	 * Since those frequencies are unbounded and their upper limits are
-	 * unknown, we transform them using sigmoid-like functions. For wait
-	 * and wake frequencies, we use a sigmoid function (sigmoid_u64), which
-	 * is monotonically increasing since higher frequencies mean more
-	 * latency-critical.
-	 */
-	wait_freq_ft = calc_freq_factor(taskc->wait_freq) + 1;
-	wake_freq_ft = calc_freq_factor(taskc->wake_freq) + 1;
-	runtime_ft = calc_runtime_factor(taskc->avg_runtime) + 1;
-
-	/*
 	 * Wake frequency and wait frequency represent how much a task is used
 	 * for a producer and a consumer, respectively. If both are high, the
 	 * task is in the middle of a task chain. The ratio tends to follow an
-	 * exponentially skewed distribution, so we linearize it using log2. We
-	 * add +1 to guarantee the latency criticality (log2-ed) is always
-	 * positive.
+	 * exponentially skewed distribution, so we linearize it using sqrt.
 	 */
-	lat_cri = log2_u64(wait_freq_ft * wake_freq_ft) +
-		  log2_u64(runtime_ft * weight_ft);
+	lat_cri = wait_ft + wake_ft + runtime_ft + weight_ft;
 
 	/*
 	 * Determine latency criticality of a task in a context-aware manner by
@@ -158,12 +136,38 @@ static void calc_lat_cri(struct task_struct *p, struct task_ctx *taskc)
 	 * Note that we use unadjusted weight to reflect the pure task priority.
 	 */
 	if (have_little_core) {
-		perf_cri = log2_u64(wait_freq_ft * wake_freq_ft);
-		perf_cri += log2_u64(max(taskc->run_freq, 1) *
-				     max(taskc->avg_runtime, 1) * p->scx.weight);
+		sum_runtime_ft = calc_sum_runtime_factor(p, taskc);
+		perf_cri = wait_ft + wake_ft + sum_runtime_ft;
 	}
-
 	taskc->perf_cri = perf_cri;
+}
+
+static u32 calc_greedy_ratio(struct task_ctx *taskc)
+{
+	u32 ratio;
+
+	/*
+	 * The greedy ratio of a task represents how much time the task
+	 * overspent CPU time compared to the ideal, fair CPU allocation. It is
+	 * the ratio of task's actual service time to average service time in a
+	 * system.
+	 */
+	ratio = (taskc->svc_time << LAVD_SHIFT) / sys_stat.avg_svc_time;
+	taskc->is_greedy = ratio > LAVD_SCALE;
+	return ratio;
+}
+
+static u32 calc_greedy_factor(u32 greedy_ratio)
+{
+	u64 ft = LAVD_SCALE;
+
+	/*
+	 * For all under-utilized tasks, we treat them equally.
+	 * For over-utilized tasks, we give some mild penalty.
+	 */
+	if (greedy_ratio > LAVD_SCALE)
+		ft += ((greedy_ratio - LAVD_SCALE) / LAVD_LC_GREEDY_PENALTY);
+	return ft;
 }
 
 static u64 calc_adjusted_runtime(struct task_ctx *taskc)
@@ -199,13 +203,4 @@ static u64 calc_virtual_deadline_delta(struct task_struct *p,
 	deadline = (adjusted_runtime * greedy_ft) / taskc->lat_cri;
 
 	return deadline;
-}
-
-static u64 calc_time_slice(struct task_ctx *taskc)
-{
-	if (!taskc)
-		return LAVD_SLICE_MAX_NS_DFL;
-
-	taskc->slice_ns = sys_stat.slice;
-	return taskc->slice_ns;
 }

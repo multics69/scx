@@ -283,6 +283,15 @@ static void advance_cur_logical_clk(struct task_struct *p)
 	}
 }
 
+static u64 calc_time_slice(struct task_ctx *taskc)
+{
+	if (!taskc)
+		return LAVD_SLICE_MAX_NS_DFL;
+
+	taskc->slice_ns = sys_stat.slice;
+	return taskc->slice_ns;
+}
+
 static void update_stat_for_running(struct task_struct *p,
 				    struct task_ctx *taskc,
 				    struct cpu_ctx *cpuc, u64 now)
