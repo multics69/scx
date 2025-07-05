@@ -194,7 +194,7 @@ char _license[] SEC("license") = "GPL";
 /*
  * Logical current clock
  */
-static u64		cur_logical_clk;
+static u64		cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
 
 /*
  * Current service time
@@ -434,18 +434,6 @@ static void update_stat_for_stopping(struct task_struct *p,
 	 */
 	reset_lock_futex_boost(taskc, cpuc);
 	taskc->lock_holder_xted = false;
-}
-
-static u64 calc_when_to_run(struct task_struct *p, struct task_ctx *taskc)
-{
-	u64 deadline_delta;
-
-	/*
-	 * Before enqueueing a task to a run queue, we should decide when a
-	 * task should be scheduled.
-	 */
-	deadline_delta = calc_virtual_deadline_delta(p, taskc);
-	return READ_ONCE(cur_logical_clk) + deadline_delta;
 }
 
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
