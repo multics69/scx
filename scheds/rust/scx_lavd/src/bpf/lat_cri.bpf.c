@@ -170,7 +170,7 @@ static u32 calc_greedy_factor(u32 greedy_ratio)
 	 * For over-utilized tasks, we give some mild penalty.
 	 */
 	if (greedy_ratio > LAVD_SCALE)
-		ft += ((greedy_ratio - LAVD_SCALE) / LAVD_LC_GREEDY_PENALTY);
+		ft += (greedy_ratio - LAVD_SCALE) >> LAVD_LC_GREEDY_SHIFT;
 	return ft;
 }
 
