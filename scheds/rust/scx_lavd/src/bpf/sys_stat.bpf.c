@@ -171,6 +171,12 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		}
 
 		/*
+		 * TODO
+		 */
+		if (cpuc->nr_pinned_tasks)
+			shrink_boosted_time_slice(cpuc, c->now, true);
+
+		/*
 		 * If a task is currently running on a CPU,
 		 * consider that before collecting per-CPU statistics.
 		 */

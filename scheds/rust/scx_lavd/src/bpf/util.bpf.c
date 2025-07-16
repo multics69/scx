@@ -184,6 +184,21 @@ static inline void reset_task_flag(struct task_ctx *taskc, u64 flag)
 	taskc->flags &= ~flag;
 }
 
+static inline bool test_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
+{
+	return (cpuc->flags & flag) == flag;
+}
+
+static inline void set_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
+{
+	cpuc->flags |= flag;
+}
+
+static inline void reset_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
+{
+	cpuc->flags &= ~flag;
+}
+
 static bool is_lat_cri(struct task_ctx *taskc)
 {
 	return taskc->lat_cri >= sys_stat.avg_lat_cri;
@@ -196,7 +211,7 @@ static bool is_lock_holder(struct task_ctx *taskc)
 
 static bool is_lock_holder_running(struct cpu_ctx *cpuc)
 {
-	return cpuc->flags & LAVD_FLAG_FUTEX_BOOST;
+	return test_cpu_flag(cpuc, LAVD_FLAG_FUTEX_BOOST);
 }
 
 static bool have_scheduled(struct task_ctx *taskc)

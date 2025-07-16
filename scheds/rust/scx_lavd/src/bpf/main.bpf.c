@@ -523,9 +523,17 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Increase the number of pinned tasks waiting for execution.
+	 * If the slice task is already running on the CPU, shrink its
+	 * time slice to a regular one.
 	 */
-	if (cpu >= 0 && is_pinned(p) && (cpuc = get_cpu_ctx_id(cpu)))
+	if (cpu >= 0 && is_pinned(p) && (cpuc = get_cpu_ctx_id(cpu))) {
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
+
+		if (test_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST)) {
+			u64 now = scx_bpf_now();
+			shrink_boosted_time_slice(cpuc, now, false);
+		}
+	}
 
 	/*
 	 * Collect additional information when the scheduler is monitored.
