@@ -221,33 +221,6 @@ const volatile u64	slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
 #include "sys_stat.bpf.c"
 #include "lat_cri.bpf.c"
 
-static void reset_suspended_duration(struct cpu_ctx *cpuc)
-{
-	if (cpuc->online_clk > cpuc->offline_clk)
-		cpuc->offline_clk = cpuc->online_clk;
-}
-
-static u64 get_suspended_duration_and_reset(struct cpu_ctx *cpuc)
-{
-	/*
-	 * When a system is suspended, a task is also suspended in a running
-	 * stat on the CPU. Hence, we subtract the suspended duration when it
-	 * resumes.
-	 */
-
-	u64 duration = 0;
-
-	if (cpuc->online_clk > cpuc->offline_clk) {
-		duration = time_delta(cpuc->online_clk, cpuc->offline_clk);
-		/*
-		 * Once calculated, reset the duration to zero.
-		 */
-		cpuc->offline_clk = cpuc->online_clk;
-	}
-
-	return duration;
-}
-
 static void advance_cur_logical_clk(struct task_struct *p)
 {
 	u64 vlc, clc, ret_clc;
@@ -386,24 +359,14 @@ static void update_stat_for_stopping(struct task_struct *p,
 				     struct cpu_ctx *cpuc)
 {
 	u64 now = scx_bpf_now();
-	u64 suspended_duration, task_runtime;
 
 	/*
-	 * Update task's runtime. When a task is scheduled consecutively
-	 * without ops.quiescent(), the task's runtime is accumulated for
-	 * statistics. Suppose a task is scheduled 2ms, 2ms, and 2ms with the
-	 * time slice exhausted. If 6ms of time slice was given in the first
-	 * place, the task will entirely consume the time slice. Hence, the
-	 * consecutive execution is accumulated and reflected in the
-	 * calculation of runtime statistics.
+	 * Account task runtime statistics first.
 	 */
-	suspended_duration = get_suspended_duration_and_reset(cpuc);
-	task_runtime = time_delta(now, taskc->last_running_clk + suspended_duration);
-	taskc->acc_runtime += task_runtime;
+	account_task_runtime(p, taskc, cpuc, now);
+
 	taskc->avg_runtime = calc_avg(taskc->avg_runtime, taskc->acc_runtime);
 	taskc->last_stopping_clk = now;
-
-	taskc->svc_time += task_runtime / p->scx.weight;
 
 	/*
 	 * Reset waker's latency criticality here to limit the latency boost of
@@ -412,21 +375,10 @@ static void update_stat_for_stopping(struct task_struct *p,
 	taskc->lat_cri_waker = 0;
 
 	/*
-	 * Increase total service time of this CPU.
-	 */
-	cpuc->tot_svc_time += taskc->svc_time;
-
-	/*
 	 * Update the current service time if necessary.
 	 */
 	if (READ_ONCE(cur_svc_time) < taskc->svc_time)
 		WRITE_ONCE(cur_svc_time, taskc->svc_time);
-
-	/*
-	 * Increase total scaled CPU time of this CPU,
-	 * which is capacity and frequency invariant.
-	 */
-	cpuc->tot_sc_time += scale_cap_freq(task_runtime, cpuc->cpu_id);
 
 	/*
 	 * Reset task's lock and futex boost count
@@ -936,15 +888,13 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	struct task_ctx *taskc;
 	u64 now, interval;
 
-	/*
-	 * Substract task load from the current CPU's load.
-	 */
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
 	if (!cpuc || !taskc) {
 		scx_bpf_error("Failed to lookup context for task %d", p->pid);
 		return;
 	}
+	cpuc->flags = 0;
 
 	/*
 	 * If a task @p is dequeued from a run queue for some other reason
@@ -1171,6 +1121,7 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
 	}
+	cpuc->flags = 0;
 
 	/*
 	 * When a CPU is released to serve higher priority scheduler class,

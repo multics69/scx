@@ -52,6 +52,81 @@ struct sys_stat_ctx {
 	u32		cur_sc_util;
 };
 
+static void account_task_runtime(struct task_struct *p,
+				 struct task_ctx *taskc,
+				 struct cpu_ctx *cpuc,
+				 u64 now)
+{
+	u64 suspended_duration, last_measured_clk, runtime, svc_time, sc_time;
+	bool need_task_release = false;
+
+	/*
+	 * Eagerly bail out if another is updating, following the
+	 * double-checked lock pattern.
+	 */
+	if (cpuc->is_updating)
+		return;
+
+	/*
+	 * If @p or @taskc are not given, figure them out by itself.
+	 */
+	if (!p) {
+		struct rq *rq = scx_bpf_cpu_rq(cpuc->cpu_id);
+		if (!rq || !(p = rq->curr))
+			return;
+		/*
+		 * Note that this is a hack to bypass the restriction of the
+		 * current BPF not trusting the pointer p. Once the BPF
+		 * verifier gets smarter, we can remove bpf_task_from_pid().
+		 */
+		p = bpf_task_from_pid(p->pid);
+		if (!p)
+			return;
+		need_task_release = true;
+	}
+
+	if (!taskc) {
+		taskc = get_task_ctx(p);
+		if (!taskc)
+			goto out;
+	}
+
+	/*
+	 * Atomically holding the update lock.
+	 */
+	if (!__sync_bool_compare_and_swap(&cpuc->is_updating, false, true))
+		goto out;
+
+	/*
+	 * Since task execution can span one or more sys_stat intervals,
+	 * we update task and CPU's statistics at every sys_stat interval
+	 * and update_stat_for_stopping(). It is essential to account for
+	 * the load of long-running tasks properly. So, we add up only the
+	 * execution duration since the last measured time.
+	 */
+	suspended_duration = get_suspended_duration_and_reset(cpuc);
+	last_measured_clk = max(taskc->last_running_clk,
+				READ_ONCE(sys_stat.last_update_clk)) +
+			    suspended_duration;
+	runtime = time_delta(now, last_measured_clk);
+	svc_time = runtime / p->scx.weight;
+	sc_time = scale_cap_freq(runtime, cpuc->cpu_id);
+
+	WRITE_ONCE(taskc->acc_runtime, taskc->acc_runtime + runtime);
+	WRITE_ONCE(taskc->svc_time, taskc->svc_time + svc_time);
+	WRITE_ONCE(cpuc->tot_svc_time, cpuc->tot_svc_time + svc_time);
+	WRITE_ONCE(cpuc->tot_sc_time, cpuc->tot_sc_time + sc_time);
+
+	/*
+	 * Release the update lock.
+	 */
+	cpuc->is_updating = false;
+
+out:
+	if (need_task_release)
+		bpf_task_release(p);
+}
+
 static void init_sys_stat_ctx(struct sys_stat_ctx *c)
 {
 	__builtin_memset(c, 0, sizeof(*c));
@@ -59,7 +134,11 @@ static void init_sys_stat_ctx(struct sys_stat_ctx *c)
 	c->min_perf_cri = LAVD_SCALE;
 	c->now = scx_bpf_now();
 	c->duration = time_delta(c->now, sys_stat.last_update_clk);
-	sys_stat.last_update_clk = c->now;
+}
+
+static void update_clock(struct sys_stat_ctx *c) 
+{
+	WRITE_ONCE(sys_stat.last_update_clk, c->now);
 }
 
 static void collect_sys_stat(struct sys_stat_ctx *c)
@@ -90,6 +169,12 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 			c->compute_total = 0;
 			break;
 		}
+
+		/*
+		 * If a task is currently running on a CPU,
+		 * consider that before collecting per-CPU statistics.
+		 */
+		account_task_runtime(NULL, NULL, cpuc, c->now);
 
 		/*
 		 * Accumulate cpus' loads.
@@ -361,6 +446,7 @@ static void do_update_sys_stat(void)
 
 	init_sys_stat_ctx(&c);
 	collect_sys_stat(&c);
+	update_clock(&c);
 	calc_sys_stat(&c);
 }
 

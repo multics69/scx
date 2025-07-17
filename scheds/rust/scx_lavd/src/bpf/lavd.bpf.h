@@ -127,6 +127,7 @@ struct cpu_ctx {
 	volatile u64	tot_svc_time;	/* total service time on a CPU scaled by tasks' weights */
 	volatile u64	tot_sc_time;	/* total scaled CPU time, which is capacity and frequency invariant. */
 	volatile u64	cpu_release_clk; /* when the CPU is taken by higher-priority scheduler class */
+	volatile u32	is_updating;    /* load is being updated */
 
 	/*
 	 * Information used to keep track of latency criticality
