@@ -37,6 +37,7 @@ const volatile bool	no_slice_boost;
 const volatile bool	is_autopilot_on;
 const volatile u8	verbose;
 const volatile u8	preempt_shift;
+const volatile u64	relax_deadline;
 
 /*
  * Exit information
@@ -226,12 +227,6 @@ static bool have_scheduled(struct task_ctx *taskc)
 static bool can_boost_slice(void)
 {
 	return slice_max_ns <= sys_stat.slice;
-}
-
-static bool have_pending_tasks(struct cpu_ctx *cpuc)
-{
-	return scx_bpf_dsq_nr_queued(cpuc->cpdom_id) ||
-	       scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id);
 }
 
 static u16 get_nice_prio(struct task_struct *p)

@@ -270,12 +270,13 @@ static u64 calc_time_slice(struct task_ctx *taskc, struct cpu_ctx *cpuc)
 	 * could be scheduled out due to a shorter time slice than required.
 	 * In this case, let's consider boosting task's time slice.
 	 *
-	 * However, if there are pinned tasks waiting to run on this CPU,
-	 * we do not boost the task's time slice to avoid delaying the pinned
-	 * task that cannot be run on another CPU.
+	 * However, if there are pinned or locally-enqueued tasks waiting to
+	 * run on this CPU, we do not boost the task's time slice to avoid
+	 * delaying the pinned task that cannot be run on another CPU.
 	 */
 	if (!no_slice_boost && !cpuc->nr_pinned_tasks &&
-	    (taskc->avg_runtime >= sys_stat.slice)) {
+	    (taskc->avg_runtime >= sys_stat.slice) &&
+	    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id)) {
 		/*
 		 * When the system is not heavily loaded, so it can serve all
 		 * tasks within the targeted latency (slice_max_ns <=
@@ -564,25 +565,45 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		reset_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 	}
 out:
+	reset_task_flag(taskc, LAVD_FLAG_ENQ_NON_LOCAL);
 	return cpu_id;
 }
 
-static bool can_direct_dispatch(u64 dsq_id, s32 cpu, bool is_idle)
+static
+bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_idle)
 {
 	/*
 	 * If the chosen CPU is idle and there is nothing to do
 	 * in the domain, we can safely choose the fast track.
 	 */
-	return is_idle && cpu >= 0 && !scx_bpf_dsq_nr_queued(dsq_id);
+	if (is_idle && !scx_bpf_dsq_nr_queued(cpuc->cpdom_id))
+		return true;
+
+	/*
+	 * If the local DSQ of the chosen CPU is not congested and
+	 * no pending tasks are waiting to run on this CPU, choose
+	 * the fast track.
+	 */
+	if (cpuc->nr_enq_non_local == 0 &&
+	    (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id) <
+		relax_deadline))
+		return true;
+
+	/*
+	 * Many tasks are competing with each other to win the race
+	 * against deadlines. It is better to place a task in the
+	 * per-domain DSQ for fair competition.
+	 */
+	return false;
 }
 
 void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *taskc;
-	struct cpu_ctx *cpuc, *cpuc_cur;
+	struct cpu_ctx *cpuc = NULL, *cpuc_cur;
 	s32 task_cpu, cpu = -ENOENT;
 	u64 dsq_id;
-	bool is_idle = false, shrinked = false;
+	bool is_idle = false, direct_dispatch;
 
 	taskc = get_task_ctx(p);
 	cpuc_cur = get_cpu_ctx();
@@ -596,7 +617,9 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 *
 	 * If the task is re-enqueued due to a higher-priority scheduling class
 	 * taking the CPU, we don't need to recalculate the task's deadline and
-	 * timeslice, as the task hasn't yet run.
+	 * timeslice, as the task hasn't yet run. In this case, if the task was
+	 * enqueued to a non-local DSQ, we decrement nr_q_non_local since it
+	 * was enqueued to a non-local DSQ but never run.
 	 */
 	if (!(enq_flags & SCX_ENQ_REENQ)) {
 		if (enq_flags & SCX_ENQ_WAKEUP)
@@ -605,8 +628,14 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 			reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
 
 		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+	} else if (test_task_flag(taskc, LAVD_FLAG_ENQ_NON_LOCAL)) {
+		s32 cpu_sug = taskc->suggested_cpu_id;
+		struct cpu_ctx *cpuc_sug;
+		if (cpu_sug >= 0 && (cpuc_sug = get_cpu_ctx_id(cpu_sug)))
+			__sync_fetch_and_sub(&cpuc_sug->nr_enq_non_local, 1);
 	}
 	p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
+	reset_task_flag(taskc, LAVD_FLAG_ENQ_NON_LOCAL);
 
 	/*
 	 * Find a proper DSQ for the task, which is either the task's
@@ -633,22 +662,32 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		reset_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 	}
 
+	if (cpu < 0 || (!cpuc && !(cpuc = get_cpu_ctx_id(cpu)))) {
+		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
+		return;
+	}
+
 	/*
 	 * Increase the number of pinned tasks waiting for execution.
 	 */
-	if (cpu >= 0 && is_pinned(p) && (cpuc = get_cpu_ctx_id(cpu))) {
+	if (is_pinned(p))
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
-	}
 
 	/*
 	 * Enqueue the task to a DSQ. If it is safe to directly dispatch
 	 * to the local DSQ of the chosen CPU, do it. Otherwise, enqueue
-	 * to the chosen DSQ of the chosen domain.
+	 * to the chosen DSQ of the chosen domain. Keep track of the number
+	 * of tasks enqueued to non-local DSQs for relaxed enforcement of
+	 * the deadline.
 	 */
-	if (can_direct_dispatch(dsq_id, cpu, is_idle)) {
+	direct_dispatch = can_direct_dispatch(cpuc, is_idle);
+	if (direct_dispatch) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
 				   enq_flags);
 	} else {
+		set_task_flag(taskc, LAVD_FLAG_ENQ_NON_LOCAL);
+		__sync_fetch_and_add(&cpuc->nr_enq_non_local, 1);
+
 		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
 					 p->scx.dsq_vtime, enq_flags);
 	}
@@ -657,7 +696,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * If a new overflow CPU was assigned while finding a proper DSQ,
 	 * kick the new CPU and go.
 	 */
-	if (is_idle && cpu >= 0) {
+	if (is_idle) {
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		return;
 	}
@@ -666,9 +705,10 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * If there is no idle CPU for an eligible task, try to preempt a task.
 	 * Try to find and kick a victim CPU, which runs a less urgent task,
 	 * from dsq_id. The kick will be done asynchronously.
+	 * In the case of direct dispatch, there is no point in finding a victim in the other CPUs.
 	 */
-	if (!shrinked && !no_preemption)
-		try_find_and_kick_victim_cpu(p, taskc, cpu, dsq_id);
+	if (!no_preemption)
+		try_find_and_kick_victim_cpu(p, taskc, cpuc, direct_dispatch);
 }
 
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
@@ -975,6 +1015,22 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	}
 
 	/*
+	 * Decrement the number of tasks queued to non-local DSQs.
+	 */
+	if (test_task_flag(taskc, LAVD_FLAG_ENQ_NON_LOCAL)) {
+		s32 cpu_sug = taskc->suggested_cpu_id;
+		struct cpu_ctx *cpuc_sug = NULL;
+
+		if (cpu_sug == cpuc->cpu_id)
+			cpuc_sug = cpuc;
+		else if (cpu_sug >= 0)
+			cpuc_sug = get_cpu_ctx_id(cpu_sug);
+		if (cpuc_sug)
+			__sync_fetch_and_sub(&cpuc_sug->nr_enq_non_local, 1);
+	}
+	reset_task_flag(taskc, LAVD_FLAG_ENQ_NON_LOCAL);
+
+	/*
 	 * Increase the number of pinned tasks waiting for execution.
 	 */
 	if (is_pinned(p))
@@ -1043,10 +1099,12 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 
 	/*
 	 * If this task is slice-boosted and there is a pinned task that
-	 * must run on this, shrink its time slice to the regular one.
+	 * must run on this or there is a task on its local DSQ, shrink
+	 * its time slice to the regular one.
 	 */
-	if (cpuc->nr_pinned_tasks &&
-	    test_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST)) {
+	if (test_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST) &&
+	    (cpuc->nr_pinned_tasks ||
+	     scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id))) {
 		shrink_boosted_slice_at_tick(p, cpuc, now);
 	}
 }

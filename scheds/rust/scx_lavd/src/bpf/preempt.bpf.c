@@ -285,15 +285,15 @@ static void shrink_boosted_slice_at_tick(struct task_struct *p,
 
 static void try_find_and_kick_victim_cpu(struct task_struct *p,
 					 struct task_ctx *taskc,
-					 s32 preferred_cpu,
-					 u64 dsq_id)
+					 struct cpu_ctx *cpuc_picked,
+					 bool direct_dispatch)
 {
 	struct preemption_info prm_t, prm_c;
 	struct bpf_cpumask *cd_cpumask, *cpumask;
 	struct cpdom_ctx *cpdomc;
-	struct cpu_ctx *cpuc_victim;
-	struct cpu_ctx *cpuc_cur = NULL;
+	struct cpu_ctx *cpuc_cur = NULL, *cpuc_victim;
 	u64 now, dur, new_slice = 0;
+	u64 dsq_id = cpuc_picked->cpdom_id;
 
 	/*
 	 * Don't even try to perform expensive preemption for greedy tasks.
@@ -309,9 +309,9 @@ static void try_find_and_kick_victim_cpu(struct task_struct *p,
 	 * its time slice.
 	 */
 	now = scx_bpf_now();
+	cpuc_victim = cpuc_picked;
+	init_prm_by_task(&prm_t, taskc, now);
 	if (!no_slice_boost &&
-	    (preferred_cpu >= 0) &&
-	    (cpuc_victim = get_cpu_ctx_id(preferred_cpu)) &&
 	    test_cpu_flag(cpuc_victim, LAVD_FLAG_SLICE_BOOST)) {
 		/*
 		 * If the enqueuing task is more latency-critical, let's
@@ -319,12 +319,9 @@ static void try_find_and_kick_victim_cpu(struct task_struct *p,
 		 * immediately.
 		 */
 		dur = time_delta(now, cpuc_victim->running_clk);
-		if (dur >= sys_stat.slice) {
-			init_prm_by_task(&prm_t, taskc, now);
-			if (can_x_kick_cpu2(&prm_t, &prm_c, cpuc_victim)) {
-				reset_cpu_flag(cpuc_victim, LAVD_FLAG_SLICE_BOOST);
-				goto kick_out;
-			}
+		if (dur >= sys_stat.slice &&
+		    can_x_kick_cpu2(&prm_t, &prm_c, cpuc_victim)) {
+			goto kick_out;
 		}
 
 		/*
@@ -337,9 +334,18 @@ static void try_find_and_kick_victim_cpu(struct task_struct *p,
 		if (test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED)) {
 			if (sys_stat.slice > dur)
 				new_slice = time_delta(sys_stat.slice, dur);
-			reset_cpu_flag(cpuc_victim, LAVD_FLAG_SLICE_BOOST);
 			goto kick_out;
 		}
+	}
+
+	/*
+	 * If the task was directly dispatched to the picked CPU's local DSQ,
+	 * there is no point in finding the victim in the other CPUs.
+	 */
+	if (direct_dispatch) {
+		if (can_x_kick_cpu2(&prm_t, &prm_c, cpuc_victim))
+			goto kick_out;
+		return;
 	}
 
 	/*
@@ -360,13 +366,15 @@ static void try_find_and_kick_victim_cpu(struct task_struct *p,
 	/*
 	 * Find a victim CPU among CPUs that run lower-priority tasks.
 	 */
-	cpuc_victim = find_victim_cpu(cast_mask(cpumask), preferred_cpu, taskc, now);
+	cpuc_victim = find_victim_cpu(cast_mask(cpumask), cpuc_picked->cpu_id,
+				      taskc, now);
 
 	/*
 	 * If a victim CPU is chosen, preempt the victim by kicking it.
 	 */
 	if (cpuc_victim) {
 kick_out:
+		reset_cpu_flag(cpuc_victim, LAVD_FLAG_SLICE_BOOST);
 		ask_cpu_yield_after(cpuc_victim, new_slice);
 
 		if (cpuc_cur || (cpuc_cur = get_cpu_ctx()))

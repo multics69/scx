@@ -116,6 +116,13 @@ struct Opts {
     #[clap(long = "slice-min-us", default_value = "500")]
     slice_min_us: u64,
 
+    /// The maximum number of tasks that can violate deadline-ordered
+    /// execution on a CPU. 0 means that all tasks will be strictly executed
+    /// in the order of their deadlines. More relaxation usually improves
+    /// performance, but it would increase tail latency a bit.
+    #[clap(long = "relax-deadline", default_value = "2")]
+    relax_deadline: u64,
+
     /// Limit the ratio of preemption to the roughly top P% of latency-critical
     /// tasks. When N is given as an argument, P is 0.5^N * 100. The default
     /// value is 6, which limits the preemption for the top 1.56% of
@@ -524,6 +531,7 @@ impl<'a> Scheduler<'a> {
         rodata.no_use_em = opts.no_use_em as u8;
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
+        rodata.relax_deadline = opts.relax_deadline;
 
         skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
