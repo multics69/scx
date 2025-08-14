@@ -381,7 +381,7 @@ macro_rules! scx_ops_open {
 
                 let name_field = &mut ops.name;
                 let existing_name = unsafe {
-                    ::std::ffi::CStr::from_ptr(name_field.as_ptr())
+                    ::std::ffi::CStr::from_ptr(name_field.as_ptr() as *const u8)
                         .to_str()
                         .expect("name is not utf-8")
                 };
