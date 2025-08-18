@@ -234,6 +234,9 @@ static void set_on_core_type(struct task_ctx *taskc,
 	int cpu;
 
 	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (cpu >= LAVD_CPU_ID_MAX)
+			break;
+
 		if (!bpf_cpumask_test_cpu(cpu, cpumask))
 			continue;
 

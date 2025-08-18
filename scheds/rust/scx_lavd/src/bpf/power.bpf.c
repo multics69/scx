@@ -608,6 +608,9 @@ int reinit_active_cpumask_for_performance(void)
 	 */
 	if (have_little_core) {
 		bpf_for(cpu, 0, nr_cpu_ids) {
+			if (cpu >= LAVD_CPU_ID_MAX)
+				break;
+
 			cpuc = get_cpu_ctx_id(cpu);
 			if (!cpuc)
 				continue;
@@ -641,6 +644,9 @@ int reinit_active_cpumask_for_performance(void)
 		bpf_cpumask_clear(ovrflw);
 
 		bpf_for(cpu, 0, nr_cpu_ids) {
+			if (cpu >= LAVD_CPU_ID_MAX)
+				break;
+
 			cpuc = get_cpu_ctx_id(cpu);
 			if (!cpuc || !cpuc->is_online)
 				continue;

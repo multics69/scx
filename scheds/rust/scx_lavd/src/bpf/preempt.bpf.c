@@ -121,6 +121,8 @@ static struct cpu_ctx *find_victim_cpu(const struct cpumask *cpumask,
 	 */
 	nr_cpus = bpf_cpumask_weight(cpumask);
 	bpf_for(i, 0, nr_cpus) {
+		if (i >= LAVD_CPU_ID_MAX)
+			break;
 
 		/*
 		 * Decide a CPU ID to examine.
