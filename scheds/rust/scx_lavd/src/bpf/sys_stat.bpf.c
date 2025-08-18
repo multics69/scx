@@ -86,6 +86,7 @@ static void init_sys_stat_ctx(struct sys_stat_ctx *c)
 static void collect_sys_stat(struct sys_stat_ctx *c)
 {
 	struct cpdom_ctx *cpdomc;
+	struct cpu_ctx *cpuc;
 	u64 cpdom_id, cpuc_tot_sc_time, compute;
 	int cpu;
 
@@ -121,7 +122,10 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 	 * Collect statistics for each CPU.
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
-		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+		if (cpu >= LAVD_CPU_ID_MAX)
+			break;
+
+		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			c->compute_total = 0;
 			break;
