@@ -2912,6 +2912,7 @@ dependencies = [
  "ordered-float",
  "plain",
  "rlimit",
+ "scx_arena",
  "scx_cargo",
  "scx_stats",
  "scx_stats_derive",
