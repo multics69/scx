@@ -14,6 +14,7 @@ pub use bpf_intf::*;
 mod cpu_order;
 use scx_utils::init_libbpf_logging;
 mod stats;
+use std::ffi::c_ulong;
 use std::ffi::c_int;
 use std::ffi::CStr;
 use std::mem;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use std::thread::ThreadId;
 use std::time::Duration;
 
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -159,6 +161,11 @@ struct Opts {
     /// highly experimental feature.
     #[clap(long = "per-cpu-dsq", action = clap::ArgAction::SetTrue)]
     per_cpu_dsq: bool,
+
+    /// Enable CPU bandwidth control using cpu.max in cgroup v2.
+    /// This is a highly experimental feature.
+    #[clap(long = "enable-cpu-bw", action = clap::ArgAction::SetTrue)]
+    enable_cpu_bw: bool,
 
     ///
     /// Disable core compaction so the scheduler uses all the online CPUs.
@@ -367,8 +374,11 @@ impl<'a> Scheduler<'a> {
         // Initialize skel according to @opts.
         Self::init_globals(&mut skel, &opts, &order);
 
-        // Attach.
+        // Initialize arena
         let mut skel = scx_ops_load!(skel, lavd_ops, uei)?;
+        Self::setup_arenas(&mut skel).unwrap();
+
+        // Attach.
         let struct_ops = Some(scx_ops_attach!(skel, lavd_ops)?);
         let stats_server = StatsServer::new(stats::server_data(*NR_CPU_IDS as u64)).launch()?;
 
@@ -525,7 +535,7 @@ impl<'a> Scheduler<'a> {
         bss_data.is_powersave_mode = opts.powersave;
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.nr_llcs = order.nr_llcs as u64;
-        rodata.__nr_cpu_ids = *NR_CPU_IDS as u64;
+        rodata.nr_cpu_ids = *NR_CPU_IDS as u32;
         rodata.is_smt_active = order.smt_enabled;
         rodata.is_autopilot_on = opts.autopilot;
         rodata.verbose = opts.verbose;
@@ -536,11 +546,45 @@ impl<'a> Scheduler<'a> {
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
+        rodata.enable_cpu_bw = opts.enable_cpu_bw;
 
         skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
+    }
+
+    fn setup_arenas(skel: &mut BpfSkel<'_>) -> Result<()> {
+        const STATIC_ALLOC_PAGES_GRANULARITY: c_ulong = 8;
+        const TASK_SIZE: c_ulong = std::mem::size_of::<types::task_ctx>() as c_ulong;
+
+        // Allocate the arena memory from the BPF side so userspace initializes it before starting
+        // the scheduler. Despite the function call's name this is neither a test nor a test run,
+        // it's the recommended way of executing SEC("syscall") probes.
+        let mut args = types::arena_init_args {
+            static_pages: STATIC_ALLOC_PAGES_GRANULARITY,
+            task_ctx_size: TASK_SIZE,
+        };
+
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        let output = skel.progs.arena_init.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Could not initialize arenas: {}",
+                output.return_value as i32
+            );
+        }
+
+        Ok(())
     }
 
     fn get_msg_seq_id() -> u64 {

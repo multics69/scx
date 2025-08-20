@@ -78,7 +78,7 @@ struct scx_cgroup_ctx {
  * If a cgroup is either at a leaf level or threaded, we manage per-LLC-cgroup
  * contexts to reduce cross-LLC cache coherence traffic. Otherwise, the cgroup
  * stats are used only for distributing remaining budgets. In this case, we do
- * not manage per-LLCvcontext since they will be accessed much less frequently.
+ * not manage per-LLC context since they will be accessed much less frequently.
  */
 struct scx_cgroup_llc_ctx {
 	/*
@@ -122,7 +122,7 @@ struct scx_cgroup_llc_ctx {
 	 * backend of BTQ.
 	 */
 	scx_atq_t	*btq;
-} __attribute__((aligned(SCX_CACHELINE_SIZE));
+} __attribute__((aligned(SCX_CACHELINE_SIZE)));
 
 /**
  * Configs for cpu.max
