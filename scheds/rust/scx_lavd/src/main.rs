@@ -15,6 +15,7 @@ mod cpu_order;
 use scx_utils::init_libbpf_logging;
 mod stats;
 use std::ffi::c_int;
+use std::ffi::c_ulong;
 use std::ffi::CStr;
 use std::mem;
 use std::mem::MaybeUninit;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use std::thread::ThreadId;
 use std::time::Duration;
 
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -54,7 +56,10 @@ use scx_utils::scx_ops_open;
 use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
+use scx_utils::Core;
 use scx_utils::EnergyModel;
+use scx_utils::Llc;
+use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use scx_utils::NR_CPU_IDS;
 use stats::SchedSample;
@@ -160,6 +165,11 @@ struct Opts {
     /// highly experimental feature.
     #[clap(long = "per-cpu-dsq", action = clap::ArgAction::SetTrue)]
     per_cpu_dsq: bool,
+
+    /// Enable CPU bandwidth control using cpu.max in cgroup v2.
+    /// This is a highly experimental feature.
+    #[clap(long = "enable-cpu-bw", action = clap::ArgAction::SetTrue)]
+    enable_cpu_bw: bool,
 
     ///
     /// Disable core compaction so the scheduler uses all the online CPUs.
@@ -372,8 +382,12 @@ impl<'a> Scheduler<'a> {
         // Initialize skel according to @opts.
         Self::init_globals(&mut skel, &opts, &order);
 
-        // Attach.
+        // Initialize arena
         let mut skel = scx_ops_load!(skel, lavd_ops, uei)?;
+        Self::setup_arenas(&mut skel).unwrap();
+        Self::setup_topology(&mut skel).unwrap();
+
+        // Attach.
         let struct_ops = Some(scx_ops_attach!(skel, lavd_ops)?);
         let stats_server = StatsServer::new(stats::server_data(*NR_CPU_IDS as u64)).launch()?;
 
@@ -530,7 +544,7 @@ impl<'a> Scheduler<'a> {
         bss_data.is_powersave_mode = opts.powersave;
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.nr_llcs = order.nr_llcs as u64;
-        rodata.__nr_cpu_ids = *NR_CPU_IDS as u64;
+        rodata.nr_cpu_ids = *NR_CPU_IDS as u32;
         rodata.is_smt_active = order.smt_enabled;
         rodata.is_autopilot_on = opts.autopilot;
         rodata.verbose = opts.verbose;
@@ -541,11 +555,137 @@ impl<'a> Scheduler<'a> {
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
+        rodata.enable_cpu_bw = opts.enable_cpu_bw;
 
         skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
             | *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
+    }
+
+    fn setup_arenas(skel: &mut BpfSkel<'_>) -> Result<()> {
+        const STATIC_ALLOC_PAGES_GRANULARITY: c_ulong = 8;
+        const TASK_SIZE: c_ulong = std::mem::size_of::<types::task_ctx>() as c_ulong;
+
+        // Allocate the arena memory from the BPF side so userspace initializes it before starting
+        // the scheduler. Despite the function call's name this is neither a test nor a test run,
+        // it's the recommended way of executing SEC("syscall") probes.
+        let mut args = types::arena_init_args {
+            static_pages: STATIC_ALLOC_PAGES_GRANULARITY,
+            task_ctx_size: TASK_SIZE,
+        };
+
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        let output = skel.progs.arena_init.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Could not initialize arenas: {}",
+                output.return_value as i32
+            );
+        }
+
+        Ok(())
+    }
+
+    fn setup_topology_node(skel: &BpfSkel<'_>, mask: &[u64]) -> Result<()> {
+        let mut args = types::arena_alloc_mask_args {
+            bitmap: 0 as c_ulong,
+        };
+
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        let output = skel.progs.arena_alloc_mask.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Could not initialize arenas, setup_topology_node returned {}",
+                output.return_value as i32
+            );
+        }
+
+        let ptr = unsafe { std::mem::transmute::<u64, &mut [u64; 10]>(args.bitmap) };
+
+        let (valid_mask, _) = ptr.split_at_mut(mask.len());
+        valid_mask.clone_from_slice(mask);
+
+        let mut args = types::arena_topology_node_init_args {
+            bitmap: args.bitmap as c_ulong,
+            data_size: 0 as c_ulong,
+            id: 0 as c_ulong,
+        };
+
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        let output = skel.progs.arena_topology_node_init.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "lavd_topology_node_init returned {}",
+                output.return_value as i32
+            );
+        }
+
+        Ok(())
+    }
+
+    fn setup_topology(skel: &mut BpfSkel<'_>) -> Result<()> {
+        let topo = Topology::new().expect("Failed to build host topology");
+
+        Self::setup_topology_node(&skel, topo.span.as_raw_slice())?;
+
+        for (_, node) in topo.nodes {
+            Self::setup_topology_node(&skel, node.span.as_raw_slice())?;
+        }
+
+        for (_, llc) in topo.all_llcs {
+            Self::setup_topology_node(
+                &skel,
+                Arc::<Llc>::into_inner(llc)
+                    .expect("missing llc")
+                    .span
+                    .as_raw_slice(),
+            )?;
+        }
+
+        for (_, core) in topo.all_cores {
+            Self::setup_topology_node(
+                &skel,
+                Arc::<Core>::into_inner(core)
+                    .expect("missing core")
+                    .span
+                    .as_raw_slice(),
+            )?;
+        }
+        for (_, cpu) in topo.all_cpus {
+            let mut mask = [0; 9];
+            mask[cpu.id.checked_shr(64).unwrap_or(0)] |= 1 << (cpu.id % 64);
+            Self::setup_topology_node(&skel, &mask)?;
+        }
+
+        Ok(())
     }
 
     fn get_msg_seq_id() -> u64 {
