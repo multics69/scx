@@ -355,6 +355,11 @@ struct scx_cgroup_ctx *cbw_get_cgroup_ctx(struct cgroup *cgrp)
 	return bpf_cgrp_storage_get(&cbw_cgrp_map, cgrp, 0, 0);
 }
 
+long cbw_del_cgroup_ctx(struct cgroup *cgrp)
+{
+	return bpf_cgrp_storage_delete(&cbw_cgrp_map, cgrp);
+}
+
 static
 struct scx_cgroup_llc_ctx *cbw_alloc_llc_ctx(struct cgroup *cgrp,
 					     struct scx_cgroup_ctx *cgx,
@@ -622,10 +627,36 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 	return cbw_init_llc_ctx(cgrp, cgx);
 }
 
+/**
+ * scx_cgroup_bw_exit - Exit a cgroup.
+ * @cgrp: cgroup being exited
+ *
+ * Either the BPF scheduler is being unloaded or @cgrp destroyed, exit
+ * @cgrp for sched_ext. This operation my block.
+ *
+ * Return 0 for success, -errno for failure.
+ */
 __hidden
 int scx_cgroup_bw_exit(struct cgroup *cgrp __arg_trusted)
 {
-	return -ENOTSUP;
+	struct cgroup *parent;
+	struct scx_cgroup_ctx *parentx;
+
+	cbw_dbg_cgrp();
+
+	if ((cgrp->level > 0) &&
+	    (parent = bpf_cgroup_ancestor(cgrp, cgrp->level - 1))) {
+		parentx = cbw_get_cgroup_ctx(parent);
+		if (parentx) {
+			parentx->nr_children--;
+			cbw_update_budget_tx(parentx);
+		}
+		bpf_cgroup_release(parent);
+	}
+
+	cbw_del_cgroup_ctx(cgrp);
+	cbw_free_llc_ctx(cgrp, NULL);
+	return 0;
 }
 
 /**
