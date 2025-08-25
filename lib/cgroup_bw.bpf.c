@@ -180,6 +180,12 @@ struct scx_cgroup_ctx *cbw_get_cgroup_ctx(struct cgroup *cgrp)
 }
 
 static
+long cbw_del_cgroup_ctx(struct cgroup *cgrp)
+{
+	return bpf_cgrp_storage_delete(&cbw_cgrp_map, cgrp);
+}
+
+static
 struct scx_cgroup_llc_ctx *cbw_alloc_llc_ctx(struct cgroup *cgrp, int llc_id)
 {
 	static const struct scx_cgroup_llc_ctx llcx0;
@@ -394,9 +400,20 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 	return cbw_init_llc_ctx(cgrp, cgx);
 }
 
+/**
+ * scx_cgroup_bw_exit - Exit a cgroup.
+ * @cgrp: cgroup being exited
+ *
+ * Either the BPF scheduler is being unloaded or @cgrp destroyed, exit
+ * @cgrp for sched_ext. This operation my block.
+ *
+ * Return 0 for success, -errno for failure.
+ */
 int scx_cgroup_bw_exit(struct cgroup *cgrp __arg_trusted)
 {
-	return -ENOTSUP;
+	cbw_del_cgroup_ctx(cgrp);
+	cbw_free_llc_ctx(cgrp, NULL);
+	return 0;
 }
 
 /**
