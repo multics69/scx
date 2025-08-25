@@ -171,6 +171,11 @@ struct scx_cgroup_ctx *cbw_get_cgroup_ctx(struct cgroup *cgrp)
 	return bpf_cgrp_storage_get(&cbw_cgrp_map, cgrp, 0, 0);
 }
 
+long cbw_del_cgroup_ctx(struct cgroup *cgrp)
+{
+	return bpf_cgrp_storage_delete(&cbw_cgrp_map, cgrp);
+}
+
 static
 struct scx_cgroup_llc_ctx *cbw_alloc_llc_ctx(struct cgroup *cgrp,
 					     struct scx_cgroup_ctx *cgx,
@@ -401,15 +406,23 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 	return cbw_init_llc_ctx(cgrp, cgx);
 }
 
+/**
+ * scx_cgroup_bw_exit - Exit a cgroup.
+ * @cgrp: cgroup being exited
+ *
+ * Either the BPF scheduler is being unloaded or @cgrp destroyed, exit
+ * @cgrp for sched_ext. This operation my block.
+ *
+ * Return 0 for success, -errno for failure.
+ */
 __hidden
 int scx_cgroup_bw_exit(struct cgroup *cgrp __arg_trusted)
 {
-	return -ENOTSUP;
+	cbw_del_cgroup_ctx(cgrp);
+	cbw_free_llc_ctx(cgrp, NULL);
+	return 0;
 }
 
-<<<<<<< HEAD
-__hidden
-=======
 /**
  * scx_cgroup_bw_set - A cgroup's bandwidth is being changed.
  * @cgrp: cgroup whose bandwidth is being updated
@@ -430,7 +443,7 @@ __hidden
  *
  * Return 0 for success, -errno for failure.
  */
->>>>>>> 7c1c6ee4 (lib: cgroup_bw: Implement scx_cgroup_bw_init().)
+__hidden
 int scx_cgroup_bw_set(struct cgroup *cgrp __arg_trusted, u64 period_us, u64 quota_us, u64 burst_us)
 {
 	struct cgroup *cur_cgrp;
