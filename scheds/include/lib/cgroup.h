@@ -75,11 +75,13 @@ int scx_cgroup_bw_exit(struct cgroup *cgrp __arg_trusted);
 int scx_cgroup_bw_set(struct cgroup *cgrp __arg_trusted, u64 period_us, u64 quota_us, u64 burst_us);
 
 /**
- * scx_cgroup_bw_throttledi - 
- * @cgrp:
- * @llc_id:
+ * scx_cgroup_bw_throttled - Check if the cgroup is throttled or not.
+ * @cgrp: cgroup where a task belongs to.
+ * @llc_id: caller's LLC id.
  *
- * Returns
+ * Return 0 when the cgroup is not throttled,
+ * -EAGAIN when the cgroup is throttled, and
+ * -errno for some other failures.
  */
 int scx_cgroup_bw_throttled(struct cgroup *cgrp __arg_trusted, int llc_id);
 
