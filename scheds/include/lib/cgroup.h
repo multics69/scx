@@ -86,12 +86,12 @@ int scx_cgroup_bw_set(struct cgroup *cgrp __arg_trusted, u64 period_us, u64 quot
 int scx_cgroup_bw_throttled(struct cgroup *cgrp __arg_trusted, int llc_id);
 
 /**
- * scx_cgroup_bw_consume - 
- * @cgrp:
- * @llc_id:
- * @consumed_ns:
+ * scx_cgroup_bw_consume - Consume the time actually used after the task execution.
+ * @cgrp: cgroup where a task belongs to.
+ * @llc_id: caller's LLC id.
+ * @consumed_ns: amount of time actually used.
  *
- * Returns
+ * Return 0 for success, -errno for failure.
  */
 int scx_cgroup_bw_consume(struct cgroup *cgrp __arg_trusted, int llc_id, u64 consumed_ns);
 
