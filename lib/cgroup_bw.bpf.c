@@ -1168,10 +1168,55 @@ release_out:
 	return ret;
 }
 
+/**
+ * scx_cgroup_bw_consume - Consume the time actually used after the task execution.
+ * @cgrp: cgroup where a task belongs to.
+ * @llc_id: caller's LLC id.
+ * @reserved_ns: amount of time budgeted.
+ * @consumed_ns: amount of time actually used.
+ *
+ * Return 0 for success, -errno for failure.
+ */
 __hidden
 int scx_cgroup_bw_consume(struct cgroup *cgrp __arg_trusted, int llc_id, u64 reserved_ns, u64 consumed_ns)
 {
-	return -ENOTSUP;
+	struct scx_cgroup_llc_ctx *llcx;
+
+	/* Always go ahead with the root cgroup. */
+	if (cgrp->level == 0)
+		return 0;
+
+	/* Sanity check LLC ID. */
+	if (!is_llc_id_valid(llc_id)) {
+		cbw_err("Invalid LLC id: %d", llc_id);
+		return -EINVAL;
+	}
+
+	/*
+	 * Update the budget usage.
+	 *
+	 * Note that the budget can be reserved in an LLC domain and then
+	 * actually used in another LLC domain. However, that is not a problem
+	 * because LLC's runtime_total will be aggregated to the cgroup level
+	 * at reservation.
+	 */
+	llcx = cbw_get_llc_ctx(cgrp, llc_id);
+	if (!llcx) {
+		/*
+		 * When exiting a scx scheduler, the sched_ext kernel shuts
+		 * down cgroup support before tasks. Hence, failing to look
+		 * up an LLC context is quite normal in this case.
+		 */
+		return 0;
+	}
+
+	cbw_consume_budget(llcx, reserved_ns, consumed_ns);
+
+	cbw_dbg_fn_cgrp("  llc_id: %d -- reserved_ns: %llu -- consumed_ns: %llu -- llcx:budget_remaining: %lld -- llcx:runtime_total: %lld",
+			llc_id, reserved_ns, consumed_ns,
+			READ_ONCE(llcx->budget_remaining),
+			READ_ONCE(llcx->runtime_total));
+	return 0;
 }
 
 __hidden
