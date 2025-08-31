@@ -206,6 +206,13 @@ struct {
 } tree_levels_map SEC(".maps");
 
 /*
+ * An array of cgroups that can have tasks. This is necessary to iterate
+ * cgroups without holding an RCU lock.
+ */
+static u64		cbw_nr_taskable_cgroups;
+static u64		cbw_taskable_cgroup_ids[CBW_NR_CGRP_MAX];
+
+/*
  * Timer to replenish time budget for all cgroups periodically.
  */
 struct replenish_timer {
@@ -223,6 +230,36 @@ static u64		cbw_last_replenish_at;
 
 static
 int replenish_timerfn(void *map, int *key, struct bpf_timer *timer);
+
+/*
+ * The replenish timer running status. The replenish timer is split into two
+ * parts: the top half and the bottom half. The top half -- the actual BPF
+ * timer function -- runs the essential, critical part, such as refilling the
+ * time budget. On the other hand, the bottom half -- scx_cgroup_bw_reenqueue()
+ * -- runs on a BPF scheduler's ops.dispatch() and requeues the backlogged
+ *  tasks to proper DSQs.
+ *
+ *  [IDLE] -> [TOP_HALF_RUNNING] -> [BOTTOM_HALF_READY] -> [BOTTOM_HALF_RUNNING]
+ *   /+\                                                            |
+ *    |                                                             |
+ *    +-------------------------------------------------------------+
+ */
+enum replenish_stats {
+	/* Nothing related to the replenishment is going on. */
+	CBW_REPLENISH_STAT_IDLE			= 0,
+	/* The top half of the replenish timer is running. */
+	CBW_REPLENISH_STAT_TOP_HALF_RUNNING	= 1,
+	/* The top half was done. It is ready to start the bottom-half part. */
+	CBW_REPLENISH_STAT_BOTTOM_HALF_READY	= 2,
+	/* The bottom half of the replenish timer is running at ops.dispatch(). */
+	CBW_REPLENISH_STAT_BOTTOM_HALF_RUNNING	= 3,
+};
+
+struct replenish_stat {
+	int			s;
+} __attribute__((aligned(SCX_CACHELINE_SIZE)));
+
+static struct replenish_stat cbw_replenish_stat;
 
 /*
  * Debug macros.
@@ -1270,10 +1307,67 @@ int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 ctx, u64 vt
 	return ret;
 }
 
-__hidden
-int scx_cgroup_bw_reenqueue(void)
+static
+int cbw_replenish_cgroup(struct scx_cgroup_ctx *cgx, int level, u64 now)
 {
-	return -ENOTSUP;
+	s64 burst, budget_inc;
+	int i;
+
+	/*
+	 * Replenish the quota at the cgroup level, considering the burst.
+	 *
+	 * We need to replenish budget_remaining at the subroot level
+	 * (level == 1) because only the subroot cgroup distributes the budget
+	 * to its descendants. Also, replenishing quota is necessary only when
+	 * the cgroup's quota is limited (i.e., not unlimited).
+	 */
+	if ((level == 1) && (cgx->nquota != CBW_RUNTUME_INF)) {
+		/*
+		 * If the budget is underutilized, we accumulate the remaining
+		 * budget up to the burst within the period. On the other hand,
+		 * if the budget is overused (cgx->budget_remaining < 0), the
+		 * overused time should be charged over time within one period.
+		 */
+		if (cgx->burst > 0) {
+			burst = clamp(cgx->budget_remaining, 0, cgx->burst_remaining);
+			budget_inc = cgx->nquota + burst;
+
+			if (time_delta(now, cgx->period_start_clk) < cgx->period)
+				cgx->burst_remaining -= burst;
+			else
+				cgx->burst_remaining = cgx->burst;
+		} else
+			budget_inc = cgx->nquota;
+
+		if (time_delta(now, cgx->period_start_clk) < cgx->period) {
+			__sync_fetch_and_add(&cgx->budget_remaining, budget_inc);
+		} else {
+			bpf_for(i, 0, cbw_config.nr_llcs) {
+				struct scx_cgroup_llc_ctx *llcx;
+
+				llcx = cbw_get_llc_ctx_with_id(cgx->id, i);
+				if (!llcx)
+					continue;
+
+				WRITE_ONCE(llcx->budget_remaining, 0);
+			}
+
+			WRITE_ONCE(cgx->budget_remaining, budget_inc);
+			cgx->period_start_clk = now;
+		}
+
+		dbg_cgx(cgx, "replenished: ");
+	}
+	WRITE_ONCE(cgx->is_throttled, false);
+	return 0;
+}
+
+static
+bool cbw_transit_replenish_stat(int from, int to)
+{
+	if (READ_ONCE(cbw_replenish_stat.s) != from)
+		return false;
+	return __sync_bool_compare_and_swap(&cbw_replenish_stat.s, from, to);
 }
 
 /*
@@ -1282,6 +1376,271 @@ int scx_cgroup_bw_reenqueue(void)
 static
 int replenish_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
-	/* TODO: to be implemented */
+	struct cgroup *root_cgrp, *cur_cgrp;
+	struct scx_cgroup_ctx *cur_cgx;
+	struct cgroup_subsys_state *subroot_css, *pos;
+	struct scx_cgroup_llc_ctx *cur_llcx;
+	const struct cpumask *online_mask;
+	u64 *ids, now;
+	s64 interval, jitter, period;
+	s32 idle_cpu;
+	int i, cur_level, ret;
+
+	/*
+	 * Let's start running the top half.
+	 */
+	if (!cbw_transit_replenish_stat(CBW_REPLENISH_STAT_IDLE,
+					CBW_REPLENISH_STAT_TOP_HALF_RUNNING)) {
+		cbw_err("Incorrect replenish state: %d -- %d => %d",
+			cbw_replenish_stat.s, CBW_REPLENISH_STAT_IDLE,
+			CBW_REPLENISH_STAT_TOP_HALF_RUNNING);
+		return 0;
+	}
+
+	now  = scx_bpf_now();
+	cbw_dbg_fn("at %llu", now);
+
+	/*
+	 * Reset the runtime_total of each LLC context and update the array of
+	 * taskable or subroot-level (level == 1) cgroup IDs
+	 * (cbw_taskable_cgroup_ids). The subroot-level cgroups need to be
+	 * replenished since they distribute the budget even if they are not
+	 * taskable. This prevents the runtime_total_sloppy at the cgroup level
+	 * from being mixed with the runtime_total of the LLC level in a
+	 * previous period.
+	 */
+	root_cgrp = bpf_cgroup_from_id(1);
+	if (!root_cgrp) {
+		cbw_err("Failed to fetch the root cgroup pointer.");
+		goto transit_out;
+	}
+
+	bpf_rcu_read_lock();
+	cbw_nr_taskable_cgroups = 0;
+	subroot_css = &root_cgrp->self;
+	bpf_for_each(css, pos, subroot_css, BPF_CGROUP_ITER_DESCENDANTS_POST) {
+		cur_cgrp = pos->cgroup;
+		cur_cgx = cbw_get_cgroup_ctx(cur_cgrp);
+		if (!cur_cgx) {
+			/*
+			 * The CPU controller of this cgroup is not enabled
+			 * so that we can skip it safely.
+			 */
+			continue;
+		}
+
+		if (cur_cgx->has_llcx) {
+			bpf_for(i, 0, cbw_config.nr_llcs) {
+				cur_llcx = cbw_get_llc_ctx(cur_cgrp, i);
+				if (cur_llcx)
+					WRITE_ONCE(cur_llcx->runtime_total, 0);
+			}
+		}
+
+		if (cur_cgx->has_llcx || cur_cgrp->level == 1) {
+			ids = MEMBER_VPTR(cbw_taskable_cgroup_ids, [cbw_nr_taskable_cgroups]);
+			if (!ids) {
+				cbw_err("Failed to fetch a taskable cgroup table.");
+				continue;
+			}
+			*ids = cgroup_get_id(cur_cgrp);
+			cbw_nr_taskable_cgroups++;
+		}
+		WRITE_ONCE(cur_cgx->runtime_total_sloppy, 0);
+	}
+	bpf_rcu_read_unlock();
+	bpf_cgroup_release(root_cgrp);
+
+	/*
+	 * Replenish all the taskable cgroups.
+	 *
+	 * Note that we do not use the cgroup iterator here since it requires
+	 * an RCU read lock. We should not acquire the RCU read lock here since
+	 * the enqueue callback could hold an RCU read lock.
+	 *
+	 * Note that there is a time gap between the time of update (when
+	 * runtime_total_sloppy is updated) and the time of use (when the
+	 * cgroup is replenished). Hence, there is an inaccuracy in calculating
+	 * the burst time. However, relaxing some accuracy in burst time
+	 * calculation has more benefits than drawbacks.
+	 */
+	cbw_dbg("Start replenish %llu taskable cgroups.", cbw_nr_taskable_cgroups);
+	bpf_for(i, 0, cbw_nr_taskable_cgroups) {
+		ids = MEMBER_VPTR(cbw_taskable_cgroup_ids, [i]);
+		if (!ids) {
+			cbw_err("Failed to fetch a taskable cgroup table.");
+			continue;
+		}
+
+		cur_cgrp = bpf_cgroup_from_id(ids[0]);
+		if (!cur_cgrp) {
+			cbw_err("Failed to fetch a cgroup pointer.");
+			goto transit_out;
+		}
+
+		cur_cgx = cbw_get_cgroup_ctx(cur_cgrp);
+		if (!cur_cgx) {
+			cbw_err("Failed to lookup a cgroup ctx");
+			bpf_cgroup_release(cur_cgrp);
+			goto transit_out;
+		}
+
+		cur_level = cur_cgrp->level;
+		bpf_cgroup_release(cur_cgrp);
+
+		cbw_replenish_cgroup(cur_cgx, cur_level, now);
+	}
+
+	/*
+	 * Transit from a top-half running to a bottom-half ready.
+	 * After this, the bottom half can start.
+	 */
+transit_out:
+	cbw_transit_replenish_stat(CBW_REPLENISH_STAT_TOP_HALF_RUNNING,
+				   CBW_REPLENISH_STAT_BOTTOM_HALF_READY);
+
+	/*
+	 * scx_cgroup_bw_reenqueue() may be called from ops.dispatch().
+	 * In the worst case, when all CPUs are idle and all runnable tasks
+	 * are backlogged, ops.dispatch() may be deferred indefinitely.
+	 *
+	 * Avoid this by selecting and kicking an idle CPU to guarantee that
+	 * ops.dispatch() runs immediately. If no idle CPU is available, this
+	 * is fine since ops.dispatch() will be invoked shortly anyway.
+	 */
+	online_mask = scx_bpf_get_online_cpumask();
+	idle_cpu = scx_bpf_pick_idle_cpu(online_mask, SCX_PICK_IDLE_CORE);
+	if (idle_cpu == -EBUSY)
+		idle_cpu = scx_bpf_pick_idle_cpu(online_mask, 0);
+	if (idle_cpu >= 0)
+		scx_bpf_kick_cpu(idle_cpu, SCX_KICK_IDLE);
+	scx_bpf_put_cpumask(online_mask);
+
+	/*
+	 * Re-arm the replenish timer. We calculate the jitter to compensate
+	 * for the delay of the timer execution.CBW_NPERIOD,
+	 */
+	interval = time_delta(now, cbw_last_replenish_at);
+	jitter = time_delta(interval, CBW_NPERIOD);
+	period = max(time_delta(CBW_NPERIOD, jitter), CBW_BUDGET_XFER_MIN);
+	if ((ret = bpf_timer_start(timer, period, 0)))
+		cbw_err("Failed to re-arm replenish timer: %d", ret);
+	cbw_last_replenish_at = now;
+
 	return 0;
+}
+
+static
+void cbw_drain_btq_until_throttled(struct scx_cgroup_ctx *cgx,
+				   struct scx_cgroup_llc_ctx *llcx)
+{
+	u64 taskc;
+
+	/*
+	 * Pop the tasks in the BTQ and ask the BPF scheduler to enqueue
+	 * them to a DSQ for execution until the BTQ becomes empty or
+	 * the cgroup is throttled.
+	 */
+	while (!READ_ONCE(cgx->is_throttled) &&
+	       (taskc = scx_atq_pop(llcx->btq)) && can_loop) {
+		scx_group_bw_enqueue_cb(taskc);
+		cbw_dbg_fn("cgid%llu", cgx->id);
+	}
+}
+
+static
+int cbw_reenqueue_cgroup(struct scx_cgroup_ctx *cgx, u64 cgrp_id, int level, u64 now)
+{
+	struct scx_cgroup_llc_ctx *llcx;
+	int i;
+
+	/*
+	 * Drain BTQ of each LLC level until the BTQ becomes empty or
+	 * the cgroup is throttled.
+	 */
+	if (!cgx->has_llcx)
+		return 0;
+	cbw_dbg_fn("cgid%llu", cgrp_id);
+
+	bpf_for(i, 0, cbw_config.nr_llcs) {
+		llcx = cbw_get_llc_ctx_with_id(cgrp_id, i);
+		if (!llcx) {
+			cbw_err("Failed to lookup an LLC context");
+			continue;
+		}
+
+		cbw_drain_btq_until_throttled(cgx, llcx);
+	}
+	return 0;
+}
+
+/*
+ * scx_cgroup_bw_reenqueue - Reenqueue backlogged tasks.
+ *
+ * When a cgroup is throttled, a task should be put aside at the ops.enqueue()
+ * path. Once the cgroup becomes unthrottled again, such backlogged tasks
+ * should be requeued for execution. To this end, a BPF scheduler should call
+ * this at the beginning of its ops.dispatch() method, so that backlogged tasks
+ * can be reenqueued if necessary.
+ *
+ * Return 0 for success, -errno for failure.
+ */
+__hidden
+int scx_cgroup_bw_reenqueue(void)
+{
+	struct cgroup *cur_cgrp;
+	struct scx_cgroup_ctx *cur_cgx;
+	u64 *ids, cur_cgrp_id, now;
+	int i, cur_level, ret = 0;
+
+	/*
+	 * If the bottom half is ready to run, go ahead after changing the
+	 * state to the bottom-half running. Otherwise, stop here.
+	 */
+	if (!cbw_transit_replenish_stat(CBW_REPLENISH_STAT_BOTTOM_HALF_READY,
+					CBW_REPLENISH_STAT_BOTTOM_HALF_RUNNING))
+		return 0;
+
+	/*
+	 * Reqneueue backlogged tasks of the throttled cgroups.
+	 */
+	cbw_dbg_fn();
+	now  = scx_bpf_now();
+	bpf_for(i, 0, cbw_nr_taskable_cgroups) {
+		ids = MEMBER_VPTR(cbw_taskable_cgroup_ids, [i]);
+		if (!ids) {
+			cbw_err("Failed to fetch a taskable cgroup table.");
+			continue;
+		}
+
+		cur_cgrp = bpf_cgroup_from_id(ids[0]);
+		if (!cur_cgrp) {
+			cbw_err("Failed to fetch a cgroup pointer.");
+			ret = -ESRCH;
+			goto transit_out;
+		}
+
+		cur_cgx = cbw_get_cgroup_ctx(cur_cgrp);
+		if (!cur_cgx) {
+			cbw_err("Failed to lookup a cgroup ctx");
+			bpf_cgroup_release(cur_cgrp);
+			ret = -ESRCH;
+			goto transit_out;
+		}
+
+		cur_cgrp_id = cgroup_get_id(cur_cgrp);
+		cur_level = cur_cgrp->level;
+		bpf_cgroup_release(cur_cgrp);
+
+		cbw_reenqueue_cgroup(cur_cgx, cur_cgrp_id, cur_level, now);
+	}
+
+	/*
+	 * Transit from a bottom-half running to an idle state.
+	 * After this, the top half can start.
+	 */
+transit_out:
+	cbw_transit_replenish_stat(CBW_REPLENISH_STAT_BOTTOM_HALF_RUNNING,
+				   CBW_REPLENISH_STAT_IDLE);
+	return ret;
 }
