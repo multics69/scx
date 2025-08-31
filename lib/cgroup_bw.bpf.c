@@ -256,6 +256,24 @@ void cbw_drain_n_free_btq(scx_atq_t *btq)
 }
 
 static
+void cbw_drain_btq_until_throttled(struct scx_cgroup_ctx *cgx,
+				   struct scx_cgroup_llc_ctx *llcx)
+{
+	u64 pid64;
+
+	/*
+	 * Pop the tasks in the BTQ and ask the BPF scheduler to enqueue
+	 * them to a DSQ for execution until the BTQ becomes empty or
+	 * the cgroup is throttled.
+	 */
+	while (!READ_ONCE(cgx->is_throttled) &&
+	       (pid64 = scx_atq_pop(llcx->btq)) && can_loop) {
+		pid_t pid = (pid_t)pid64;
+		scx_group_bw_enqueue_cb(pid);
+	}
+}
+
+static
 int cbw_init_llc_ctx(struct cgroup *cgrp, struct scx_cgroup_ctx *cgx)
 {
 	int i;
@@ -970,12 +988,146 @@ int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 vtime, stru
 	return ret;
 }
 
+static
+int cbw_reset_runtime_total(struct cgroup *cgrp __arg_trusted)
+{
+	struct cgroup *cur_cgrp;
+	struct scx_cgroup_ctx *cur_cgx;
+	struct cgroup_subsys_state *subroot_css, *pos;
+	struct scx_cgroup_llc_ctx *cur_llcx;
+	int i;
+
+	bpf_rcu_read_lock();
+	subroot_css = &cgrp->self;
+	bpf_for_each(css, pos, subroot_css, BPF_CGROUP_ITER_DESCENDANTS_POST) {
+		cur_cgrp = pos->cgroup;
+		cur_cgx = cbw_get_cgroup_ctx(cur_cgrp);
+		if (!cur_cgx) {
+			cbw_err("Failed to lookup a cgroup ctx");
+			continue;
+		}
+
+		if (cur_cgx->has_llcx) {
+			bpf_for(i, 0, cbw_config.nr_llcs) {
+				cur_llcx = cbw_get_llc_ctx(cur_cgrp, i);
+				if (cur_llcx)
+					WRITE_ONCE(cur_llcx->runtime_total, 0);
+			}
+		}
+		WRITE_ONCE(cur_cgx->runtime_total_sloppy, 0);
+	}
+	bpf_rcu_read_unlock();
+	return 0;
+}
+
+static
+int cbw_replenish_cgroup(struct cgroup *cgrp __arg_trusted, u64 now)
+{
+	struct scx_cgroup_ctx *cgx;
+	struct scx_cgroup_llc_ctx *llcx;
+	s64 burst, budget_inc;
+	int i;
+
+	/*
+	 * Replenish the quota at the cgroup level, considering the burst.
+	 *
+	 * We need to replenish budget_remaining at the subroot level
+	 * (level == 1) because only the subroot cgroup distributes the budget
+	 * to its descendants. Also, replenishing quota is necessary only when
+	 * the cgroup's quota is limited (i.e., not unlimited).
+	 */
+	cgx = cbw_get_cgroup_ctx(cgrp);
+	if (!cgx) {
+		cbw_err("Failed to lookup a cgroup ctx");
+		return -ESRCH;
+	}
+
+	if ((cgrp->level == 1) && (cgx->nquota != CBW_RUNTUME_INF)) {
+		/*
+		 * If the budget is underutilized, we accumulate the remaining
+		 * budget up to the burst within the period. On the other hand,
+		 * if the budget is overused (cgx->budget_remaining < 0), the
+		 * overused time should be charged over time.
+		 */
+		burst = min(cgx->budget_remaining, cgx->burst_remaining);
+		budget_inc = cgx->nquota + burst;
+		if (cgx->budget_remaining >= 0) {
+			WRITE_ONCE(cgx->budget_remaining, budget_inc);
+		} else {
+			__sync_fetch_and_add(&cgx->budget_remaining, budget_inc);
+		}
+		cgx->burst_remaining -= burst;
+
+		if (time_delta(now, cgx->period_start_clk) >= cgx->period) {
+			cgx->period_start_clk = now;
+			cgx->burst_remaining = cgx->burst;
+		}
+	}
+	WRITE_ONCE(cgx->is_throttled, false);
+
+	/*
+	 * Drain BTQ of each LLC level until the BTQ becomes empty or
+	 * the cgroup is throttled.
+	 */
+	if (cgx->has_llcx) {
+		bpf_for(i, 0, cbw_config.nr_llcs) {
+			llcx = cbw_get_llc_ctx(cgrp, i);
+			if (!llcx) {
+				cbw_err("Failed to lookup an LLC context");
+				continue;
+			}
+	
+			cbw_drain_btq_until_throttled(cgx, llcx);
+		}
+	}
+	return 0;
+}
+
 /*
  * A handler function for the replenish timer.
  */
 static
 int replenish_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
-	/* TODO: to be implemented */
+	struct cgroup *root_cgrp, *cgrp;
+	struct cgroup_subsys_state *root_css, *pos;
+	u64 now  = scx_bpf_now();
+	int ret;
+
+	/*
+	 * Reset the runtime_total of each LLC context in post-order (left ->
+	 * right -> root). This prevents the runtime_total_sloppy at the cgroup
+	 * level from being mixed with the runtime_total of the LLC level in a
+	 * previous period.
+	 */
+	root_cgrp = bpf_cgroup_from_id(1);
+	if (!root_cgrp) {
+		cbw_err("Failed to fetch the root cgroup pointer.");
+		return 0;
+	}
+	cbw_reset_runtime_total(root_cgrp);
+
+	/*
+	 * Replenish all the cgroups in pre-order (root -> left -> right).
+	 *
+	 * Note that there is a time gap between the time of update (when
+	 * runtime_total_sloppy is updated) and the time of use (when the
+	 * cgroup is replenished). Hence, there is an inaccuracy in calculating
+	 * the burst time. However, relaxing some accuracy in burst time
+	 * calculation has more benefits than drawbacks.
+	 */
+	bpf_rcu_read_lock();
+	root_css = &root_cgrp->self;
+	bpf_for_each(css, pos, root_css, BPF_CGROUP_ITER_DESCENDANTS_PRE) {
+		cgrp = pos->cgroup;
+		cbw_replenish_cgroup(cgrp, now);
+	}
+	bpf_rcu_read_unlock();
+	bpf_cgroup_release(root_cgrp);
+
+	/* Re-arm the replenish timer. */
+	if ((ret = bpf_timer_start(timer, CBW_NPERIOD, 0)))
+		cbw_err("Failed to re-arm replenish timer: %d", ret);
+
 	return 0;
 }
