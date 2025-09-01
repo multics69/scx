@@ -213,6 +213,11 @@ const volatile u64	slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
 static volatile u64	nr_cpus_big;
 
 /*
+ * Scheduler's PID
+ */
+static pid_t		lavd_pid;
+
+/*
  * Include sub-modules
  */
 #include "util.bpf.c"
@@ -470,7 +475,7 @@ static void update_stat_for_stopping(struct task_struct *p,
 	 * how much time was actually consumed compared to the reserved time.
 	 */
 	taskc->last_slice_used = time_delta(now, taskc->last_running_clk);
-	if (enable_cpu_bw) {
+	if (enable_cpu_bw && (p->pid != lavd_pid)) {
 		cgrp = bpf_cgroup_from_id(taskc->cgrp_id);
 		if (cgrp) {
 			debugln("%s/%d/%llu", p->comm, p->pid, taskc->cgrp_id);
@@ -591,6 +596,50 @@ static bool can_direct_dispatch(u64 dsq_id, s32 cpu, bool is_idle)
 	return is_idle && cpu >= 0 && !scx_bpf_dsq_nr_queued(dsq_id);
 }
 
+static int reserve_cpu_time(struct task_struct *p, task_ctx *taskc, bool put_aside)
+{
+	struct cpu_ctx *cpuc;
+	struct cgroup *cgrp;
+	s32 cpu;
+	int ret, ret2;
+
+	/*
+	 * Under CPU bandwidth control using cpu.max, we should first reserve
+	 * time for execution. If we succeed in reserving the time, we will go
+	 * ahead. Otherwise, we should set the task aside for later execution.
+	 * In the forced mode, we should enqueue the task even if the time
+	 * reservation failed (-EAGAIN).
+	 */
+	cpu = bpf_get_smp_processor_id();
+	cpuc = get_cpu_ctx_id(cpu);
+	if (!cpuc) {
+		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
+		return -ESRCH;
+	}
+
+	/*
+	 * Note that we cannot use scx_bpf_task_cgroup() here because this can
+	 * be called from ops.enqueue() and ops.dispatch().
+	 */
+	cgrp = bpf_cgroup_from_id(taskc->cgrp_id);
+	if (!cgrp) {
+		debugln("Failed to lookup a cgroup: %llu", taskc->cgrp_id);
+		return -ESRCH;
+	}
+
+	ret = scx_cgroup_bw_reserve(cgrp, cpuc->llc_id, LAVD_SLICE_MIN_NS_DFL);
+	if ((ret == -EAGAIN) && put_aside) {
+		ret2 = scx_cgroup_bw_put_aside(p, p->scx.dsq_vtime, cgrp, cpuc->llc_id);
+		if (ret2) {
+			bpf_cgroup_release(cgrp);
+			scx_bpf_error("Failed to put aside a task: %d", ret2);
+			return ret2;
+		}
+	}
+	bpf_cgroup_release(cgrp);
+	return ret;
+}
+
 void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	task_ctx *taskc;
@@ -621,7 +670,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 
 		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
 	}
-	p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
+	p->scx.slice = LAVD_SLICE_MIN_NS_DFL;
 
 	/*
 	 * Find a proper DSQ for the task, which is either the task's
@@ -651,6 +700,25 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		cpdom_id = cpuc->cpdom_id;
 		is_idle = test_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 		reset_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
+	}
+	taskc->cpdom_id = cpdom_id;
+
+	/*
+	 * Under the CPU bandwidth control with cpu.max, reserve CPU time
+	 * before executing the task.
+	 *
+	 * Note that we calculate the task's deadline before reserving its
+	 * CPU time, as we need the deadline to set aside the task when the
+	 * cgroup is throttled.
+	 *
+	 * Also, we do not throttle the scheduler process itself to
+	 * guarantee forward progress.
+	 */
+	if (enable_cpu_bw && (p->pid != lavd_pid) &&
+	    (reserve_cpu_time(p, taskc, true) == -EAGAIN)) {
+		debugln("Task %s[pid%d/cgid%llu] is throttled.",
+			p->comm, p->pid, taskc->cgrp_id);
+		return;
 	}
 
 	/*
@@ -689,10 +757,68 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * If there is no idle CPU for an eligible task, try to preempt a task.
 	 * Try to find and kick a victim CPU, which runs a less urgent task,
 	 * from dsq_id. The kick will be done asynchronously.
+	 *
+	 * In the case of the forced enqueue mode, we don't try preemption
+	 * since it is a batch of bulk enqueues.
 	 */
 	if (!no_preemption)
 		try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpdom_id));
 }
+
+static
+void enqueue_cb(struct task_struct *p)
+{
+	task_ctx *taskc;
+	struct cpu_ctx *cpuc, *cpuc_cur;
+	s32 cpu;
+	u64 cpdom_id;
+
+	taskc = get_task_ctx(p);
+	cpuc_cur = get_cpu_ctx();
+	if (!taskc || !cpuc_cur) {
+		scx_bpf_error("Failed to lookup a task context: %d", p->pid);
+		return;
+	}
+
+	/*
+	 * Reserve CPU time before executing the task. 
+	 */
+	reserve_cpu_time(p, taskc, false);
+
+	/*
+	 * Calculate when a task can be scheduled.
+	 */
+	p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+
+	/*
+	 * Fetch the chosen CPU and DSQ for the task.
+	 */
+	cpu = taskc->suggested_cpu_id;
+	cpdom_id = taskc->cpdom_id;
+	cpuc = get_cpu_ctx_id(cpu);
+	if (!cpuc) {
+		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
+		return;
+	}
+
+	/*
+	 * Increase the number of pinned tasks waiting for execution.
+	 */
+	if (is_pinned(p))
+		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
+
+	/*
+	 * Enqueue the task to a DSQ.
+	 */
+	if (per_cpu_dsq) {
+		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu), p->scx.slice,
+					 p->scx.dsq_vtime, 0);
+	} else {
+		scx_bpf_dsq_insert_vtime(p, cpdom_to_dsq(cpdom_id), p->scx.slice,
+					 p->scx.dsq_vtime, 0);
+	}
+}
+
 
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
@@ -914,6 +1040,14 @@ consume_prev:
 			 * Let's update stats first before calculating time slice.
 			 */
 			update_stat_for_refill(prev, taskc_prev, cpuc);
+
+			/*
+			 * Under the CPU bandwidth control with cpu.max,
+			 * reserve CPU time before executing the task.
+			 */
+			if (enable_cpu_bw && (prev->pid != lavd_pid) &&
+			    (reserve_cpu_time(prev, taskc_prev, false) == -EAGAIN))
+				return;
 
 			/*
 			 * Refill the time slice.
@@ -1826,7 +1960,20 @@ void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
 
 int lavd_enqueue_cb(pid_t pid)
 {
-	/* TODO: to be implemnted */
+	struct task_struct *p;
+
+	if (!enable_cpu_bw)
+		return 0;
+
+	/*
+	 * Enqueue a task with @pid. As long as the task is under scx,
+	 * it must be enqueued regardless of whether its cgroup is throttled
+	 * or not.
+	 */
+	if ((p = bpf_task_from_pid(pid))) {
+		enqueue_cb(p);
+		bpf_task_release(p);
+	}
 	return 0;
 }
 REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(lavd_enqueue_cb);
@@ -1900,6 +2047,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 		};
 		err = scx_cgroup_bw_lib_init(&bw_config);
 	}
+
+	/*
+	 * Keep track of scheduler process's PID.
+	 */
+	lavd_pid = (u32)bpf_get_current_pid_tgid();
 
 	return err;
 }
