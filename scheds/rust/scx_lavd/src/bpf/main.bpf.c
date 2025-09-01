@@ -592,7 +592,45 @@ static bool can_direct_dispatch(u64 dsq_id, s32 cpu, bool is_idle)
 	return is_idle && cpu >= 0 && !scx_bpf_dsq_nr_queued(dsq_id);
 }
 
-void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
+static int reserve_cpu_time(struct task_struct *p, bool put_aside)
+{
+	struct cpu_ctx *cpuc;
+	struct cgroup *cgrp;
+	s32 cpu;
+	u64 llc_id;
+	int ret, ret2;
+
+	/*
+	 * Under CPU bandwidth control using cpu.max, we should first reserve
+	 * time for execution. If we succeed in reserving the time, we will go
+	 * ahead. Otherwise, we should set the task aside for later execution.
+	 * In the forced mode, we should enqueue the task even if the time
+	 * reservation failed (-EAGAIN).
+	 */
+	cpu = scx_bpf_task_cpu(p);
+	cpuc = get_cpu_ctx_id(cpu);
+	if (!cpuc) {
+		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
+		return -ESRCH;
+	}
+	llc_id = cpuc->llc_id;
+
+	cgrp = scx_bpf_task_cgroup(p);
+	ret = scx_cgroup_bw_reserve(cgrp, llc_id, LAVD_SLICE_MIN_NS_DFL);
+	if ((ret == -EAGAIN) && put_aside) {
+		ret2 = scx_cgroup_bw_put_aside(p, p->scx.dsq_vtime, cgrp, llc_id);
+		if (ret2) {
+			bpf_cgroup_release(cgrp);
+			scx_bpf_error("Failed to put aside a task: %d", ret2);
+			return ret2;
+		}
+	}
+	bpf_cgroup_release(cgrp);
+	return ret;
+}
+
+static
+void enqueue_x(struct task_struct *p, u64 enq_flags, bool force)
 {
 	struct task_ctx *taskc;
 	struct cpu_ctx *cpuc, *cpuc_cur;
@@ -622,7 +660,16 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 
 		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
 	}
-	p->scx.slice = LAVD_SLICE_MAX_NS_DFL;
+	p->scx.slice = LAVD_SLICE_MIN_NS_DFL;
+
+	/*
+	 * Under the CPU bandwidth control with cpu.max, reserve CPU time
+	 * before executing the task.
+	 */
+	if (enable_cpu_bw && (reserve_cpu_time(p, !force) == -EAGAIN) && !force) {
+		debugln("Task %s[%d] is throttled.", p->comm, p->pid);
+		return;
+	}
 
 	/*
 	 * Find a proper DSQ for the task, which is either the task's
@@ -690,9 +737,22 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * If there is no idle CPU for an eligible task, try to preempt a task.
 	 * Try to find and kick a victim CPU, which runs a less urgent task,
 	 * from dsq_id. The kick will be done asynchronously.
+	 *
+	 * In the case of the forced enqueue mode, we don't try preemption
+	 * since it is a batch of bulk enqueues.
 	 */
-	if (!no_preemption)
+	if (!no_preemption && !force)
 		try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpdom_id));
+}
+
+void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
+{
+	/*
+	 * Enqueue task @p if its cgroup is not throttled. If throttled,
+	 * the task will be placed in the backlog task queue (BTQ),
+	 * which the scx library manages.
+	 */
+	enqueue_x(p, enq_flags, false);
 }
 
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
@@ -906,6 +966,14 @@ consume_prev:
 			 * Let's update stats first before calculating time slice.
 			 */
 			update_stat_for_refill(prev, taskc_prev, cpuc);
+
+			/*
+			 * Under the CPU bandwidth control with cpu.max,
+			 * reserve CPU time before executing the task.
+			 */
+			if (enable_cpu_bw &&
+			    (reserve_cpu_time(prev, false) == -EAGAIN))
+				return;
 
 			/*
 			 * Refill the time slice.
@@ -1797,7 +1865,20 @@ void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
 
 int lavd_enqueue_cb(pid_t pid)
 {
-	/* TODO: to be implemnted */
+	struct task_struct *p;
+
+	if (!enable_cpu_bw)
+		return 0;
+
+	/*
+	 * Enqueue a task with @pid. As long as the task is under scx,
+	 * it must be enqueued regardless of whether its cgroup is throttled
+	 * or not.
+	 */
+	if ((p = bpf_task_from_pid(pid))) {
+		enqueue_x(p, 0, true);
+		bpf_task_release(p);
+	}
 	return 0;
 }
 REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(lavd_enqueue_cb);
