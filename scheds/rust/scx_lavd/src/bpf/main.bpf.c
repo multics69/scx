@@ -453,6 +453,7 @@ static void update_stat_for_stopping(struct task_struct *p,
 				     struct cpu_ctx *cpuc)
 {
 	u64 now = scx_bpf_now();
+	struct cgroup *cgrp;
 
 	/*
 	 * Account task runtime statistics first.
@@ -464,9 +465,20 @@ static void update_stat_for_stopping(struct task_struct *p,
 
 	/*
 	 * Account for how much of the slice was used for this instance.
+	 *
+	 * Under CPU bandwidth control using cpu.max, we also need to report
+	 * how much time was actually consumed compared to the reserved time.
 	 */
-	if (is_monitored) {
-		taskc->last_slice_used = time_delta(now, taskc->last_running_clk);
+	taskc->last_slice_used = time_delta(now, taskc->last_running_clk);
+	if (enable_cpu_bw) {
+		cgrp = bpf_cgroup_from_id(taskc->cgrp_id);
+		if (cgrp) {
+			debugln("%s/%d/%llu", p->comm, p->pid, taskc->cgrp_id);
+			scx_cgroup_bw_consume(cgrp, cpuc->llc_id,
+					      LAVD_SLICE_MIN_NS_DFL,
+					      taskc->last_slice_used);
+			bpf_cgroup_release(cgrp);
+		}
 	}
 
 	/*
