@@ -53,21 +53,10 @@ struct {
 	__uint(max_entries, 1);
 } cpu_ctx_stor SEC(".maps");
 
-/*
- * Per-task scheduling context
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, int);
-	__type(value, task_ctx);
-} task_ctx_stor SEC(".maps");
-
-
 __hidden
-task_ctx *get_task_ctx(struct task_struct *p)
+u64 get_task_ctx_internal(struct task_struct __arg_trusted *p)
 {
-	return bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
+	return (u64)scx_task_data(p);
 }
 
 __hidden
