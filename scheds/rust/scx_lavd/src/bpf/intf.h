@@ -124,6 +124,17 @@ struct sys_stat {
  */
 struct task_ctx {
 	/*
+	 * Do NOT change the position of atq. It should be at the beginning
+	 * of the task_ctx. 
+	 *
+	 * TODO: The type of atq should be scx_task_common. However, to
+	 * workaround the complex header dependencies, a large enough space
+	 * that can hold scx_task_common is allocated for now. This will be
+	 * fixed later after some more refactoring.
+	 */
+	u64	atq[8];
+
+	/*
 	 * Clocks when a task state transition happens for task statistics calculation
 	 */
 	u64	last_runnable_clk;	/* last time when a task became runnable */
@@ -152,8 +163,9 @@ struct task_ctx {
 	u64	slice;			/* time slice */
 
 	/*
-	 * Task cgroup
+	 * Task cgroup and id
 	 */
+	pid_t	pid;			/* pid for this task */
 	u64	cgrp_id;		/* cgroup id of this task */
 
 	/*
@@ -177,7 +189,6 @@ struct task_ctx {
  * Task's extra context for report
  */
 struct task_ctx_x {
-	pid_t	pid;
 	char	comm[TASK_COMM_LEN + 1];
 	char	stat[LAVD_STATUS_STR_LEN + 1];
 	u16	static_prio;	/* nice priority */
