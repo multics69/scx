@@ -30,7 +30,7 @@ struct {
 } introspec_msg SEC(".maps");
 
 static __always_inline
-int submit_task_ctx(struct task_struct *p, struct task_ctx *taskc, u32 cpu_id)
+int submit_task_ctx(struct task_struct *p, task_ctx *taskc, u32 cpu_id)
 {
 	struct cpu_ctx *cpuc;
 	struct cpdom_ctx *cpdomc;
@@ -77,7 +77,7 @@ int submit_task_ctx(struct task_struct *p, struct task_ctx *taskc, u32 cpu_id)
 }
 
 static void proc_introspec_sched_n(struct task_struct *p,
-				   struct task_ctx *taskc)
+				   task_ctx *taskc)
 {
 	u64 cur_nr, prev_nr;
 	u32 cpu_id;
@@ -112,7 +112,7 @@ static void proc_introspec_sched_n(struct task_struct *p,
 }
 
 __hidden
-void try_proc_introspec_cmd(struct task_struct *p, struct task_ctx *taskc)
+void try_proc_introspec_cmd(struct task_struct *p, task_ctx *taskc)
 {
 	if (!is_monitored)
 		return;
