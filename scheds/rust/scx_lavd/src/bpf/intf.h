@@ -173,8 +173,6 @@ struct task_ctx {
 	char	waker_comm[TASK_COMM_LEN + 1]; /* last waker's comm */
 };
 
-typedef struct task_ctx task_ctx;
-
 /*
  * Task's extra context for report
  */
