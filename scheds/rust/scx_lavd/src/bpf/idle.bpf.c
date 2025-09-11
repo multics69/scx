@@ -12,7 +12,7 @@ struct pick_ctx {
 	 * Input arguments for pick_idle_cpu().
 	 */
 	const struct task_struct *p;
-	struct task_ctx *taskc;
+	task_ctx *taskc;
 	s32 prev_cpu;
 	u64 wake_flags;
 	/*
@@ -845,7 +845,7 @@ unlock_out:
 }
 
 static
-s64 pick_proper_dsq(const struct task_struct *p, struct task_ctx *taskc,
+s64 pick_proper_dsq(const struct task_struct *p, task_ctx *taskc,
 		    s32 task_cpu, s32 *cpu, bool *is_idle,
 		    struct cpu_ctx *cpuc_cur)
 {
