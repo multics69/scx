@@ -137,19 +137,19 @@ static bool is_pinned(const struct task_struct *p)
 }
 
 __hidden
-bool test_task_flag(task_ctx *taskc, u64 flag)
+bool test_task_flag(task_ctx __arg_arena *taskc, u64 flag)
 {
 	return (taskc->flags & flag) == flag;
 }
 
 __hidden
-void set_task_flag(task_ctx *taskc, u64 flag)
+void set_task_flag(task_ctx __arg_arena *taskc, u64 flag)
 {
 	taskc->flags |= flag;
 }
 
 __hidden
-void reset_task_flag(task_ctx *taskc, u64 flag)
+void reset_task_flag(task_ctx __arg_arena *taskc, u64 flag)
 {
 	taskc->flags &= ~flag;
 }
@@ -173,13 +173,13 @@ inline void reset_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
 }
 
 __hidden
-bool is_lat_cri(task_ctx *taskc)
+bool is_lat_cri(task_ctx __arg_arena *taskc)
 {
 	return taskc->lat_cri >= sys_stat.avg_lat_cri;
 }
 
 __hidden
-bool is_lock_holder(task_ctx *taskc)
+bool is_lock_holder(task_ctx __arg_arena *taskc)
 {
 	return test_task_flag(taskc, LAVD_FLAG_FUTEX_BOOST);
 }
@@ -190,7 +190,7 @@ bool is_lock_holder_running(struct cpu_ctx *cpuc)
 	return test_cpu_flag(cpuc, LAVD_FLAG_FUTEX_BOOST);
 }
 
-bool have_scheduled(task_ctx *taskc)
+bool have_scheduled(task_ctx __arg_arena *taskc)
 {
 	/*
 	 * If task's time slice hasn't been updated, that means the task has
@@ -229,7 +229,7 @@ s64 __attribute__ ((noinline)) pick_any_bit(u64 bitmap, u64 nuance)
 	return -ENOENT;
 }
 
-static void set_on_core_type(task_ctx *taskc,
+static void set_on_core_type(task_ctx __arg_arena *taskc,
 			     const struct cpumask *cpumask)
 {
 	bool on_big = false, on_little = false;
