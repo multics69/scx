@@ -189,6 +189,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <lib/cgroup.h>
+#include <lib/sdt_task.h>
 
 char _license[] SEC("license") = "GPL";
 
@@ -1052,6 +1053,7 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	struct task_struct *waker;
 	task_ctx *p_taskc, *waker_taskc;
 	u64 now, interval;
+	int i;
 
 	/*
 	 * Clear the accumulated runtime.
@@ -1120,8 +1122,8 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	 */
 	if (is_monitored) {
 		p_taskc->waker_pid = waker->pid;
-		__builtin_memcpy_inline(p_taskc->waker_comm, waker->comm,
-					TASK_COMM_LEN);
+		for (i = 0; i < TASK_COMM_LEN && can_loop; i++)
+			p_taskc->waker_comm[i] = waker->comm[i];
 	}
 }
 
@@ -1517,15 +1519,21 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
 	taskc->svc_time = READ_ONCE(cur_svc_time);
 }
 
-static void init_task_ctx(struct task_struct *p, task_ctx *taskc)
+__hidden
+static void init_task_ctx(struct task_struct __arg_trusted *p, task_ctx __arg_arena *taskc)
 {
 	u64 now = scx_bpf_now();
+	int i;
 
-	__builtin_memset(taskc, 0, sizeof(*taskc));
+	for (i = 0; i < sizeof(*taskc) && can_loop; i++)
+		((char __arena *)taskc)[i] = 0;
+	bpf_rcu_read_lock();
 	if (bpf_cpumask_weight(p->cpus_ptr) != nr_cpu_ids)
 		set_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED);
+	bpf_rcu_read_unlock();
+
 	taskc->last_runnable_clk = now;
 	taskc->last_running_clk = now; /* for avg_runtime */
 	taskc->last_stopping_clk = now; /* for avg_runtime */
@@ -1536,7 +1544,7 @@ static void init_task_ctx(struct task_struct *p, task_ctx *taskc)
 	set_on_core_type(taskc, p->cpus_ptr);
 }
 
-s32 BPF_STRUCT_OPS(lavd_init_task, struct task_struct *p,
+s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {
 	task_ctx *taskc;
@@ -1555,8 +1563,7 @@ s32 BPF_STRUCT_OPS(lavd_init_task, struct task_struct *p,
 		return -ESRCH;
 	}
 	
-	taskc = bpf_task_storage_get(&task_ctx_stor, p, 0,
-				     BPF_LOCAL_STORAGE_GET_F_CREATE);
+	taskc = scx_task_alloc(p);
 	if (!taskc) {
 		scx_bpf_error("task_ctx_stor first lookup failed");
 		return -ENOMEM;
@@ -1567,6 +1574,13 @@ s32 BPF_STRUCT_OPS(lavd_init_task, struct task_struct *p,
 	 * Initialize @p's context.
 	 */
 	init_task_ctx(p, taskc);
+	return 0;
+}
+
+s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
+		   struct scx_exit_task_args *args)
+{
+	scx_task_free(p);
 	return 0;
 }
 
@@ -2028,6 +2042,7 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .cpu_release		= (void *)lavd_cpu_release,
 	       .enable			= (void *)lavd_enable,
 	       .init_task		= (void *)lavd_init_task,
+	       .exit_task		= (void *)lavd_exit_task,
 	       .cgroup_init		= (void *)lavd_cgroup_init,
 	       .cgroup_exit		= (void *)lavd_cgroup_exit,
 	       .cgroup_set_bandwidth	= (void *)lavd_cgroup_set_bandwidth,
