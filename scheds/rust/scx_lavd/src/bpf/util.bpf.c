@@ -60,12 +60,12 @@ struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
-	__type(value, struct task_ctx);
+	__type(value, task_ctx);
 } task_ctx_stor SEC(".maps");
 
 
 __hidden
-struct task_ctx *get_task_ctx(struct task_struct *p)
+task_ctx *get_task_ctx(struct task_struct *p)
 {
 	return bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 }
@@ -148,19 +148,19 @@ static bool is_pinned(const struct task_struct *p)
 }
 
 __hidden
-bool test_task_flag(struct task_ctx *taskc, u64 flag)
+bool test_task_flag(task_ctx *taskc, u64 flag)
 {
 	return (taskc->flags & flag) == flag;
 }
 
 __hidden
-void set_task_flag(struct task_ctx *taskc, u64 flag)
+void set_task_flag(task_ctx *taskc, u64 flag)
 {
 	taskc->flags |= flag;
 }
 
 __hidden
-void reset_task_flag(struct task_ctx *taskc, u64 flag)
+void reset_task_flag(task_ctx *taskc, u64 flag)
 {
 	taskc->flags &= ~flag;
 }
@@ -184,13 +184,13 @@ inline void reset_cpu_flag(struct cpu_ctx *cpuc, u64 flag)
 }
 
 __hidden
-bool is_lat_cri(struct task_ctx *taskc)
+bool is_lat_cri(task_ctx *taskc)
 {
 	return taskc->lat_cri >= sys_stat.avg_lat_cri;
 }
 
 __hidden
-bool is_lock_holder(struct task_ctx *taskc)
+bool is_lock_holder(task_ctx *taskc)
 {
 	return test_task_flag(taskc, LAVD_FLAG_FUTEX_BOOST);
 }
@@ -201,7 +201,7 @@ bool is_lock_holder_running(struct cpu_ctx *cpuc)
 	return test_cpu_flag(cpuc, LAVD_FLAG_FUTEX_BOOST);
 }
 
-bool have_scheduled(struct task_ctx *taskc)
+bool have_scheduled(task_ctx *taskc)
 {
 	/*
 	 * If task's time slice hasn't been updated, that means the task has
@@ -240,7 +240,7 @@ s64 __attribute__ ((noinline)) pick_any_bit(u64 bitmap, u64 nuance)
 	return -ENOENT;
 }
 
-static void set_on_core_type(struct task_ctx *taskc,
+static void set_on_core_type(task_ctx *taskc,
 			     const struct cpumask *cpumask)
 {
 	bool on_big = false, on_little = false;
