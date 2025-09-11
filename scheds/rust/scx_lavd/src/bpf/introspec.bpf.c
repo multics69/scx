@@ -35,6 +35,7 @@ int submit_task_ctx(struct task_struct *p, task_ctx *taskc, u32 cpu_id)
 	struct cpu_ctx *cpuc;
 	struct cpdom_ctx *cpdomc;
 	struct msg_task_ctx *m;
+	int i;
 
 	cpuc = get_cpu_ctx_id(cpu_id);
 	if (!cpuc)
@@ -69,7 +70,8 @@ int submit_task_ctx(struct task_struct *p, task_ctx *taskc, u32 cpu_id)
 	m->taskc_x.stat[3] = test_task_flag(taskc, LAVD_FLAG_IS_GREEDY)? 'G' : 'E';
 	m->taskc_x.stat[4] = '\0';
 
-	__builtin_memcpy_inline(&m->taskc, taskc, sizeof(m->taskc));
+	for (i = 0; i < sizeof(m->taskc) && can_loop; i++)
+		((char *) &m->taskc)[i] = ((char __arena *) taskc)[i];
 
 	bpf_ringbuf_submit(m, 0);
 
