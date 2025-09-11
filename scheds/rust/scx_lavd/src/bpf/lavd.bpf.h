@@ -6,6 +6,8 @@
 #ifndef __LAVD_H
 #define __LAVD_H
 
+#include <scx/bpf_arena_common.bpf.h>
+
 /*
  * common macros
  */
@@ -122,7 +124,11 @@ extern struct cpdom_ctx		cpdom_ctxs[LAVD_CPDOM_MAX_NR];
 extern struct bpf_cpumask	cpdom_cpumask[LAVD_CPDOM_MAX_NR];
 extern int			nr_cpdoms;
 
-task_ctx *get_task_ctx(struct task_struct *p);
+typedef struct task_ctx __arena task_ctx;
+
+u64 get_task_ctx_internal(struct task_struct *p);
+#define get_task_ctx(p) ((task_ctx *)get_task_ctx_internal((p)))
+
 struct cpu_ctx *get_cpu_ctx(void);
 struct cpu_ctx *get_cpu_ctx_id(s32 cpu_id);
 struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
