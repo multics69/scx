@@ -49,7 +49,6 @@ int submit_task_ctx(struct task_struct *p, task_ctx *taskc, u32 cpu_id)
 		return -ENOMEM;
 
 	m->hdr.kind = LAVD_MSG_TASKC;
-	m->taskc_x.pid = p->pid;
 	__builtin_memcpy_inline(m->taskc_x.comm, p->comm, TASK_COMM_LEN);
 	m->taskc_x.static_prio = get_nice_prio(p);
 	m->taskc_x.cpu_util = s2p(cpuc->avg_util);
