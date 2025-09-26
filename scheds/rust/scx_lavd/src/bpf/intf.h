@@ -152,8 +152,9 @@ struct task_ctx {
 	u64	slice;			/* time slice */
 
 	/*
-	 * Task cgroup
+	 * Task cgroup and id
 	 */
+	pid_t	pid;			/* pid for this task */
 	u64	cgrp_id;		/* cgroup id of this task */
 
 	/*
@@ -177,7 +178,6 @@ struct task_ctx {
  * Task's extra context for report
  */
 struct task_ctx_x {
-	pid_t	pid;
 	char	comm[TASK_COMM_LEN + 1];
 	char	stat[LAVD_STATUS_STR_LEN + 1];
 	u16	static_prio;	/* nice priority */
