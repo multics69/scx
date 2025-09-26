@@ -25,12 +25,18 @@ struct scx_atq {
 
 typedef struct scx_atq __arena scx_atq_t;
 
+struct scx_task_common {
+	struct rbnode atq;	/* rbnode for being inserted into ATQs */
+};
+
+typedef struct scx_task_common scx_task_common;
+
 #ifdef __BPF__
 u64 scx_atq_create_internal(bool fifo, size_t capacity);
 #define scx_atq_create(fifo) scx_atq_create_internal((fifo), SCX_ATQ_INF_CAPACITY)
 #define scx_atq_create_size(fifo, capacity) scx_atq_create_internal((fifo), (capacity))
-int scx_atq_insert(scx_atq_t *atq_ptr, u64 taskc_ptr);
-int scx_atq_insert_vtime(scx_atq_t *atq, u64 taskc_ptr, u64 vtime);
+int scx_atq_insert(scx_atq_t *atq, rbnode_t __arg_arena *node, u64 task_ptr);
+int scx_atq_insert_vtime(scx_atq_t __arg_arena *atq, rbnode_t __arg_arena *node, u64 task_ptr, u64 vtime);
 int scx_atq_nr_queued(scx_atq_t *atq);
 u64 scx_atq_pop(scx_atq_t *atq);
 u64 scx_atq_peek(scx_atq_t *atq);
