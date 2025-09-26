@@ -105,6 +105,7 @@ int scx_cgroup_bw_consume(struct cgroup *cgrp __arg_trusted, int llc_id, u64 res
  * scx_cgroup_bw_put_aside - Put aside a task to execute it when the cgroup is
  * unthrottled later.
  * @p: a task to be put aside since the cgroup is throttled.
+ * @taskc: the BPF task context from the scheduler.
  * @vtime: vtime of a task @p.
  * @cgrp: cgroup where a task belongs to.
  * @llc_id: caller's LLC id.
@@ -117,7 +118,8 @@ int scx_cgroup_bw_consume(struct cgroup *cgrp __arg_trusted, int llc_id, u64 res
  *
  * Return 0 for success, -errno for failure.
  */
-int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 vtime, struct cgroup *cgrp __arg_trusted, int llc_id);
+int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 taskc, 
+		u64 vtime, struct cgroup *cgrp __arg_trusted, int llc_id);
 
 /**
  * scx_cgroup_bw_reenqueue - Reenqueue backlogged tasks.
@@ -134,20 +136,20 @@ int scx_cgroup_bw_reenqueue(void);
 
 /**
  * REGISTER_SCX_CGROUP_BW_ENQUEUE_CB - Register an enqueue callback.
- * @enqueue_cb: A function name with a prototype of 'void fn(pid_t pid)'.
+ * @enqueue_cb: A function name with a prototype of 'void fn(void * __arg_arena)'.
  *
- * @enqueue_cb enqueues a task with @pid following the BPF scheduler's
+ * @enqueue_cb enqueues a task with BPF context @taskc following the BPF scheduler's
  * regular enqueue path. @enqueue_cb will be called when a throttled cgroup
  * becomes available again or when the cgroup is exiting for some reason.
  * @enqueue_cb MUST enqueue the task; otherwise, the task will be lost and
  * never be scheduled.
  */
 #define REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(enqueue_cb)				\
-	__hidden int scx_group_bw_enqueue_cb(pid_t pid)				\
+	__hidden int scx_group_bw_enqueue_cb(u64 taskc)				\
 	{									\
-		extern int enqueue_cb(pid_t pid);				\
-		enqueue_cb(pid);						\
+		extern int enqueue_cb(u64);					\
+		enqueue_cb(taskc);						\
 		return 0;							\
 	}
 
-extern int scx_group_bw_enqueue_cb(pid_t pid);
+extern int scx_group_bw_enqueue_cb(u64 taskc);

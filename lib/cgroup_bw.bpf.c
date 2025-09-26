@@ -5,8 +5,21 @@
  */
 
 #include <scx/common.bpf.h>
+#include <scx/bpf_arena_common.bpf.h>
 #include <lib/cgroup.h>
 #include <lib/atq.h>
+
+/*
+ * Generic task struct representation. We can use CO:RE in each
+ * scheduler to grab the atq field without knowing the actual
+ * layout of the struct when compiling the module.
+ */
+struct task_ctx {
+	u64 pid;
+	rbnode_t *atq;
+} __attribute__((preserve_access_index));
+
+typedef struct task_ctx __arena task_ctx;
 
 enum scx_cgroup_consts {
 	/* cache line size of an architecture */
@@ -439,7 +452,9 @@ void cbw_free_llc_ctx(struct cgroup *cgrp, struct scx_cgroup_ctx *cgx)
 	struct cgroup *root_cgrp;
 	struct scx_cgroup_llc_ctx *llcx, *root_llcx;
 	scx_atq_t *btq, *root_btq;
-	u64 pid64;
+	task_ctx *taskc;
+	rbnode_t *node;
+	int ret;
 	int i;
 
 	/*
@@ -477,8 +492,14 @@ void cbw_free_llc_ctx(struct cgroup *cgrp, struct scx_cgroup_ctx *cgx)
 			continue;
 		}
 
-		while ((pid64 = scx_atq_pop(btq)) && can_loop) {
-			if (scx_atq_insert_vtime(root_btq, pid64, 0)) {
+		while ((taskc = (task_ctx *)scx_atq_pop(btq)) && can_loop) {
+			ret = bpf_core_read(&node, sizeof(rbnode_t *), &taskc->atq);
+			if (ret) {
+				cbw_err("Failed to retrieve rbnode for task_ctx.");
+				continue;
+			}
+
+			if (scx_atq_insert_vtime(root_btq, node, (u64)taskc, 0)) {
 				cbw_err("Failed to move a task to the root cgroup.");
 				continue;
 			}
@@ -1189,9 +1210,12 @@ int scx_cgroup_bw_consume(struct cgroup *cgrp __arg_trusted, int llc_id, u64 res
  * Return 0 for success, -errno for failure.
  */
 __hidden
-int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 vtime, struct cgroup *cgrp __arg_trusted, int llc_id)
+int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 ctx, 
+		u64 vtime, struct cgroup *cgrp __arg_trusted, int llc_id)
 {
+	task_ctx *taskc = (task_ctx *)ctx;
 	struct scx_cgroup_llc_ctx *llcx;
+	rbnode_t *node;
 	int ret;
 
 	cbw_dbg_fn_cgrp(" [%s/%d]", p->comm, p->pid);
@@ -1217,7 +1241,13 @@ int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 vtime, stru
 		return -ESRCH;
 	}
 
-	ret = scx_atq_insert_vtime(llcx->btq, (u64)p->pid, vtime);
+	ret = bpf_core_read(&node, sizeof(rbnode_t *), &taskc->atq);
+	if (ret) {
+		cbw_err("Failed to retrieve rbnode for task_ctx.");
+		return ret;
+	}
+
+	ret = scx_atq_insert_vtime(llcx->btq, node, (u64)taskc, vtime);
 	if (ret)
 		cbw_err("Failed to insert a task to BTQ: %d", ret);
 
@@ -1415,7 +1445,7 @@ static
 void cbw_drain_btq_until_throttled(struct scx_cgroup_ctx *cgx,
 				   struct scx_cgroup_llc_ctx *llcx)
 {
-	u64 pid64;
+	u64 taskc;
 
 	/*
 	 * Pop the tasks in the BTQ and ask the BPF scheduler to enqueue
@@ -1423,9 +1453,8 @@ void cbw_drain_btq_until_throttled(struct scx_cgroup_ctx *cgx,
 	 * the cgroup is throttled.
 	 */
 	while (!READ_ONCE(cgx->is_throttled) &&
-	       (pid64 = scx_atq_pop(llcx->btq)) && can_loop) {
-		pid_t pid = (pid_t)pid64;
-		scx_group_bw_enqueue_cb(pid);
+	       (taskc = scx_atq_pop(llcx->btq)) && can_loop) {
+		scx_group_bw_enqueue_cb(taskc);
 	}
 }
 
