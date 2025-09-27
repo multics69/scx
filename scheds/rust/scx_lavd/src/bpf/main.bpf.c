@@ -769,7 +769,6 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpdom_id));
 }
 
-static
 void enqueue_cb(struct task_struct *p)
 {
 	task_ctx *taskc;
@@ -1985,6 +1984,7 @@ void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
 	       scx_bpf_error("Failed to set bandwidth of a cgroup: %d", ret);
 }
 
+__hidden
 int lavd_enqueue_cb(u64 ctx)
 {
 	task_ctx *taskc = (task_ctx *)ctx;
