@@ -145,7 +145,7 @@ int scx_cgroup_bw_reenqueue(void);
  * never be scheduled.
  */
 #define REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(eqcb)					\
-	__hidden int scx_group_bw_enqueue_cb(u64 taskc)				\
+	__hidden inline int scx_group_bw_enqueue_cb(u64 taskc)			\
 	{									\
 		extern int eqcb(u64);						\
 		eqcb(taskc);							\
