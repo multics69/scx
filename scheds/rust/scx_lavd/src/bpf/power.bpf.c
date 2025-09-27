@@ -756,6 +756,7 @@ u16 get_cpuperf_cap(s32 cpu)
 	return 0;
 }
 
+__hidden
 u64 scale_cap_freq(u64 dur, s32 cpu)
 {
 	u64 cap, freq, scaled_dur;

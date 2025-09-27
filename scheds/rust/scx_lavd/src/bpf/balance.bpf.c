@@ -205,6 +205,7 @@ static int pick_most_loaded_cpu(struct cpdom_ctx *cpdomc) {
 	return pick_cpu;
 }
 
+__hidden
 static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 {
 	struct cpdom_ctx *cpdomc_pick;
@@ -347,6 +348,7 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 	return false;
 }
 
+__hidden
 static bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 {
 	struct cpdom_ctx *cpdomc;

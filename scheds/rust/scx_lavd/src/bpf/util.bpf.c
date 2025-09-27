@@ -79,6 +79,7 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p)
 	return get_cpu_ctx_id(scx_bpf_task_cpu(p));
 }
 
+__hidden
 u32 __attribute__ ((noinline)) calc_avg32(u32 old_val, u32 new_val)
 {
 	/*
@@ -88,6 +89,7 @@ u32 __attribute__ ((noinline)) calc_avg32(u32 old_val, u32 new_val)
 	return __calc_avg(old_val, new_val, 3);
 }
 
+__hidden
 u64 __attribute__ ((noinline)) calc_avg(u64 old_val, u64 new_val)
 {
 	/*
@@ -97,6 +99,7 @@ u64 __attribute__ ((noinline)) calc_avg(u64 old_val, u64 new_val)
 	return __calc_avg(old_val, new_val, 3);
 }
 
+__hidden
 u64 __attribute__ ((noinline)) calc_asym_avg(u64 old_val, u64 new_val)
 {
 	/*
@@ -108,6 +111,7 @@ u64 __attribute__ ((noinline)) calc_asym_avg(u64 old_val, u64 new_val)
 		return __calc_avg(old_val, new_val, 3);
 }
 
+__hidden
 u64 __attribute__ ((noinline)) calc_avg_freq(u64 old_freq, u64 interval)
 {
 	u64 new_freq, ewma_freq;
@@ -215,6 +219,7 @@ static bool use_full_cpus(void)
 	return sys_stat.nr_active >= nr_cpus_onln;
 }
 
+__hidden
 s64 __attribute__ ((noinline)) pick_any_bit(u64 bitmap, u64 nuance)
 {
 	u64 i, pos;
@@ -266,6 +271,7 @@ static void set_on_core_type(task_ctx __arg_arena *taskc,
 		reset_task_flag(taskc, LAVD_FLAG_ON_LITTLE);
 }
 
+__hidden
 bool __attribute__ ((noinline)) prob_x_out_of_y(u32 x, u32 y)
 {
 	u32 r;
@@ -283,6 +289,7 @@ bool __attribute__ ((noinline)) prob_x_out_of_y(u32 x, u32 y)
 /*
  * We define the primary cpu in the physical core as the lowest logical cpu id.
  */
+__hidden
 u32 __attribute__ ((noinline)) get_primary_cpu(u32 cpu) {
 	const volatile u32 *sibling;
 

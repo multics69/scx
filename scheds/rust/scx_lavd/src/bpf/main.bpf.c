@@ -427,6 +427,7 @@ static void update_stat_for_running(struct task_struct *p,
 	reset_suspended_duration(cpuc);
 }
 
+__hidden
 static void account_task_runtime(struct task_struct *p,
 				 task_ctx *taskc,
 				 struct cpu_ctx *cpuc,
@@ -454,6 +455,7 @@ static void account_task_runtime(struct task_struct *p,
 	taskc->last_measured_clk = now;
 }
 
+__hidden
 static void update_stat_for_stopping(struct task_struct *p,
 				     task_ctx *taskc,
 				     struct cpu_ctx *cpuc)
@@ -509,6 +511,7 @@ static void update_stat_for_stopping(struct task_struct *p,
 	reset_lock_futex_boost(taskc, cpuc);
 }
 
+__hidden
 static void update_stat_for_refill(struct task_struct *p,
 				   task_ctx *taskc,
 				   struct cpu_ctx *cpuc)
