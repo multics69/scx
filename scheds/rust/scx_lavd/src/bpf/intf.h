@@ -119,10 +119,16 @@ struct sys_stat {
 	u64	nr_lc_on_big;	/* latency-critical tasks scheduled on big core */
 };
 
+struct scx_placeholder {
+	char space[100];
+};
+
 /*
  * Task context
  */
 struct task_ctx {
+	/* Common fields shared between scx schedulers. */
+	struct scx_placeholder common; /* WARNING: must always be the first field. */
 	/*
 	 * Clocks when a task state transition happens for task statistics calculation
 	 */
