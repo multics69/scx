@@ -22,8 +22,13 @@ struct scx_atq {
 	u64 fifo;
 };
 
-
 typedef struct scx_atq __arena scx_atq_t;
+
+struct scx_task_common {
+	struct rbnode atq;	/* rbnode for being inserted into ATQs */
+};
+
+typedef struct scx_task_common scx_task_common;
 
 #ifdef __BPF__
 u64 scx_atq_create_internal(bool fifo, size_t capacity);
