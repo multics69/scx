@@ -766,7 +766,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpdom_id));
 }
 
-void enqueue_cb(struct task_struct *p)
+int enqueue_cb(struct task_struct __arg_trusted *p)
 {
 	task_ctx *taskc;
 	struct cpu_ctx *cpuc, *cpuc_cur;
@@ -777,7 +777,7 @@ void enqueue_cb(struct task_struct *p)
 	cpuc_cur = get_cpu_ctx();
 	if (!taskc || !cpuc_cur) {
 		scx_bpf_error("Failed to lookup a task context: %d", p->pid);
-		return;
+		return 0;
 	}
 
 	/*
@@ -798,7 +798,7 @@ void enqueue_cb(struct task_struct *p)
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
-		return;
+		return 0;
 	}
 
 	/*
@@ -817,6 +817,8 @@ void enqueue_cb(struct task_struct *p)
 		scx_bpf_dsq_insert_vtime(p, cpdom_to_dsq(cpdom_id), p->scx.slice,
 					 p->scx.dsq_vtime, 0);
 	}
+
+	return 0;
 }
 
 
