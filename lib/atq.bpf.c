@@ -17,57 +17,80 @@ u64 scx_atq_create_internal(bool fifo, size_t capacity)
 	if (!atq)
 		return (u64)NULL;
 
-	atq->heap = scx_minheap_alloc(capacity);
-	if (!atq->heap)
+	atq->tree = rb_create(RB_NOALLOC, RB_DUPLICATE);
+	if (!atq->tree)
 		return (u64)NULL;
 
 	atq->fifo = fifo;
+	atq->capacity = capacity;
+	atq->size = 0;
 
 	return (u64)atq;
 }
 
+/* 
+ * XXXETSAL: We are using the __hidden antipattern for API functions because some
+ * older kernels do not allow function calls with preemption disabled. We will replace
+ * these annotations with the proper ones (__weak) at some point in the future.
+ */
+
 __hidden
-int scx_atq_insert(scx_atq_t *atq, u64 taskc_ptr)
+int scx_atq_insert_vtime(scx_atq_t __arg_arena *atq, rbnode_t __arg_arena *node, u64 taskc_ptr, u64 vtime)
 {
 	int ret;
-
-	if (!atq->fifo)
-		return -EINVAL;
 
 	ret = arena_spin_lock(&atq->lock);
 	if (ret)
 		return ret;
 
-	ret = scx_minheap_insert(atq->heap, taskc_ptr, atq->seq++);
+	if (unlikely(atq->size == atq->capacity)) {
+		ret = -ENOSPC;
+		goto done;
+	}
 
+	if ((vtime == SCX_ATQ_FIFO) != atq->fifo) {
+		ret = -EINVAL;
+		goto done;
+	}
+
+	/*
+	 * For FIFO, "Leak" the seq on error. We only want
+	 * sequence numbers to be monotonic, not
+	 * consecutive.
+	 */
+	node->key = (vtime == SCX_ATQ_FIFO) ? atq->seq++ : vtime;
+	node->value = taskc_ptr;
+
+	ret = rb_insert_node(atq->tree, node);
+	if (ret)
+		goto done;
+
+	atq->size += 1;
+
+done:
 	arena_spin_unlock(&atq->lock);
 
 	return ret;
 }
 
 __hidden
-int scx_atq_insert_vtime(scx_atq_t *atq, u64 taskc_ptr, u64 vtime)
+int scx_atq_insert(scx_atq_t *atq, rbnode_t __arg_arena *node, u64 taskc_ptr)
 {
-	int ret;
-
-	if (atq->fifo)
-		return -EINVAL;
-
-	ret = arena_spin_lock(&atq->lock);
-	if (ret)
-		return ret;
-
-	ret = scx_minheap_insert(atq->heap, taskc_ptr, vtime);
-
-	arena_spin_unlock(&atq->lock);
-
-	return ret;
+	return scx_atq_insert_vtime(atq, node, taskc_ptr, SCX_ATQ_FIFO);
 }
 
+/*
+ * XXXETSAL: There is a mismatch between insert and pop here: We are inserting
+ * rbnodes, but returning a key/value pair. This is deliberate: We can use CO:RE
+ * to find the rbnode from any scheduler's task_ctx in a generic way, but there is
+ * no container_of equivalent that lets us go rbnode -> task_ctx (especially since
+ * the actual layout of task_ctx varies by scheduler. For now, pass the task_ctx 
+ * as a value to the node and use it to find the original rbonde.
+ */
 __hidden
 u64 scx_atq_pop(scx_atq_t *atq)
 {
-	struct scx_minheap_elem helem;
+	u64 vtime, taskc_ptr;
 	int ret;
 
 	ret = arena_spin_lock(&atq->lock);
@@ -79,20 +102,24 @@ u64 scx_atq_pop(scx_atq_t *atq)
 		return (u64)NULL;
 	}
 
-	ret = scx_minheap_pop(atq->heap, &helem);
+	ret = rb_pop(atq->tree, &vtime, &taskc_ptr);
+	if (!ret)
+		atq->size -= 1;
 
 	arena_spin_unlock(&atq->lock);
 
-	if (ret)
+	if (ret) {
+		bpf_printk("%s: error %d", __func__, ret);
 		return (u64)NULL;
+	}
 
-	return helem.elem;
+	return taskc_ptr;
 }
 
 __hidden
 u64 scx_atq_peek(scx_atq_t *atq)
 {
-	u64 elem;
+	u64 vtime, taskc_ptr;
 	int ret;
 
 	ret = arena_spin_lock(&atq->lock);
@@ -104,15 +131,15 @@ u64 scx_atq_peek(scx_atq_t *atq)
 		return (u64)NULL;
 	}
 
-	elem = atq->heap->helems[0].elem;
+	ret = rb_least(atq->tree, &vtime, &taskc_ptr);
 
 	arena_spin_unlock(&atq->lock);
 
-	return elem;
+	return taskc_ptr;
 }
 
 __hidden
 int scx_atq_nr_queued(scx_atq_t *atq)
 {
-	return atq->heap->size;
+	return atq->size;
 }

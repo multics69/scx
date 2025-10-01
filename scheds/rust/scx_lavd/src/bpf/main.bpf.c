@@ -181,6 +181,7 @@
  * Author: Changwoo Min <changwoo@igalia.com>
  */
 #include <scx/common.bpf.h>
+#include <scx/bpf_arena_common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
 #include <errno.h>
@@ -629,7 +630,7 @@ static int reserve_cpu_time(struct task_struct *p, task_ctx *taskc, bool put_asi
 
 	ret = scx_cgroup_bw_reserve(cgrp, cpuc->llc_id, LAVD_SLICE_MIN_NS_DFL);
 	if ((ret == -EAGAIN) && put_aside) {
-		ret2 = scx_cgroup_bw_put_aside(p, p->scx.dsq_vtime, cgrp, cpuc->llc_id);
+		ret2 = scx_cgroup_bw_put_aside(p, (u64)taskc, p->scx.dsq_vtime, cgrp, cpuc->llc_id);
 		if (ret2) {
 			bpf_cgroup_release(cgrp);
 			scx_bpf_error("Failed to put aside a task: %d", ret2);
@@ -765,8 +766,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpdom_id));
 }
 
-static
-void enqueue_cb(struct task_struct *p)
+int enqueue_cb(struct task_struct __arg_trusted *p)
 {
 	task_ctx *taskc;
 	struct cpu_ctx *cpuc, *cpuc_cur;
@@ -777,7 +777,7 @@ void enqueue_cb(struct task_struct *p)
 	cpuc_cur = get_cpu_ctx();
 	if (!taskc || !cpuc_cur) {
 		scx_bpf_error("Failed to lookup a task context: %d", p->pid);
-		return;
+		return 0;
 	}
 
 	/*
@@ -798,7 +798,7 @@ void enqueue_cb(struct task_struct *p)
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
-		return;
+		return 0;
 	}
 
 	/*
@@ -817,6 +817,8 @@ void enqueue_cb(struct task_struct *p)
 		scx_bpf_dsq_insert_vtime(p, cpdom_to_dsq(cpdom_id), p->scx.slice,
 					 p->scx.dsq_vtime, 0);
 	}
+
+	return 0;
 }
 
 
@@ -1958,8 +1960,10 @@ void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
 	       scx_bpf_error("Failed to set bandwidth of a cgroup: %d", ret);
 }
 
-int lavd_enqueue_cb(pid_t pid)
+__hidden
+int lavd_enqueue_cb(u64 ctx)
 {
+	task_ctx *taskc = (task_ctx *)ctx;
 	struct task_struct *p;
 
 	if (!enable_cpu_bw)
@@ -1970,7 +1974,7 @@ int lavd_enqueue_cb(pid_t pid)
 	 * it must be enqueued regardless of whether its cgroup is throttled
 	 * or not.
 	 */
-	if ((p = bpf_task_from_pid(pid))) {
+	if ((p = bpf_task_from_pid(taskc->pid))) {
 		enqueue_cb(p);
 		bpf_task_release(p);
 	}
