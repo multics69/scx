@@ -464,7 +464,7 @@ struct scx_cgroup_llc_ctx *cbw_alloc_llc_ctx(struct cgroup *cgrp,
 	llcx->id = cgroup_get_id(cgrp);
 
 	/* Create an associated BTQ. */
-	llcx->btq = (scx_atq_t *)scx_atq_create(false);
+	llcx->btq = (scx_atq_t *)scx_atq_create_size(false, 1024);
 	if (!llcx->btq) {
 		cbw_err("Fail to allocate a BTQ");
 		bpf_map_delete_elem(&cbw_cgrp_llc_map, &key);
