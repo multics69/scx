@@ -34,6 +34,13 @@ enum scx_cgroup_consts {
 	CBW_REENQ_MAX_BATCH		= 8,
 };
 
+__weak
+int throttle_err_msg(int line, enum scx_task_throttle found, enum scx_task_throttle expected, scx_task_common __arg_arena *taskc)
+{
+	bpf_printk("%d [%p] SCX_TSK: found %d, expected %d", line, taskc, found, expected);
+	return 0;
+}
+
 /**
  * Per-cgroup data structure containing cpu.max-related information.
  * In the future, it can be extended to support other features of cgroup
@@ -523,6 +530,7 @@ void cbw_free_llc_ctx(struct cgroup *cgrp, struct scx_cgroup_ctx *cgx)
 		cbw_err("Failed to fetch the root cgroup pointer.");
 		return;
 	}
+
 	bpf_for(i, 0, cbw_config.nr_llcs) {
 		llcx = cbw_get_llc_ctx(cgrp, i);
 		if (!llcx)
@@ -541,8 +549,17 @@ void cbw_free_llc_ctx(struct cgroup *cgrp, struct scx_cgroup_ctx *cgx)
 		}
 
 		while ((taskc = (scx_task_common *)scx_atq_pop(btq)) && can_loop) {
+
+			if (taskc->state != SCX_TSK_THROTTLED) {
+				throttle_err_msg(__LINE__, taskc->state, SCX_TSK_THROTTLED, taskc);
+				continue;
+			}
+
+			bpf_printk("Draining task %p", taskc);
+
 			if (scx_atq_insert_vtime(root_btq, (rbnode_t *)&taskc->atq, (u64)taskc, 0)) {
-				cbw_err("Failed to move a task to the root cgroup.");
+				bpf_printk("Failed to move a task to the root cgroup.");
+				taskc->state = SCX_TSK_CANRUN;
 				continue;
 			}
 		}
@@ -1346,10 +1363,19 @@ int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 ctx, u64 vt
 		return -ESRCH;
 	}
 
+	if (taskc->state != SCX_TSK_CANRUN) {
+		throttle_err_msg(__LINE__, taskc->state, SCX_TSK_CANRUN, taskc);
+		return -EACCES;
+	}
+
+	taskc->state = SCX_TSK_THROTTLED;
+
 	ret = scx_atq_insert_vtime(llcx->btq, (rbnode_t *)&taskc->atq,
 				   (u64)taskc, vtime);
-	if (ret)
-		cbw_err("Failed to insert a task to BTQ: %d", ret);
+	if (ret) {
+		bpf_printk("Failed to insert a task to BTQ: %d", ret);
+		taskc->state = SCX_TSK_CANRUN;
+	}
 
 	return ret;
 }
@@ -1607,7 +1633,7 @@ bool cbw_drain_btq_until_throttled(struct scx_cgroup_ctx *cgx,
 				   struct scx_cgroup_llc_ctx *llcx)
 {
 	bool reached_max;
-	u64 taskc;
+	scx_task_common *taskc;
 	int i;
 
 	/*
@@ -1616,8 +1642,16 @@ bool cbw_drain_btq_until_throttled(struct scx_cgroup_ctx *cgx,
 	 * the cgroup is throttled.
 	 */
 	for (i = 0; i < CBW_REENQ_MAX_BATCH && !READ_ONCE(cgx->is_throttled) &&
-		    (taskc = scx_atq_pop(llcx->btq)) && can_loop; i++) {
-		scx_cgroup_bw_enqueue_cb(taskc);
+		    (taskc = (scx_task_common *)scx_atq_pop(llcx->btq)) && can_loop; i++) {
+
+		if (taskc->state != SCX_TSK_THROTTLED) {
+			throttle_err_msg(__LINE__, taskc->state, SCX_TSK_THROTTLED, taskc);
+			continue;
+		}
+
+		taskc->state = SCX_TSK_CANRUN;
+
+		scx_cgroup_bw_enqueue_cb((u64)taskc);
 		cbw_dbg_fn("cgid%llu", cgx->id);
 	}
 

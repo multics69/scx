@@ -736,12 +736,16 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Also, we do not throttle the scheduler process itself to
 	 * guarantee forward progress.
 	 */
+	int ret2 = 0;
 	if (enable_cpu_bw && (p->pid != lavd_pid) &&
-	    (cgroup_throttled(p, taskc, true) == -EAGAIN)) {
+	    ((ret2 = cgroup_throttled(p, taskc, true) == -EAGAIN))) {
 		debugln("Task %s[pid%d/cgid%llu] is throttled.",
 			p->comm, p->pid, taskc->cgrp_id);
 		return;
 	}
+
+	if (ret2 == -EACCES)
+		bpf_printk("Possible double enqueue detected");
 
 	/*
 	 * Increase the number of pinned tasks waiting for execution.
