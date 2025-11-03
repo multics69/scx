@@ -1466,8 +1466,7 @@ int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 ctx, u64 vt
 	}
 	taskc->state = SCX_TSK_THROTTLED;
 
-	ret = scx_atq_insert_vtime(llcx->btq, (rbnode_t *)&taskc->atq,
-				   (u64)taskc, vtime);
+	ret = scx_atq_insert_vtime(llcx->btq, (scx_task_common *)taskc, vtime);
 	if (ret) {
 		taskc->state = SCX_TSK_CANRUN;
 		cbw_err("Failed to insert a task to BTQ: %d", ret);
