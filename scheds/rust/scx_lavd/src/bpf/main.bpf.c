@@ -830,6 +830,21 @@ int enqueue_cb(struct task_struct __arg_trusted *p)
 	return 0;
 }
 
+void BPF_STRUCT_OPS(lavd_dequeue, struct task_struct *p, u64 deq_flags)
+{
+	task_ctx *taskc;
+
+	taskc = get_task_ctx(p);
+	if (!taskc) {
+		debugln("Failed to lookup task_ctx for task %d", p->pid);
+		return;
+	}
+
+	ret = cbw_cancel((u64)taskc);
+	if (ret)
+		debugln("Failed to cancel task %d", p->p_pid);
+		
+}
 
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
