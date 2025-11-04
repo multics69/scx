@@ -1460,18 +1460,33 @@ int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 ctx, u64 vt
 		return -ESRCH;
 	}
 
-	if (taskc->state != SCX_TSK_CANRUN) {
-		cbw_err("Possible double enqueue detected.");
-		return -EACCES;
-	}
-	taskc->state = SCX_TSK_THROTTLED;
-
-	ret = scx_atq_insert_vtime(llcx->btq, (scx_task_common *)taskc, vtime);
+	ret = scx_atq_lock(llcx->btq);
 	if (ret) {
-		taskc->state = SCX_TSK_CANRUN;
+		cbw_err("Failed to lock ATQ.");
+		return -EBUSY;
+	}
+
+	if (taskc->atq != NULL) {
+		/* 
+		 * Not really a bug: The initial .enqueue() may race with
+		 * a pair of .dequeue()/.enqueue() calls, and cause two 
+		 * instances of this function to happen simultaneously
+		 * for the task. This should be rare, but possible.
+		 * The spinlock turns the race into a benign one.
+		 */
+		cbw_dbg("Possible double enqueue detected.");
+		scx_atq_unlock(llcx->btq);
+		return 0;
+	}
+
+	ret = scx_atq_insert_vtime_unlocked(llcx->btq, taskc, vtime);
+
+	if (ret) {
 		cbw_err("Failed to insert a task to BTQ: %d", ret);
 	} else if (!READ_ONCE(llcx->has_backlogged_tasks))
 		WRITE_ONCE(llcx->has_backlogged_tasks, true);
+
+	scx_atq_unlock(llcx->btq);
 
 	return ret;
 }
@@ -1812,15 +1827,23 @@ int cbw_drain_btq_until_throttled(struct scx_cgroup_ctx *cgx,
 	 * Pop the tasks in the BTQ and ask the BPF scheduler to enqueue
 	 * them to a DSQ for execution until the BTQ becomes empty or
 	 * the cgroup is throttled.
+	 *
+	 * The .pop() operation is concurrency-safe because all ATQ operations
+	 * serialize on its lock. The task we retrieve with it is guaranteed
+	 * to have been enqueued and not been dequeued. ATQ integrity aside,
+	 * the main problem is that because a .dequeue() callback can happen
+	 * at any point.
 	 */
 	for (i = 0; i < CBW_REENQ_MAX_BATCH &&
 		    !READ_ONCE(cgx->is_throttled) &&
 		    (taskc = (scx_task_common *)scx_atq_pop(llcx->btq)) &&
 		    can_loop; i++) {
 
-		if (taskc->state != SCX_TSK_THROTTLED)
-			continue;
-		taskc->state = SCX_TSK_CANRUN;
+		/* 
+		 * We do not worry about racing with .dequeue() here, because 
+		 * even if we do, the callback's insert_vtime call will fail
+		 * silently in the scx core. 
+		 */
 
 		scx_cgroup_bw_enqueue_cb((u64)taskc);
 		cbw_dbg("cgid%llu", cgx->id);
@@ -2023,5 +2046,59 @@ int scx_cgroup_bw_reenqueue(void)
 			CBW_REPLENISH_STAT_BOTTOM_HALF_RUNNING,
 			CBW_REPLENISH_STAT_IDLE);
 	}
+	return 0;
+}
+
+/*
+ * cbw_cancel - Cancel throttling for a task. 
+ *
+ * @ctx: Pointer to the scx_task_common task context. Passed as a u64
+ * to avoid exposing the scx_task_common type to the scheduler.
+ *
+ * Tasks may be dequeued from the BPF side by the scx core during system
+ * calls like sched_setaffinity(2). In that case, we must cancel any 
+ * throttling-related ATQ insert operations for the task:
+ * - We must avoid double inserts caused by the dequeued task being
+ *   reenqueed and throttled again while still in an ATQ.
+ * - We want to remove tasks not in scx anymore from throttling. While
+ *   inserting non-scx tasks into a DSQ is a no-op, we would like our
+ *   accounting to be as accurate as possible.
+ */
+__weak
+int cbw_cancel(u64 ctx)
+{
+	scx_task_common *taskc = (scx_task_common *)ctx;
+	scx_atq_t *atq;
+	int ret;
+
+	/* 
+	 * Copy the ATQ pointer over to the stack and use it to avoid
+	 * a racing scx_atq_pop() from overwriting it. Check the
+	 * pointer is valid, as expected by the caller.
+	 */
+	atq = taskc->atq;
+	if (!atq)
+		return 0;
+
+	if (scx_atq_lock(atq)) {
+		cbw_err("Failed to lock ATQ for task.");
+		return 0;
+	}
+
+	/* We lost the race, assume whoever popped the task will handle it. */
+	if (taskc->atq != atq)
+		goto done;
+
+	/* Protected from races by the */
+	ret = scx_atq_remove_unlocked(taskc->atq, taskc);
+	if (ret) {
+		/* There is an unavoidable race with scx_atq_pop. */
+		cbw_dbg("Failed to remove node from task");
+		goto done;
+	}
+
+done:
+	scx_atq_unlock(atq);
+
 	return 0;
 }
