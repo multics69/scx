@@ -268,6 +268,8 @@ scx_alloc_init(struct scx_allocator *alloc, __u64 data_size)
 	_Static_assert(sizeof(struct sdt_chunk) <= PAGE_SIZE,
 		"chunk size must fit into a page");
 
+	scx_arena_subprog_init();
+
 	ret = pool_set_size(&chunk_pool, sizeof(struct sdt_chunk), 1);
 	if (ret != 0)
 		return ret;
