@@ -135,8 +135,10 @@ struct Opts {
     /// are running on a CPU. Must be between slice-min-us and slice-max-us.
     /// When this option is enabled, pinned tasks are always enqueued to per-CPU DSQs
     /// and the dispatch logic compares vtimes across all DSQs to select the lowest
-    /// vtime task. This helps improve responsiveness for pinned tasks.
-    #[clap(long = "pinned-slice-us")]
+    /// vtime task. This helps improve responsiveness for pinned tasks. This option
+    /// is enabled by default with the default value of 5000. To turn it off,
+    /// explicitly set the value to 0.
+    #[clap(long = "pinned-slice-us", default_value = "5000")]
     pinned_slice_us: Option<u64>,
 
     /// Limit the ratio of preemption to the roughly top P% of latency-critical
