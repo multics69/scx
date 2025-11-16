@@ -278,28 +278,55 @@ int shrink_boosted_slice_remote(struct cpu_ctx *cpuc, u64 now)
 }
 
 __hidden
-void shrink_boosted_slice_at_tick(struct task_struct *p,
-					 struct cpu_ctx *cpuc, u64 now)
+bool shrink_slice_at_tick(struct task_struct *p, struct cpu_ctx *cpuc, u64 now)
 {
-	u64 dur, new_slice = 0;
+	u64 ub, duration;
 
 	/*
-	 * Shrink the time slice of the slice-boosted task into a regular
-	 * slice by reducing the remaining time slice to the regular one.
+	 * Calculate the upper bound of running this task
+	 * since it is scheduled this time.
 	 */
-	reset_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST);
-
-	dur = time_delta(now, cpuc->running_clk);
-	if (sys_stat.slice > dur)
-		new_slice = time_delta(sys_stat.slice, dur);
+	if (pinned_slice_ns)
+		ub = min(pinned_slice_ns, sys_stat.slice);
+	else
+		ub = sys_stat.slice;
 
 	/*
-	 * It is okay to set p->scx.slice to zero since this is supposed to
-	 * be called by ops.tick(), which is the scheduling point.
+	 * Calculate how long the task has been running
+	 * since it was scheduled.
 	 */
-	p->scx.slice = new_slice;
+	duration = time_delta(now, cpuc->running_clk);
 
-	cpuc->nr_preempt++;
+	/*
+	 * If the task is running beyond the current upper bound,
+	 * stop it right now.
+	 */
+	if (duration >= ub) {
+		/*
+		 * It is okay to set p->scx.slice to zero since this is
+		 * supposed to be called by ops.tick(), which is the
+		 * scheduling point.
+		 */
+		p->scx.slice = 0;
+		reset_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST);
+		cpuc->nr_preempt++;
+		return true;
+	}
+	/* Note: duration < ub */
+
+	if (test_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST)) {
+		/*
+		 * Shrink the time slice of the slice-boosted task into a
+		 * regular slice by reducing the remaining time slice to the
+		 * regular one.
+		 */
+		p->scx.slice = time_delta(ub, duration);
+		reset_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST);
+		cpuc->nr_preempt++;
+		return true;
+	}
+
+	return false;
 }
 
 __hidden
