@@ -202,9 +202,9 @@ static void calc_lat_cri(struct task_struct *p, task_ctx *taskc)
 	taskc->perf_cri = perf_cri;
 }
 
-static u64 calc_greedy_penalty(struct task_struct *p, task_ctx *taskc)
+static s64 calc_greedy_penalty(struct task_struct *p, task_ctx *taskc)
 {
-	u64 lag_max, penalty;
+	u64 lag_max;
 	s64 lag;
 
 	/*
@@ -235,60 +235,60 @@ static u64 calc_greedy_penalty(struct task_struct *p, task_ctx *taskc)
 		if (lag < -lag_max)
 			lag = -lag_max;
 	}
+	/* lag = [-lag_max, lag_max] */
 
 	/*
-	 * penalty = LAVD_SCALE + [0, 2 * LAVD_SCALE] >> LAVD_LC_GREEDY_SHIFT
-	 *         = [100%, 125%]
+	 * penalty = [-1024, 1024]
+	 *	- -1024 (-100%): fully underserved
+	 *	-     0    (0%): fairly served
+	 *	- +1024 (_100%): fully overserved
 	 */
-	penalty = (((lag_max - lag) << LAVD_SHIFT) / lag_max);
-	return LAVD_SCALE + (penalty >> LAVD_LC_GREEDY_SHIFT);
-}
-
-static u64 calc_adjusted_runtime(task_ctx *taskc)
-{
-	u64 runtime;
-
-	/*
-	 * Prefer a short-running (avg_runtime) and recently woken-up
-	 * (acc_runtime) task. To avoid the starvation of CPU-bound tasks,
-	 * which rarely sleep, limit the impact of acc_runtime.
-	 */
-	runtime = LAVD_ACC_RUNTIME_MAX +
-		  min(taskc->acc_runtime, LAVD_ACC_RUNTIME_MAX);
-
-	return runtime;
-}
-
-static u64 calc_virtual_deadline_delta(struct task_struct *p,
-				       task_ctx *taskc)
-{
-	u64 deadline, adjusted_runtime;
-	u32 greedy_penalty;
-
-	/*
-	 * Calculate the deadline based on runtime,
-	 * latency criticality, and greedy ratio.
-	 */
-	calc_lat_cri(p, taskc);
-	greedy_penalty = calc_greedy_penalty(p, taskc);
-	adjusted_runtime = calc_adjusted_runtime(taskc);
-
-	deadline = (adjusted_runtime * greedy_penalty) / taskc->lat_cri;
-	return deadline >> LAVD_SHIFT;
+	return ((-lag) << LAVD_SHIFT) / lag_max;
 }
 
 __hidden
 u64 calc_when_to_run(struct task_struct *p, task_ctx *taskc)
 {
-	u64 dl_delta, clc;
+	s64 greedy_penalty, start_delta;
+	u64 runtime, deadline_delta;
 
 	/*
-	 * Before enqueueing a task to a run queue, we should decide when a
-	 * task should be scheduled. We start from -LAVD_DL_COMPETE_WINDOW
-	 * so that the current task can compete against the already enqueued
-	 * tasks within [-LAVD_DL_COMPETE_WINDOW, 0].
+	 * Calculate the task's latency criticality.
 	 */
-	dl_delta = calc_virtual_deadline_delta(p, taskc);
-	clc = READ_ONCE(cur_logical_clk) - LAVD_DL_COMPETE_WINDOW;
-	return clc + dl_delta;
+	calc_lat_cri(p, taskc);
+
+	/*
+	 * Calculate the task's greedy_penalty, which is in [-1024, 1024].
+	 */
+	greedy_penalty = calc_greedy_penalty(p, taskc);
+
+	/*
+	 * Calculate the task's start delta, which is an offset from the
+	 * current cur_logical_clk -- the fair start line.
+	 *
+	 * Prefer an underserved task. If the task is underserved, start early.
+	 * Otherwise, start late. Start penalty is in [-LAVD_ACC_RUNTIME_MAX,
+	 * LAVD_ACC_RUNTIME_MAX] based on its greedy penalty. 
+	 *
+	 */
+	start_delta = ((LAVD_ACC_RUNTIME_MAX * greedy_penalty) >> LAVD_SHIFT);
+
+	/*
+	 * Calculate the task's runtime factor.
+	 *
+	 * Prefer a recently woken-up (acc_runtime) task. To avoid the
+	 * starvation of CPU-bound tasks, which rarely sleep, limit the
+	 * impact of acc_runtime.
+	 */
+	runtime = LAVD_ACC_RUNTIME_MAX +
+		  min(taskc->acc_runtime, LAVD_ACC_RUNTIME_MAX);
+
+	/*
+	 * Calculate the task's deadline delta from the start line.
+	 *
+	 * Prefer a latency-critical task.
+	 */
+	deadline_delta = (runtime / taskc->lat_cri) >> LAVD_SHIFT;
+
+	return READ_ONCE(cur_logical_clk) + start_delta + deadline_delta;
 }

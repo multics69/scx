@@ -197,7 +197,7 @@ char _license[] SEC("license") = "GPL";
 /*
  * Logical current clock
  */
-u64		cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
+u64		cur_logical_clk = LAVD_ACC_RUNTIME_MAX;
 
 /*
  * Current service time
