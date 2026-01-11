@@ -266,12 +266,12 @@ u64 calc_when_to_run(struct task_struct *p, task_ctx *taskc)
 	 * Calculate the task's start delta, which is an offset from the
 	 * current cur_logical_clk -- the fair start line.
 	 *
-	 * Prefer an underserved task. If the task is underserved, start early.
-	 * Otherwise, start late. Start penalty is in [-LAVD_ACC_RUNTIME_MAX,
-	 * LAVD_ACC_RUNTIME_MAX] based on its greedy penalty. 
-	 *
+	 * Prefer an underserved task.
+	 * If the task is underserved, start early. Otherwise, start late.
+	 * Start delta is in [-LAVD_SLICE_MAX_NS_DFL, LAVD_SLICE_MAX_NS_DFL]
+	 * based on its greedy penalty.
 	 */
-	start_delta = ((LAVD_ACC_RUNTIME_MAX * greedy_penalty) >> LAVD_SHIFT);
+	start_delta = (LAVD_SLICE_MAX_NS_DFL >> LAVD_SHIFT) * greedy_penalty;
 
 	/*
 	 * Calculate the task's runtime factor.
@@ -280,15 +280,15 @@ u64 calc_when_to_run(struct task_struct *p, task_ctx *taskc)
 	 * starvation of CPU-bound tasks, which rarely sleep, limit the
 	 * impact of acc_runtime.
 	 */
-	runtime = LAVD_ACC_RUNTIME_MAX +
-		  min(taskc->acc_runtime, LAVD_ACC_RUNTIME_MAX);
+	runtime = LAVD_SLICE_MAX_NS_DFL +
+		  min(taskc->acc_runtime, LAVD_SLICE_MAX_NS_DFL);
 
 	/*
 	 * Calculate the task's deadline delta from the start line.
 	 *
 	 * Prefer a latency-critical task.
 	 */
-	deadline_delta = (runtime / taskc->lat_cri) >> LAVD_SHIFT;
+	deadline_delta = runtime / taskc->lat_cri;
 
-	return READ_ONCE(cur_logical_clk) + start_delta + deadline_delta;
+	return READ_ONCE(cur_logical_clk) + (start_delta + deadline_delta);
 }
