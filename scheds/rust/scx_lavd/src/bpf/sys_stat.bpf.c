@@ -7,6 +7,7 @@
 #include <scx/common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
+#include "power.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
@@ -85,8 +86,8 @@ static void init_sys_stat_ctx(struct sys_stat_ctx *c)
 
 static void collect_sys_stat(struct sys_stat_ctx *c)
 {
-	struct cpdom_ctx *cpdomc;
 	u64 cpdom_id, compute, non_scx_time, sc_non_scx_time, cpuc_tot_sc_time;
+	struct cpdom_ctx *cpdomc;
 	int cpu;
 
 	/*
@@ -222,6 +223,16 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 		 */
 		if (cpuc->cur_util > LAVD_CC_UTIL_SPIKE)
 			c->tsct_spike += cpuc_tot_sc_time;
+
+		/*
+		 * Update the effective capacity of this CPU -- the capacity
+		 * that this CPU can achieve considering all the constraints,
+		 * such as policy, thermal, power, etc.
+		 *
+		 * WARNING: This should be called after updating cpuc->cur_util.
+		 */
+		update_effective_capacity(cpuc);
+
 		/*
 		 * Accumulate statistics.
 		 */
