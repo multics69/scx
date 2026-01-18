@@ -114,9 +114,13 @@ void update_effective_capacity(struct cpu_ctx *cpuc)
 
 	/*
 	 * Calculate the maximum capacity available at the moment which is
-	 * restricted by scaling_max_freq and thermal pressure. Note that
-	 * we cannot rely on rq->cpu_capacity since it is not updated
-	 * when an SCX scheduler is running.
+	 * restricted by scaling_max_freq and thermal pressure.
+	 *
+	 * Note that we cannot rely on rq->cpu_capacity since it is not
+	 * updated when an SCX scheduler is running.
+	 *
+	 * TODO: bypassing cpufreq_cpu_data in intel and amd?
+	 * TODO: need to consider irq_pressure?
 	 */
 	if ((base = (struct cpufreq_policy **)&cpufreq_cpu_data) &&
 	    (bpf_probe_read_kernel(&policy, sizeof(policy), base + cpu) == 0) &&
