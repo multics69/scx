@@ -86,8 +86,8 @@ static void init_sys_stat_ctx(struct sys_stat_ctx *c)
 
 static void collect_sys_stat(struct sys_stat_ctx *c)
 {
-	u64 cpdom_id, compute, non_scx_time, sc_non_scx_time, cpuc_tot_sc_time;
 	struct cpdom_ctx *cpdomc;
+	u64 cpdom_id, compute;
 	int cpu;
 
 	/*
@@ -134,6 +134,7 @@ static void collect_sys_stat(struct sys_stat_ctx *c)
 	 * into one.
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
+		u64 non_scx_time, sc_non_scx_time, cpuc_tot_sc_time;
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			c->compute_total = 0;
