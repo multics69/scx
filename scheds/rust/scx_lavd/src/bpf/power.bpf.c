@@ -101,14 +101,13 @@ void update_effective_capacity(struct cpu_ctx *cpuc)
 	extern const unsigned long hw_pressure __ksym __weak;
 
 	u16 capacity_policy = 0, capacity_observed;
-	unsigned long *p_pressure, pressure = 0;
 	struct cpufreq_policy **base, *policy;
-	u32 cpu_max = 0, scaling_max = 0, mfo;
+	unsigned long *p_pressure;
+	u32 mfo;
 	int cpu;
 
 	/* Sanity check */
-	if (!cpuc || cpuc->max_freq_observed == 0 ||
-	    cpuc->cpu_id < 0 || cpuc->cpu_id >= nr_cpu_ids)
+	if (!cpuc || cpuc->cpu_id < 0 || cpuc->cpu_id >= nr_cpu_ids)
 		return;
 	cpu = cpuc->cpu_id;
 
@@ -122,22 +121,23 @@ void update_effective_capacity(struct cpu_ctx *cpuc)
 	 * TODO: bypassing cpufreq_cpu_data in intel and amd?
 	 * TODO: need to consider irq_pressure?
 	 */
+	capacity_policy = cpuc->capacity;
+
 	if ((base = (struct cpufreq_policy **)&cpufreq_cpu_data) &&
 	    (bpf_probe_read_kernel(&policy, sizeof(policy), base + cpu) == 0) &&
 	    policy) {
-		cpu_max = BPF_CORE_READ(policy, cpuinfo.max_freq);
-		scaling_max = BPF_CORE_READ(policy, max);
+		u32 cpu_max = BPF_CORE_READ(policy, cpuinfo.max_freq);
+		u32 scaling_max = BPF_CORE_READ(policy, max);
+
+		if (cpu_max > 0 && scaling_max > 0)
+			capacity_policy = (capacity_policy * scaling_max) / cpu_max;
 	}
 
-	capacity_policy = cpuc->capacity;
-	if (cpu_max > 0 && scaling_max > 0)
-		capacity_policy = (capacity_policy * scaling_max) / cpu_max;
-
-	if (&hw_pressure && (p_pressure = bpf_per_cpu_ptr(&hw_pressure, cpu)))
-		pressure = *p_pressure;
-
-	capacity_policy = (capacity_policy > pressure)?
+	if (&hw_pressure && (p_pressure = bpf_per_cpu_ptr(&hw_pressure, cpu))) {
+		unsigned long pressure = *p_pressure;
+		capacity_policy = (capacity_policy > pressure)?
 				capacity_policy - pressure : 0;
+	}
 
 	/*
 	 * Calculate the maximum capacity observed. This is necessary because
@@ -155,8 +155,8 @@ void update_effective_capacity(struct cpu_ctx *cpuc)
 	 *
 	 * Note that cpuc->max_freq is [0:1024].
 	 */
-	mfo = READ_ONCE(cpuc->max_freq_observed);
-	__sync_val_compare_and_swap(&cpuc->max_freq_observed, mfo, 0);
+	mfo = __sync_val_compare_and_swap(&cpuc->max_freq_observed,
+					  cpuc->max_freq_observed, 0);
 	if ((mfo > 0) && ((cpuc->max_freq < mfo) ||
 	    (cpuc->cur_util >= LAVD_CPU_UTIL_THR_FOR_MAX_FREQ))) {
 		cpuc->max_freq = calc_avg32(cpuc->max_freq, mfo);
@@ -168,16 +168,17 @@ void update_effective_capacity(struct cpu_ctx *cpuc)
 	 * the actual observed capacity as effective capacity.
 	 */
 	if (likely(capacity_policy)) {
-		WRITE_ONCE(cpuc->effective_capacity,
-				min(capacity_policy, capacity_observed));
+		cpuc->effective_capacity = min(capacity_policy, capacity_observed);
 	} else {
-		WRITE_ONCE(cpuc->effective_capacity, capacity_observed);
+		cpuc->effective_capacity = capacity_observed;
 	}
 
+#if 0
 	debugln("[cpu%d] ec: %d -- cp: %d -- co: %d -- cu: %d -- sm: %d -- cm: %d -- mf: %d -- mfo: %d -- util: %d",
 		cpu, cpuc->effective_capacity, capacity_policy,
 		capacity_observed, cpuc->capacity,
 		scaling_max, cpu_max, cpuc->max_freq, mfo, cpuc->cur_util);
+#endif
 }
 
 __hidden

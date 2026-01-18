@@ -232,7 +232,7 @@ struct cpu_ctx {
 	volatile u64	est_stopping_clk; /* estimated stopping time */
 	volatile u64	running_clk;	/* when a task starts running */
 	volatile u16	lat_cri;	/* latency criticality */
-	u16		effective_capacity;/* the capacity that CPU can do right now */
+	volatile u16	effective_capacity;/* the capacity that CPU can do right now */
 	volatile u32	max_lat_cri;	/* maximum latency criticality */
 	volatile u64	sum_lat_cri;	/* sum of latency criticality */
 
