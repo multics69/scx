@@ -177,6 +177,10 @@ int plan_x_cpdom_migration(void)
 		    cpdomc->sc_load <= stealer_threshold) {
 			WRITE_ONCE(cpdomc->is_stealer, true);
 			WRITE_ONCE(cpdomc->is_stealee, false);
+#if 1
+			bpf_printk("XXX %s:%d -- STEALER: cpdom %d",
+				__func__, __LINE__, cpdomc->id);
+#endif
 			continue;
 		}
 
@@ -188,6 +192,10 @@ int plan_x_cpdom_migration(void)
 			WRITE_ONCE(cpdomc->is_stealer, false);
 			WRITE_ONCE(cpdomc->is_stealee, true);
 			nr_stealee++;
+#if 1
+			bpf_printk("XXX %s:%d -- STEALEE: cpdom %d",
+				__func__, __LINE__, cpdomc->id);
+#endif
 			continue;
 		}
 
@@ -339,6 +347,11 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			 * because the chance is low and there is no harm
 			 * in slight over-stealing.
 			 */
+#if 1
+			bpf_printk("XXX %s:%d -- STEALER: %d <== STEALEE: %d",
+				__func__, __LINE__,
+				cpdomc->id, cpdomc_pick->id);
+#endif
 			if (consume_dsq(cpdomc_pick, dsq_id)) {
 				WRITE_ONCE(cpdomc_pick->is_stealee, false);
 				WRITE_ONCE(cpdomc->is_stealer, false);
@@ -398,6 +411,11 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 
+#if 1
+			bpf_printk("XXX %s:%d -- STEALER: %d <== STEALEE: %d",
+				__func__, __LINE__,
+				cpdomc->id, cpdomc_pick->id);
+#endif
 			if (consume_dsq(cpdomc_pick, dsq_id))
 				return true;
 		}

@@ -281,6 +281,13 @@ void set_on_core_type(task_ctx __arg_arena *taskc,
 		set_task_flag(taskc, LAVD_FLAG_ON_LITTLE);
 	else
 		reset_task_flag(taskc, LAVD_FLAG_ON_LITTLE);
+
+#if 1
+	if (!on_big && !on_little) {
+		bpf_printk("XXX %s:%d -- both on_big and on_little are off",
+		__func__, __LINE__);
+	}
+#endif
 }
 
 __hidden
