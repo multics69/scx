@@ -144,12 +144,24 @@ struct task_ctx {
 	/* --- cacheline 1 boundary (64 bytes) --- */
 	volatile u64	flags;		/* LAVD_FLAG_* */
 	u64	slice;			/* time slice */
-	u64	acc_runtime;		/* accmulated runtime from runnable to quiescent state */
-	u64	avg_runtime;		/* average runtime per schedule */
-	u64	svc_time;		/* total CPU time consumed for this task scaled by task's weight */
 	u64	wait_freq;		/* waiting frequency in a second */
 	u64	wake_freq;		/* waking-up frequency in a second */
 	u64	last_measured_clk;	/* last time when running time was measured */
+	/*
+	 * - accumulated runtime from runnable to quiescent state
+	 * - used to calculate avg_runtime and latency criticality
+	 */
+	u64	acc_runtime;
+	/*
+	 * - average runtime per schedule
+	 * - used to calculate latency criticality
+	 */
+	u64	avg_runtime;
+	/*
+	 * - total CPU time consumed for this task scaled by task's weight
+	 * - used to calculate avg_svc_time
+	 */
+	u64	svc_time;
 
 	/* --- cacheline 2 boundary (128 bytes) --- */
 	u64	last_runnable_clk;	/* last time when a task became runnable */
@@ -229,15 +241,27 @@ struct cpu_ctx *get_cpu_ctx_task(const struct task_struct *p);
 struct cpu_ctx {
 	/* --- cacheline 0 boundary (0 bytes) --- */
 	volatile u64	flags;		/* cached copy of task's flags */
-	volatile u64	tot_task_time;	/* total wall-clock time this CPU has spent running scx tasks so far. */
-	volatile u64	tot_svc_time;	/* total scx tasks' service time on a CPU scaled by tasks' weights */
-	volatile u64	tot_sc_time;	/* total scaled CPU time, which is capacity and frequency invariant. */
 	volatile u64	est_stopping_clk; /* estimated stopping time */
 	volatile u64	running_clk;	/* when a task starts running */
 	volatile u16	lat_cri;	/* latency criticality */
 	volatile u16	effective_capacity;/* the capacity that CPU can do right now */
 	volatile u32	max_lat_cri;	/* maximum latency criticality */
 	volatile u64	sum_lat_cri;	/* sum of latency criticality */
+	/*
+	 * - total wall-clock time this CPU has spent running scx tasks so far.
+	 * - used to calculate non_scx_time.
+	 */
+	volatile u64	tot_task_time;
+	/*
+	 * - total scx tasks' service time on a CPU scaled by tasks' weights.
+	 * - used to calculate avg_svc_time.
+	 */
+	volatile u64	tot_svc_time;
+	/*
+	 * - total scaled CPU time, which is capacity and frequency invariant.
+	 * - used to calculate sc_util.
+	 */
+	volatile u64	tot_sc_time;
 
 	/* --- cacheline 1 boundary (64 bytes) --- */
 	volatile u64	sum_perf_cri;	/* sum of performance criticality */
