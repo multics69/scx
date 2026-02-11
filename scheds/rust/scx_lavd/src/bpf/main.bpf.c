@@ -487,6 +487,7 @@ static void account_task_runtime(struct task_struct *p,
 	WRITE_ONCE(cpuc->tot_task_time_invr, cpuc->tot_task_time_invr + task_time_invr);
 
 	taskc->acc_runtime_wall += runtime_wall;
+	taskc->acc_runtime_invr += task_time_invr;
 	taskc->svc_time_wwgt += task_time_wwgt;
 	taskc->last_measured_clk = now;
 	taskc->last_sum_exec_clk = task_time_wall;
@@ -517,6 +518,8 @@ static void update_stat_for_stopping(struct task_struct *p,
 
 	taskc->avg_runtime_wall = calc_avg(taskc->avg_runtime_wall,
 					   taskc->acc_runtime_wall);
+	taskc->avg_runtime_invr = calc_avg(taskc->avg_runtime_invr,
+					   taskc->acc_runtime_invr);
 	taskc->last_stopping_clk = now;
 
 	/*
@@ -554,6 +557,8 @@ static void update_stat_for_refill(struct task_struct *p,
 	 */
 	taskc->avg_runtime_wall = calc_avg(taskc->avg_runtime_wall,
 					   taskc->acc_runtime_wall);
+	taskc->avg_runtime_invr = calc_avg(taskc->avg_runtime_invr,
+					   taskc->acc_runtime_invr);
 }
 
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -1167,6 +1172,7 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 	p_taskc->acc_runtime_wall = 0;
+	p_taskc->acc_runtime_invr = 0;
 
 	/*
 	 * When a task @p is wakened up, the wake frequency of its waker task
