@@ -34,6 +34,32 @@ void update_effective_capacity(struct cpu_ctx *cpuc);
 
 u64 conv_wall_to_invr_max_freq(u64 dur, s32 cpu);
 
+/*
+ * Convert a wall-clock duration to invariant time using an observed
+ * performance factor derived from a reference pair of measurements taken
+ * over the same interval:
+ *
+ *   duration_invr = duration_wall * (ref_invr / ref_wall)
+ *
+ * This is more accurate than conv_wall_to_invr() (which queries cpuperf
+ * at the current instant) or conv_wall_to_invr_max_freq() (which assumes
+ * maximum frequency) because it uses the actual performance factor
+ * observed over the measurement window.
+ *
+ * Typical use at collection point (collect_sys_stat):
+ *   ref_wall = active_wall  (delta_task - idle_total, excl. IRQ+steal+idle)
+ *   ref_invr = delta_pelt   (invariant active time,   excl. IRQ+steal+idle)
+ *
+ * Returns 0 if ref_wall is zero (CPU was entirely idle or preempted).
+ */
+static __inline u64 conv_wall_to_invr_obs(u64 duration_wall,
+					  u64 ref_invr, u64 ref_wall)
+{
+	if (!ref_wall)
+		return 0;
+	return duration_wall * ref_invr / ref_wall;
+}
+
 static __inline u64 conv_wall_to_invr(u64 duration_wall, struct cpu_ctx *cpuc)
 {
 	u64 cap, freq, duration_invr;

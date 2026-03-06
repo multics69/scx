@@ -140,6 +140,8 @@ static void collect_sys_stat(void)
 	 */
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		u64 non_scx_time_wall, sc_non_scx_time_invr, cpuc_tot_task_time_invr;
+		u64 now_task, now_pelt, delta_task, delta_pelt;
+		u64 irq_steal_wall, irq_steal_invr, active_wall, rt_dl_time_invr;
 		struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			c->compute_total_wall = 0;
@@ -218,6 +220,51 @@ static void collect_sys_stat(void)
 		cpuc->cur_util_invr = (cpuc_tot_task_time_invr << LAVD_SHIFT) /
 					c->duration_wall;
 		cpuc->avg_util_invr = calc_avg(cpuc->avg_util_invr, cpuc->cur_util_invr);
+
+		/*
+		 * Calculate steal time using scx_clock_task() and
+		 * scx_clock_pelt() snapshots for accurate measurement of
+		 * non-SCX active time (IRQ + hypervisor steal + RT/DL).
+		 *
+		 * steal_time_wall: reuses non_scx_time_wall (= compute_wall -
+		 *   tot_task_time_wall), which is exactly IRQ + hypervisor
+		 *   steal + RT/DL wall time, excluding idle.
+		 *
+		 * steal_time_invr: invariant equivalent, derived as:
+		 *   - irq_steal_invr: uses observed performance factor
+		 *     (delta_pelt / active_wall) via conv_wall_to_invr_obs(),
+		 *     which is more accurate than the max-freq approximation.
+		 *     Falls back to avg_perf_factor EWMA when active_wall is
+		 *     zero (e.g., CPU was entirely idle with only IRQ traffic).
+		 *   - rt_dl_time_invr: derived directly from pelt delta minus
+		 *     SCX task invariant time -- no approximation needed.
+		 *
+		 * Note: rq->clock_task and rq->clock_pelt are accessed without
+		 * holding the rq lock (BPF timer callback context). This is a
+		 * benign data race: values are sampled once per ~20 ms and any
+		 * transient inconsistency is smoothed out by the EWMA.
+		 */
+		now_task = scx_clock_task(cpu);
+		now_pelt = scx_clock_pelt(cpu);
+		delta_task = time_delta(now_task, cpuc->prev_task_clk);
+		delta_pelt = time_delta(now_pelt, cpuc->prev_pelt_clk);
+		irq_steal_wall = time_delta(c->duration_wall, delta_task);
+		active_wall = time_delta(delta_task, cpuc->idle_total_wall);
+		if (active_wall > 0) {
+			u64 perf_factor = (delta_pelt << LAVD_SHIFT) / active_wall;
+			cpuc->avg_perf_factor = calc_avg(cpuc->avg_perf_factor,
+							 perf_factor);
+			irq_steal_invr = conv_wall_to_invr_obs(irq_steal_wall,
+							       delta_pelt, active_wall);
+		} else {
+			irq_steal_invr = (irq_steal_wall * cpuc->avg_perf_factor) >> LAVD_SHIFT;
+		}
+		rt_dl_time_invr = time_delta(delta_pelt, cpuc->tot_task_time_invr);
+		cpuc->steal_time_wall = non_scx_time_wall;
+		cpuc->steal_time_invr = irq_steal_invr + rt_dl_time_invr;
+		cpuc->prev_task_clk = now_task;
+		cpuc->prev_pelt_clk = now_pelt;
+
 		cpuc->tot_task_time_invr = 0;
 
 		/*
