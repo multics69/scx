@@ -304,21 +304,6 @@ struct cpu_ctx {
 	u64		online_clk;	/* when a CPU becomes online */
 	u64		offline_clk;	/* when a CPU becomes offline */
 	/*
-	 * Average of estimated steal/irq utilization of CPU.
-	 * Will be used in the future.
-	 */
-	volatile u32	avg_stolen_time_wall;
-	/*
-	 * Estimated irq/steal utilization of the current interval.
-	 * Will be used in the future.
-	 */
-	volatile u32	cur_stolen_time_wall;
-	 /*
-	  * Estimated time stolen by steal/irq time on CPU
-	  */
-	volatile u64	stolen_time_wall;
-
-	/*
 	 * Snapshot of scx_clock_task() taken at the end of the last
 	 * collect_sys_stat() interval. scx_clock_task() advances during tasks
 	 * (SCX, RT/DL, idle) but is frozen during IRQ and hypervisor steal.
@@ -339,7 +324,7 @@ struct cpu_ctx {
 	 * The delta over an interval satisfies:
 	 *   delta_pelt = scx_task_time_invr + rt_dl_time_invr
 	 * so subtracting tot_task_time_invr gives rt_dl_time_invr exactly, and
-	 * the ratio delta_pelt / active_wall is the observed performance factor
+	 * the ratio delta_pelt / task_wall is the observed performance factor
 	 * used by conv_wall_to_invr_obs().
 	 * Initialized at init_per_cpu_ctx() and cpu_ctx_init_online(),
 	 * updated each collect_sys_stat().
@@ -347,8 +332,8 @@ struct cpu_ctx {
 	u64		prev_pelt_clk;
 	/*
 	 * Exponential weighted moving average of the observed performance
-	 * factor (delta_pelt / active_wall) in LAVD_SHIFT fixed-point format.
-	 * Updated each collect_sys_stat() interval when active_wall > 0. Used
+	 * factor (delta_pelt / task_wall) in LAVD_SHIFT fixed-point format.
+	 * Updated each collect_sys_stat() interval when task_wall > 0. Used
 	 * as a fallback for conv_wall_to_invr_obs() when the CPU has no active
 	 * time in the current interval (e.g., mostly idle with only IRQ
 	 * traffic), so that irq_steal_invr is estimated from recent history

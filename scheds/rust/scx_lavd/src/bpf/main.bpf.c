@@ -477,7 +477,7 @@ static void account_task_runtime(struct task_struct *p,
 				 u64 now)
 {
 	u64 task_time_wall, task_time_wwgt, task_time_invr;
-	u64 suspended_wall, duration_wall, now_task, now_pelt;
+	u64 now_task, now_pelt;
 
 	/*
 	 * Since task execution can span one or more sys_stat intervals,
@@ -486,18 +486,8 @@ static void account_task_runtime(struct task_struct *p,
 	 * the load of long-running tasks properly. So, we add up only the
 	 * execution duration since the last measured time.
 	 */
-	suspended_wall = get_suspended_duration_and_reset(cpuc);
-	duration_wall = time_delta(now, taskc->last_measured_wall_clk + suspended_wall);
-
-	/*
-	 * duration_wall - task_time_wall must equal to irq_time + steal_time
-	 * barring some imprecision when the time was snapshotted. We accumulate
-	 * the delta as cpuc->stolen_time_wall to try and approximate the total
-	 * time CPU spent in stolen time (irq+steal).
-	 */
 	now_task = scx_clock_task(cpuc->cpu_id);
 	task_time_wall = time_delta(now_task, taskc->last_measured_task_clk);
-	cpuc->stolen_time_wall += time_delta(duration_wall, task_time_wall);
 
 	now_pelt = scx_clock_pelt(cpuc->cpu_id);
 	task_time_invr = time_delta(now_pelt, taskc->last_measured_pelt_clk);
