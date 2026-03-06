@@ -350,6 +350,18 @@ struct cpu_ctx {
 	u64		steal_time_invr;	/* capacity + frequency invariant */
 
 	/*
+	 * Steal utilization: steal_time as a fraction of duration_wall,
+	 * in LAVD_SHIFT fixed-point. cur_* is the current interval value;
+	 * avg_* is the asymmetric EWMA (fast-rise, slow-decay).
+	 * Used for load balancing: a CPU with high steal utilization has
+	 * less capacity remaining for SCX tasks.
+	 */
+	u32		cur_steal_util_wall;
+	u32		avg_steal_util_wall;
+	u32		cur_steal_util_invr;
+	u32		avg_steal_util_invr;
+
+	/*
 	 * --- cacheline 3 boundary (192 bytes) ---
 	 * (read-only)
 	 */

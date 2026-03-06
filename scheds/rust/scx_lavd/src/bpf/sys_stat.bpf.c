@@ -264,6 +264,20 @@ static void collect_sys_stat(void)
 		cpuc->prev_pelt_clk = now_pelt;
 
 		/*
+		 * Calculate steal utilization: steal_time as a fraction of
+		 * duration_wall. cur_util - cur_steal_util gives the remaining
+		 * SCX capacity, usable for load balancing decisions.
+		 */
+		cpuc->cur_steal_util_wall = (cpuc->steal_time_wall << LAVD_SHIFT) /
+					c->duration_wall;
+		cpuc->avg_steal_util_wall = calc_asym_avg(cpuc->avg_steal_util_wall,
+							   cpuc->cur_steal_util_wall);
+		cpuc->cur_steal_util_invr = (cpuc->steal_time_invr << LAVD_SHIFT) /
+					c->duration_wall;
+		cpuc->avg_steal_util_invr = calc_asym_avg(cpuc->avg_steal_util_invr,
+							   cpuc->cur_steal_util_invr);
+
+		/*
 		 * Calculate per-CPU wall-clock utilization.
 		 * compute_wall = steal_time_wall + tot_task_time_wall (before
 		 * zeroing above), i.e., all non-idle CPU time.
