@@ -229,6 +229,8 @@ struct cpdom_ctx {
 	u32	nr_queued_task;			    /* the number of queued tasks in this domain */
 	u32	cur_util_wall_sum;		    /* the sum of CPU utilization in the current interval */
 	u32	avg_util_wall_sum;		    /* the sum of average CPU utilization */
+	u32	cur_util_invr_sum;		    /* the sum of invariant CPU utilization in the current interval */
+	u32	avg_util_invr_sum;		    /* the sum of average invariant CPU utilization */
 	u32	cap_sum_active_cpus;		    /* the sum of capacities of active CPUs in this domain */
 	u32	cap_sum_temp;			    /* temp for cap_sum_active_cpus */
 	u32	dsq_consume_lat;		    /* latency to consume from dsq, shows how contended the dsq is */
@@ -304,19 +306,50 @@ struct cpu_ctx {
 	u64		online_clk;	/* when a CPU becomes online */
 	u64		offline_clk;	/* when a CPU becomes offline */
 	/*
-	 * Average of estimated steal/irq utilization of CPU.
-	 * Will be used in the future.
+	 * Snapshot of scx_clock_task() taken at the end of the last
+	 * collect_sys_stat() interval. scx_clock_task() advances during tasks
+	 * (SCX, RT/DL, idle) but is frozen during IRQ and hypervisor steal.
+	 * With NO_HZ_IDLE, rq->clock_task is only updated at scheduling
+	 * events; it is stale for a currently-idle remote CPU. When a CPU
+	 * wakes from idle, rq->clock_task catches up to include the elapsed
+	 * idle duration. See collect_sys_stat() for how task_wall and
+	 * irq_steal_wall are correctly derived from delta_task.
+	 * Initialized at init_per_cpu_ctx() and cpu_ctx_init_online(),
+	 * updated each collect_sys_stat().
 	 */
-	volatile u32	avg_stolen_time_wall;
+	u64		prev_task_clk;
 	/*
-	 * Estimated irq/steal utilization of the current interval.
-	 * Will be used in the future.
+	 * Snapshot of scx_clock_pelt() taken at the end of the last
+	 * collect_sys_stat() interval. scx_clock_pelt() advances only during
+	 * active execution (SCX + RT/DL), normalized by CPU capacity and
+	 * frequency. It is frozen during IRQ, steal, and idle.
+	 * The delta over an interval satisfies:
+	 *   delta_pelt = scx_task_time_invr + rt_dl_time_invr
+	 * so subtracting tot_task_time_invr gives rt_dl_time_invr exactly, and
+	 * the ratio delta_pelt / task_wall is the observed performance factor
+	 * used by conv_wall_to_invr_obs().
+	 * Initialized at init_per_cpu_ctx() and cpu_ctx_init_online(),
+	 * updated each collect_sys_stat().
 	 */
-	volatile u32	cur_stolen_time_wall;
-	 /*
-	  * Estimated time stolen by steal/irq time on CPU
-	  */
-	volatile u64	stolen_time_wall;
+	u64		prev_pelt_clk;
+	/*
+	 * Exponential weighted moving average of the observed performance
+	 * factor (delta_pelt / task_wall) in LAVD_SHIFT fixed-point format.
+	 * Updated each collect_sys_stat() interval when task_wall > 0. Used
+	 * as a fallback for conv_wall_to_invr_obs() when the CPU has no active
+	 * time in the current interval (e.g., mostly idle with only IRQ
+	 * traffic), so that irq_steal_invr is estimated from recent history
+	 * rather than defaulting to zero or assuming max frequency.
+	 * Initialized to LAVD_SCALE at init_per_cpu_ctx() and
+	 * cpu_ctx_init_online().
+	 */
+	u32		avg_perf_factor;
+	/*
+	 * Steal time for the current interval: time the CPU was not running
+	 * SCX tasks and not idle (= IRQ + hypervisor steal + RT/DL).
+	 */
+	u64		steal_time_wall;	/* wall clock */
+	u64		steal_time_invr;	/* capacity + frequency invariant */
 
 	/*
 	 * --- cacheline 3 boundary (192 bytes) ---
