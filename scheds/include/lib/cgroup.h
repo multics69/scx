@@ -156,6 +156,33 @@ int scx_cgroup_bw_cancel(u64 taskc);
 #define REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(eqcb)					\
 	__hidden int scx_cgroup_bw_enqueue_cb(u64 ctx)				\
 	{									\
+		/*								\
+		 * bpf_task_from_pid() for a throttled task cannot fail		\
+		 * for the following reasons:					\
+		 *								\
+		 * 1) An exiting task is never throttled.			\
+		 *    scx_cgroup_bw_throttled() checks PF_EXITING and		\
+		 *    rejects such tasks before they can be put aside.		\
+		 *								\
+		 * 2) A throttled task's PID cannot change. A PID change	\
+		 *    only occurs when a non-thread-group-leader calls		\
+		 *    exec(), which requires the task to be actively		\
+		 *    running (i.e., current). A throttled task is		\
+		 *    runnable but not running, so it can never be in		\
+		 *    the exec() path.						\
+		 *								\
+		 * 3) Even at exec() time, the PID change via			\
+		 *    exchange_tids() is protected by				\
+		 *    write_lock_irq(&tasklist_lock), which disables IRQs	\
+		 *    on the local CPU. With IRQs disabled, the scheduler	\
+		 *    tick cannot fire and no context switch can occur		\
+		 *    during the PID swap. Thus an SCX scheduler observes	\
+		 *    either the old PID or the new PID atomically --		\
+		 *    never an intermediate state.				\
+		 *								\
+		 * Therefore, if bpf_task_from_pid() returns NULL here,		\
+		 * it is a genuine bug.						\
+		 */								\
 		extern int eqcb(struct task_struct * __arg_trusted, u64);	\
 		task_ctx *taskc = (task_ctx *)ctx;				\
 		struct task_struct *p = bpf_task_from_pid(taskc->pid);		\
