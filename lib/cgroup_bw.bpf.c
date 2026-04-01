@@ -2342,7 +2342,7 @@ bool cbw_has_throttled_tasks(union backlog_stat *stat)
 __hidden
 int scx_cgroup_bw_reenqueue(void)
 {
-	static u64 reenq_lock = 0;
+	static u64 reenq_lock __attribute__((aligned(SCX_CACHELINE_SIZE)));
 
 	union backlog_stat backlog_stat;
 	struct scx_cgroup_ctx *cur_cgx;
