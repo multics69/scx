@@ -1,0 +1,39 @@
+#!/usr/bin/bpftrace
+// trace/eevdf_throttle.bt
+// Measures throttle_cfs_rq and unthrottle_cfs_rq latency (EEVDF throttle path).
+// Run under condition B (EEVDF + cpu.max).
+
+BEGIN {
+    printf("Tracing throttle/unthrottle_cfs_rq — hit Ctrl-C to print results.\n");
+}
+
+// throttle_cfs_rq is called in scheduler context (task tick / runtime accounting).
+// unthrottle_cfs_rq is called from sched_cfs_period_timer (softirq), where tid is
+// the interrupted task — not the cfs_rq being unthrottled.  Both are per-CPU
+// operations, so cpu is the correct correlation key for both.
+
+kprobe:throttle_cfs_rq
+{
+    @throttle_calls++;
+}
+
+kprobe:unthrottle_cfs_rq
+{
+    @unthrottle_calls++;
+}
+
+interval:s:1
+{
+    if (@throttle_calls > 0 || @unthrottle_calls > 0) {
+        printf("throttle/sec: %lld  unthrottle/sec: %lld\n",
+               @throttle_calls, @unthrottle_calls);
+    }
+    @throttle_calls = 0;
+    @unthrottle_calls = 0;
+}
+
+END
+{
+    clear(@throttle_calls);
+    clear(@unthrottle_calls);
+}

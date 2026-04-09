@@ -1,0 +1,34 @@
+#!/usr/bin/bpftrace
+// trace/eevdf_hotpath.bt
+// Measures per-call latency of throttled_hierarchy() (EEVDF hot path).
+// Run under condition B (EEVDF + cpu.max).
+
+// NOTE: throttled_hierarchy() is a static inline function and may not be
+// present in /proc/kallsyms on all kernels. Verify before running:
+//   grep throttled_hierarchy /proc/kallsyms
+// If absent, use perf probe to add a dynamic kprobe from kernel source:
+//   sudo perf probe -x vmlinux throttled_hierarchy
+// Or skip this script — throttle_cfs_rq and unthrottle_cfs_rq (eevdf_throttle.bt)
+// are always available and capture the throttle event cost.
+
+BEGIN {
+    printf("Tracing throttled_hierarchy — hit Ctrl-C to print results.\n");
+}
+
+kprobe:throttled_hierarchy
+{
+    @calls_total++;
+}
+
+interval:s:1
+{
+    if (@calls_total > 0) {
+        printf("throttled_hierarchy calls/sec: %lld\n", @calls_total);
+    }
+    @calls_total = 0;
+}
+
+END
+{
+    clear(@calls_total);
+}

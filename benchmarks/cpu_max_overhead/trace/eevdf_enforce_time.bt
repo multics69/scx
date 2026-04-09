@@ -1,0 +1,49 @@
+#!/usr/bin/bpftrace
+// trace/eevdf_enforce_time.bt
+// Accumulates total CPU-nanoseconds spent in EEVDF cpu.max enforcement functions:
+//   throttle_cfs_rq   — called when a cgroup exhausts its quota
+//   unthrottle_cfs_rq — called at period boundary to restore quota
+//
+// Both functions are per-CPU operations; cpu is used as the correlation key to
+// avoid tid collisions (unthrottle_cfs_rq runs in softirq context where tid is
+// the interrupted task, not the cfs_rq being unthrottled).
+//
+// Run alongside perf stat for condition B. Send SIGINT when the measurement
+// window ends; the END block prints totals consumed by report.sh:
+//   throttle_ns <N>
+//   unthrottle_ns <N>
+// run_bench.sh appends: ncpus <N> and duration_s <N>
+
+kprobe:throttle_cfs_rq
+{
+    @throttle_start[cpu] = nsecs;
+}
+
+kretprobe:throttle_cfs_rq
+/@throttle_start[cpu]/
+{
+    @throttle_ns += nsecs - @throttle_start[cpu];
+    delete(@throttle_start[cpu]);
+}
+
+kprobe:unthrottle_cfs_rq
+{
+    @unthrottle_start[cpu] = nsecs;
+}
+
+kretprobe:unthrottle_cfs_rq
+/@unthrottle_start[cpu]/
+{
+    @unthrottle_ns += nsecs - @unthrottle_start[cpu];
+    delete(@unthrottle_start[cpu]);
+}
+
+END
+{
+    printf("throttle_ns %lld\n", @throttle_ns);
+    printf("unthrottle_ns %lld\n", @unthrottle_ns);
+    clear(@throttle_start);
+    clear(@unthrottle_start);
+    clear(@throttle_ns);
+    clear(@unthrottle_ns);
+}

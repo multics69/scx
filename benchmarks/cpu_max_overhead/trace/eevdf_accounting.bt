@@ -1,0 +1,26 @@
+#!/usr/bin/bpftrace
+// trace/eevdf_accounting.bt
+// Measures call rate of __account_cfs_rq_runtime() (EEVDF synchronous accounting).
+// Run under condition B (EEVDF + cpu.max).
+
+BEGIN {
+    printf("Tracing __account_cfs_rq_runtime — hit Ctrl-C to print results.\n");
+}
+
+kprobe:__account_cfs_rq_runtime
+{
+    @calls_total++;
+}
+
+interval:s:1
+{
+    if (@calls_total > 0) {
+        printf("__account_cfs_rq_runtime calls/sec: %lld\n", @calls_total);
+    }
+    @calls_total = 0;
+}
+
+END
+{
+    clear(@calls_total);
+}
