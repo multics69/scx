@@ -913,7 +913,7 @@ int cbw_free_llc_ctx(scx_cgroup_ctx_t *cgx, u64 cgrp_id)
 		 * Move all the throttled exiting tasks into the root cgroup.
 		 * Then, delete the LLC context and its associated BTQ.
 		 */
-		if (cgrp_id != 1) {
+		if (cgrp_id != ROOT_CGID) {
 			while ((taskc = scx_atq_pop(btq)) && can_loop) {
 				scx_task_cgroup_bw_t *t = (scx_task_cgroup_bw_t *)taskc;
 				/*
@@ -944,7 +944,7 @@ int cbw_free_llc_ctx(scx_cgroup_ctx_t *cgx, u64 cgrp_id)
 				 * cgroup, so it has to wait until the next
 				 * replenishment interval anyway.
 				 */
-				ret = cbw_put_aside(taskc, 0, 1);
+				ret = cbw_put_aside(taskc, 0, ROOT_CGID);
 				if (likely(!ret)) {
 					nr_moved++;
 				} else {
@@ -1118,7 +1118,7 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 	 */
 	if ((cgrp->level > 0) &&
 	    (parent = bpf_cgroup_ancestor(cgrp, cgrp->level - 1))) {
-		if (cgroup_get_id(parent) != 1) {
+		if (cgroup_get_id(parent) != ROOT_CGID) {
 			parentx = cbw_get_cgroup_ctx(parent);
 			if (parentx && !cgroup_is_threaded(parent)) {
 				cbw_free_llc_ctx(parentx, parentx->id);
