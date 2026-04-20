@@ -57,7 +57,7 @@ enum scx_cgroup_consts {
 	/* maximum number of re-enqueue tasks in one dispatch */
 	CBW_REENQ_MAX_BATCH		= 2,
 	/* size of the deferred BTQ destroy queue */
-	CBW_DEFERRED_BTQ_SIZE		= 256,
+	CBW_DEFERRED_BTQ_SIZE		= CBW_NR_CGRP_LLC_MAX,
 };
 
 /*
@@ -827,6 +827,32 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id);
 
 static void schedule_atq_destroy(scx_atq_t *btq)
 {
+	/*
+	 * Defer scx_atq_destroy() to avoid a use-after-free race with
+	 * cbw_drain_btq_batch(). That function snapshots llcx->btq under
+	 * READ_ONCE() and then calls scx_atq_pop() on the snapshot. There
+	 * is a narrow window between the READ_ONCE() and the
+	 * arena_spin_lock() inside scx_atq_pop() where the BTQ could be
+	 * freed by a concurrent scx_atq_destroy() on another CPU, causing
+	 * scx_atq_pop() to lock and dereference freed memory.
+	 *
+	 * This ring acts as a grace-period buffer: a BTQ stored here is
+	 * not freed until CBW_DEFERRED_BTQ_SIZE later BTQ destructions
+	 * have occurred. CBW_DEFERRED_BTQ_SIZE is set to
+	 * CBW_NR_CGRP_LLC_MAX (the total number of BTQs that can ever
+	 * exist), so eviction requires destroying every BTQ in the system.
+	 * The race window is a handful of instructions; completing 65536
+	 * BTQ destructions within that window is physically impossible,
+	 * making the remaining race probability negligible in practice.
+	 *
+	 * The theoretically correct fix is an RCU-style deferred
+	 * reclamation: free the BTQ only after a grace period during which
+	 * all readers that may hold a stale pointer have passed through a
+	 * quiescent state. This ring already implements that pattern; with
+	 * CBW_DEFERRED_BTQ_SIZE set to CBW_NR_CGRP_LLC_MAX the grace
+	 * period is long enough to make the remaining race negligible in
+	 * practice.
+	 */
 	static u64 slots[CBW_DEFERRED_BTQ_SIZE] __attribute__((aligned(SCX_CACHELINE_SIZE)));
 	static u64 tail __attribute__((aligned(SCX_CACHELINE_SIZE)));
 	u64 slot, old, prev;
