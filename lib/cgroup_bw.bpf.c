@@ -56,8 +56,6 @@ enum scx_cgroup_consts {
 	CBW_RUNTUME_INF			= ((s64)~((u64)1 << 63)),
 	/* maximum number of re-enqueue tasks in one dispatch */
 	CBW_REENQ_MAX_BATCH		= 2,
-	/* size of the deferred BTQ destroy queue */
-	CBW_DEFERRED_BTQ_SIZE		= 256,
 };
 
 /*
@@ -231,6 +229,20 @@ struct scx_cgroup_llc_ctx {
 	 * backend of BTQ.
 	 */
 	scx_atq_t	*btq;
+
+	/*
+	 * Pending destruction queue linkage.  Valid only while this llcx is
+	 * on the cbw_pending_queue (between cbw_schedule_llcx_destroy() and
+	 * cbw_reclaim_llcx()).  Mutually exclusive with free_next: free_next
+	 * is valid only while on the allocator free list.
+	 *
+	 * pending_next is a raw u64 arena address (same convention as
+	 * free_next) to avoid BPF verifier complaints about __arena pointer
+	 * fields in structs.
+	 */
+	u64		pending_next;	/* raw arena addr of next node; 0 = end */
+	u64		pending_epoch;	/* cbw_btq_queue_epoch when queued */
+	scx_atq_t	*pending_btq;	/* old btq to destroy after grace period */
 } __attribute__((aligned(SCX_CACHELINE_SIZE)));
 
 typedef struct scx_cgroup_llc_ctx __arena scx_cgroup_llc_ctx_t;
@@ -283,6 +295,19 @@ struct {
 } cbw_cgrp_llc_map SEC(".maps");
 
 /*
+ * Per-CPU quiescent-state epoch for QSBR-style deferred BTQ destruction.
+ * Each CPU writes the current cbw_btq_queue_epoch to its slot at every
+ * dispatch (cbw_report_qs()).  A pending BTQ is safe to free once every
+ * potential reader CPU has acknowledged an epoch >= the BTQ's queued epoch.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} cbw_cpu_qs_epoch SEC(".maps");
+
+/*
  * Generic Treiber-stack free list for arena objects.
  *
  * Any arena struct using these helpers must place a u64 free_next field first.
@@ -325,6 +350,25 @@ static inline void cbw_freelist_push(u64 *head, void __arena *ptr)
  * Cacheline-aligned to avoid false sharing with adjacent globals.
  */
 static u64 cbw_llcx_free_head __attribute__((aligned(SCX_CACHELINE_SIZE)));
+
+/*
+ * Pending BTQ destruction queue for QSBR deferred reclamation.
+ */
+struct cbw_pending_queue {
+	struct bpf_spin_lock	lock;
+	u64			head;	/* raw arena addr of oldest node; 0 = empty */
+	u64			tail;	/* raw arena addr of newest node; 0 = empty */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct cbw_pending_queue);
+} cbw_pending_queue SEC(".maps");
+
+static u64 cbw_btq_queue_epoch __attribute__((aligned(SCX_CACHELINE_SIZE)));
+static u64 cbw_prev_replenish_epoch __attribute__((aligned(SCX_CACHELINE_SIZE)));
 
 static inline scx_cgroup_llc_ctx_t *cbw_alloc_llcx(void)
 {
@@ -825,45 +869,44 @@ int cbw_init_llc_ctx(struct cgroup *cgrp, scx_cgroup_ctx_t *cgx)
 __hidden
 int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id);
 
-static void schedule_atq_destroy(scx_atq_t *btq)
+static void cbw_schedule_llcx_destroy(scx_cgroup_llc_ctx_t *llcx,
+				      scx_atq_t *btq)
 {
-	static u64 slots[CBW_DEFERRED_BTQ_SIZE] __attribute__((aligned(SCX_CACHELINE_SIZE)));
-	static u64 tail __attribute__((aligned(SCX_CACHELINE_SIZE)));
-	u64 slot, old, prev;
-
-	do {
-		/*
-		 * Atomically claim the slot. If the slot is empty, we are done.
-		 */
-		slot = __sync_fetch_and_add(&tail, 1) % CBW_DEFERRED_BTQ_SIZE;
-		old = __sync_val_compare_and_swap(&slots[slot], 0, (u64)btq);
-		if (!old)
-			return;
-
-		/*
-		 * If it is occupied, the tail has wrapped around: replace old
-		 * with the new BTQ via CAS to make the eviction atomic and
-		 * prevent a double-free.
-		 */
-		prev = __sync_val_compare_and_swap(&slots[slot], old, (u64)btq);
-		if (likely(old == prev)) {
-			scx_atq_destroy((scx_atq_t *)old);
-			return;
-		}
-
-		/*
-		 * The CAS can fail if CBW_DEFERRED_BTQ_SIZE concurrent
-		 * destroyer claimed the same slot. If the CAS fails,
-		 * retry to work on a new slot.
-		 */
-	} while (can_loop);
-
 	/*
-	 * Atomically updating tail and slots could be a potential memory hot
-	 * spot, causing a lot of cache coherence traffic. However, it is
-	 * unlikely that real-world workloads will continuously and concurrently
-	 * destroy cgroups. So, let’s keep the design simple for now.
+	 * Enqueue llcx on the QSBR pending destruction list. The llcx itself
+	 * becomes the queue node; it stays alive until cbw_reclaim_llcx()
+	 * confirms that all potential readers have passed through a quiescent
+	 * state, at which point it calls scx_atq_destroy(pending_btq) and
+	 * cbw_free_llcx(llcx).
+	 *
+	 * cbw_btq_queue_epoch is incremented here so that CPUs dispatching
+	 * after this point will write an epoch >= the assigned value to their
+	 * per-CPU slot, allowing cbw_min_cpu_qs_epoch() to confirm the grace
+	 * period has elapsed.
 	 */
+	struct cbw_pending_queue *q;
+	u64 epoch;
+	u32 key = 0;
+
+	q = bpf_map_lookup_elem(&cbw_pending_queue, &key);
+	if (!q) {
+		cbw_err("Failed to lookup pending queue");
+		return;
+	}
+
+	epoch = __sync_fetch_and_add(&cbw_btq_queue_epoch, 1) + 1;
+
+	llcx->pending_btq   = btq;
+	llcx->pending_epoch = epoch;
+	llcx->pending_next  = 0;
+
+	bpf_spin_lock(&q->lock);
+	if (q->tail)
+		((scx_cgroup_llc_ctx_t *)q->tail)->pending_next = (u64)llcx;
+	else
+		q->head = (u64)llcx;
+	q->tail = (u64)llcx;
+	bpf_spin_unlock(&q->lock);
 }
 
 static __always_inline
@@ -955,35 +998,19 @@ int cbw_free_llc_ctx(scx_cgroup_ctx_t *cgx, u64 cgrp_id)
 			}
 		}
 
-		if (cbw_del_llc_ctx_with_id(cgrp_id, i)) {
+		if (cbw_del_llc_ctx_with_id(cgrp_id, i))
 			cbw_err("Failed to delete an LLC context: [%llu/%d]",
 				cgrp_id, i);
-			/*
-			 * Even if the map delete fails, it is still safe to
-			 * call schedule_atq_destroy() below. We won the CAS
-			 * above, so we hold exclusive ownership of btq -- no
-			 * other CPU will access it. The stale LLC map entry
-			 * will be harmless: future lookups will find
-			 * llcx->btq == NULL and skip it.
-			 *
-			 * Do NOT recycle llcx: the stale map entry still
-			 * holds a reference to it.
-			 */
-		} else {
-			/*
-			 * Map entry removed; no future lookup can reach llcx.
-			 * Return it to the free list for reuse.
-			 */
-			cbw_free_llcx(llcx);
-		}
 
 		/*
-		 * Defer scx_atq_destroy() to avoid a use-after-free in
-		 * cbw_drain_btq_batch(): that function snapshots llcx->btq
-		 * under READ_ONCE(), and cbw_free_llc_ctx() may destroy the
-		 * BTQ in the window between the snapshot and scx_atq_pop().
+		 * Defer scx_atq_destroy() and cbw_free_llcx() via QSBR to
+		 * avoid a use-after-free in cbw_drain_btq_batch(): that
+		 * function snapshots llcx->btq under READ_ONCE() and then
+		 * calls scx_atq_pop() on the snapshot. llcx stays alive as
+		 * the queue node until cbw_reclaim_llcx() confirms all
+		 * potential readers have passed through a quiescent state.
 		 */
-		schedule_atq_destroy(btq);
+		cbw_schedule_llcx_destroy(llcx, btq);
 	}
 
 	return nr_moved;
@@ -2089,6 +2116,106 @@ rearm_out:
 	return 0;
 }
 
+static u64 cbw_min_cpu_qs_epoch(void)
+{
+	/*
+	 * Compute the minimum acknowledged QS epoch across all CPUs that
+	 * could hold a stale BTQ pointer (i.e., active dispatch callers).
+	 *
+	 * Two classes of CPUs are safe to skip:
+	 *
+	 * 1) Idle CPUs: detected via scx_bpf_get_idle_cpumask(). They have
+	 *    no running tasks and never call cbw_drain_btq_batch().
+	 *
+	 * 2) Busy CPUs (one task running for the entire replenish period
+	 *    without preemption): they never enter dispatch and therefore
+	 *    never call cbw_drain_btq_batch(). Detected by checking whether
+	 *    the CPU's acknowledged epoch is <= cbw_prev_replenish_epoch,
+	 *    meaning it has not dispatched since the start of the current
+	 *    replenish tick.
+	 *
+	 * Returns U64_MAX when no CPU qualifies (all are idle or busy), which
+	 * causes cbw_reclaim_llcx() to treat all pending BTQs as reclaimable.
+	 * This is safe because cbw_reclaim_llcx() runs at the replenish timer
+	 * (~100 ms after any BTQ was queued), which is orders of magnitude
+	 * longer than the race window (a handful of instructions).
+	 */
+	struct bpf_cpumask *idle;
+	u64 min_epoch = U64_MAX;
+	u64 prev_epoch;
+	u32 key = 0;
+	int cpu;
+
+	idle = (struct bpf_cpumask *)scx_bpf_get_idle_cpumask();
+	prev_epoch = READ_ONCE(cbw_prev_replenish_epoch);
+
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		u64 *qs, v;
+
+		if (idle && bpf_cpumask_test_cpu(cpu, (const struct cpumask *)idle))
+			continue;
+
+		qs = bpf_map_lookup_percpu_elem(&cbw_cpu_qs_epoch, &key, cpu);
+		if (!qs)
+			continue;
+
+		v = READ_ONCE(*qs);
+		if (v <= prev_epoch)
+			continue;
+
+		if (v < min_epoch)
+			min_epoch = v;
+	}
+
+	if (idle)
+		scx_bpf_put_cpumask((const struct cpumask *)idle);
+
+	return min_epoch;
+}
+
+static void cbw_reclaim_llcx(void)
+{
+	/*
+	 * Free pending llcx/BTQ pairs whose QSBR grace period has elapsed.
+	 * Called at the end of each replenish tick, after replenishment work
+	 * is complete.
+	 *
+	 * The list is FIFO (oldest epoch at head), so we stop as soon as we
+	 * find an entry whose epoch exceeds the current minimum acknowledged
+	 * epoch across all active CPUs.
+	 */
+	struct cbw_pending_queue *q;
+	scx_cgroup_llc_ctx_t *llcx;
+	u64 min_qs;
+	u32 key = 0;
+
+	q = bpf_map_lookup_elem(&cbw_pending_queue, &key);
+	if (!q)
+		return;
+
+	if (!q->head)
+		return;
+
+	min_qs = cbw_min_cpu_qs_epoch();
+
+	while (can_loop) {
+		bpf_spin_lock(&q->lock);
+		llcx = (scx_cgroup_llc_ctx_t *)q->head;
+		if (!llcx || llcx->pending_epoch > min_qs) {
+			bpf_spin_unlock(&q->lock);
+			break;
+		}
+		q->head = llcx->pending_next;
+		if (!q->head)
+			q->tail = 0;
+		bpf_spin_unlock(&q->lock);
+
+		scx_atq_destroy(llcx->pending_btq);
+		llcx->pending_btq = NULL;
+		cbw_free_llcx(llcx);
+	}
+}
+
 /*
  * A handler function for the replenish timer.
  */
@@ -2109,6 +2236,16 @@ int replenish_timerfn(void *map, int *key, struct bpf_timer *timer)
 
 	/* Attach the timer function to the BPF area context. */
 	scx_arena_subprog_init();
+
+	/*
+	 * Snapshot and advance the QSBR epoch at the very start of each tick.
+	 * Saving cbw_prev_replenish_epoch before the increment ensures that
+	 * CPUs dispatching during this tick write an epoch strictly greater
+	 * than cbw_prev_replenish_epoch, making cbw_min_cpu_qs_epoch() able
+	 * to distinguish them from CPUs that have not dispatched this period.
+	 */
+	WRITE_ONCE(cbw_prev_replenish_epoch, READ_ONCE(cbw_btq_queue_epoch));
+	__sync_fetch_and_add(&cbw_btq_queue_epoch, 1);
 
 	/*
 	 * Let's start running the top half.
@@ -2338,11 +2475,18 @@ int replenish_timerfn(void *map, int *key, struct bpf_timer *timer)
 		cbw_top_half_end(0, false);
 	}
 
+rearm_out:
+	/*
+	 * Reclaim pending BTQs whose QSBR grace period has elapsed.
+	 * Placed under rearm_out so reclamation runs on every tick,
+	 * including the error path.
+	 */
+	cbw_reclaim_llcx();
+
 	/*
 	 * Re-arm the replenish timer. We calculate the jitter to compensate
 	 * for the delay of the timer execution, CBW_REPLENISH_PERIOD.
 	 */
-rearm_out:
 	interval = time_delta(now, cbw_last_replenish_at);
 	jitter = time_delta(interval, CBW_REPLENISH_PERIOD);
 	period = max(time_delta(CBW_REPLENISH_PERIOD, jitter), CBW_REPLENISH_PERIOD_MIN);
@@ -2455,6 +2599,25 @@ bool cbw_has_throttled_tasks(union backlog_stat *stat)
 	return false;
 }
 
+static __always_inline void cbw_report_qs(void)
+{
+	/*
+	 * Report a quiescent state for QSBR deferred reclamation.
+	 *
+	 * Called at the start of every ops.dispatch() (via
+	 * scx_cgroup_bw_reenqueue()). Each CPU writes the current
+	 * cbw_btq_queue_epoch to its per-CPU slot. cbw_reclaim_llcx() uses
+	 * the per-CPU minimum to determine when all potential readers have
+	 * passed through a quiescent state and a pending BTQ is safe to
+	 * destroy.
+	 */
+	u32 key = 0;
+	u64 *qs = bpf_map_lookup_elem(&cbw_cpu_qs_epoch, &key);
+
+	if (qs)
+		WRITE_ONCE(*qs, READ_ONCE(cbw_btq_queue_epoch));
+}
+
 /*
  * scx_cgroup_bw_reenqueue - Reenqueue backlogged tasks.
  *
@@ -2476,6 +2639,8 @@ int scx_cgroup_bw_reenqueue(void)
 	u64 nuance, nuance2, nr_tcgs;
 	u64 *ids, cur_cgrp_id;
 	bool root_added = false;
+
+	cbw_report_qs();
 
 	/*
 	 * If there are throttled tasks in BTQ, let’s reenqueue them.
