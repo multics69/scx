@@ -179,8 +179,10 @@ int scx_cgroup_bw_pressure(u64 cgrp_id, u64 taskc);
 	{									\
 		extern int eqcb(struct task_struct * __arg_trusted, u64);	\
 		task_ctx *taskc = (task_ctx *)ctx;				\
-		struct task_struct *p = bpf_task_from_pid(taskc->pid);		\
-		if (p) {							\
+		struct task_struct *p;						\
+		if (unlikely(!taskc->pid))					\
+			return 0;						\
+		if ((p = bpf_task_from_pid(taskc->pid))) {			\
 			eqcb(p, (u64)taskc);					\
 			bpf_task_release(p);					\
 		} else {							\
