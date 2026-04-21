@@ -58,6 +58,12 @@ enum scx_cgroup_consts {
 	CBW_REENQ_MAX_BATCH		= 2,
 	/* size of the deferred BTQ destroy queue */
 	CBW_DEFERRED_BTQ_SIZE		= 256,
+	/*
+	 * Maximum carried_debt expressed as a multiple of nquota_ub.
+	 * Caps the number of replenish periods during which a cgroup is
+	 * throttled at period_budget=1 after a one-time overuse spike.
+	 */
+	CBW_CARRIED_DEBT_MAX_PERIODS	= 10,
 };
 
 /*
@@ -144,8 +150,24 @@ struct scx_cgroup_ctx {
 		 * cbw_update_runtime_total_sloppy() as the throttle threshold
 		 * instead of the bare nquota_ub, so that long-run average
 		 * utilization converges to the configured quota.
+		 *
+		 * Always clamped to >= 1 so that is_throttled is never kept set
+		 * purely due to accumulated debt.  Excess debt that would push
+		 * this below 1 is spilled into @carried_debt and paid back in
+		 * subsequent periods at nquota_ub per period.
 		 */
 		s64		period_budget;
+
+		/*
+		 * Debt that overflows the per-period nquota_ub capacity and
+		 * must be carried forward across periods.  Non-zero only when
+		 * the natural budget (nquota_ub + burst_credit - debt) would
+		 * be <= 0.  Decreases by ~nquota_ub each period until cleared.
+		 * Capped at CBW_CARRIED_DEBT_MAX_PERIODS * nquota_ub so that a
+		 * one-time spike cannot impose an arbitrarily long throttle
+		 * penalty.
+		 */
+		s64		carried_debt;
 
 		/*
 		 * Total amount of time executed once replenished. It includes
@@ -562,6 +584,7 @@ void cbw_top_half_end(u16 nr_throttled_cgroups, u16 has_throttled_tasks)
 
 #define dbg_cgx(cgx, str, ...) do {						\
 	cbw_dbg(str "cgid%llu -- cgx:period_budget: %lld -- "			\
+		"cgx:carried_debt: %lld -- "					\
 		"cgx:runtime_total_last: %lld -- "				\
 		"cgx:runtime_total_sloppy: %lld -- "				\
 		"cgx:nquota: %lld -- "						\
@@ -569,7 +592,7 @@ void cbw_top_half_end(u16 nr_throttled_cgroups, u16 has_throttled_tasks)
 		"cgx:is_throttled: %d -- "					\
 		"cgx:avg_consumption_rate: %llu "				\
 		##__VA_ARGS__,							\
-		cgx->id, cgx->period_budget,					\
+		cgx->id, cgx->period_budget, cgx->carried_debt,		\
 		cgx->runtime_total_last, cgx->runtime_total_sloppy,		\
 		cgx->nquota, cgx->nquota_ub, cgx->is_throttled,		\
 		cgx->avg_consumption_rate);					\
@@ -589,6 +612,7 @@ void cbw_top_half_end(u16 nr_throttled_cgroups, u16 has_throttled_tasks)
 
 #define info_cgx(cgx, str, ...) do {						\
 	cbw_info(str "cgid%llu -- cgx:period_budget: %lld -- "			\
+		 "cgx:carried_debt: %lld -- "					\
 		 "cgx:runtime_total_last: %lld -- "				\
 		 "cgx:runtime_total_sloppy: %lld -- "				\
 		 "cgx:nquota: %lld -- "						\
@@ -596,7 +620,7 @@ void cbw_top_half_end(u16 nr_throttled_cgroups, u16 has_throttled_tasks)
 		 "cgx:is_throttled: %d -- "					\
 		 "cgx:avg_consumption_rate: %llu"				\
 		 ##__VA_ARGS__,							\
-		 cgx->id, cgx->period_budget,					\
+		 cgx->id, cgx->period_budget, cgx->carried_debt,		\
 		 cgx->runtime_total_last, cgx->runtime_total_sloppy,		\
 		 cgx->nquota, cgx->nquota_ub, cgx->is_throttled,		\
 		 cgx->avg_consumption_rate);					\
@@ -1106,6 +1130,7 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 	cbw_update_nquota_ub(cgrp, (u64)cgx);
 	cgx->runtime_total_sloppy = 0;
 	cgx->period_budget = cgx->nquota_ub;
+	cgx->carried_debt = 0;
 	cgx->is_throttled = false;
 
 	/*
@@ -1834,7 +1859,7 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id)
 
 	ret = scx_atq_lock(btq);
 	if (ret) {
-		cbw_err("Failed to lock ATQ.");
+		cbw_dbg("Failed to lock ATQ.");
 		return -EBUSY;
 	}
 
@@ -1853,7 +1878,7 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id)
 
 	ret = scx_atq_insert_vtime_unlocked(btq, taskc, vtime);
 	if (ret)
-		cbw_err("Failed to insert a task to BTQ: %d", ret);
+		cbw_dbg("Failed to insert a task to BTQ: %d", ret);
 
 	scx_atq_unlock(btq);
 
@@ -1907,7 +1932,7 @@ bool cbw_has_backlogged_tasks(scx_cgroup_ctx_t *cgx)
 static
 bool cbw_replenish_cgroup(scx_cgroup_ctx_t *cgx, u64 now)
 {
-	s64 burst_credit = 0, debt = 0, budget;
+	s64 burst_credit = 0, debt = 0, budget, carried_debt;
 	bool period_end, was_throttled, keep_throttled = false;
 
 	/*
@@ -1932,9 +1957,11 @@ bool cbw_replenish_cgroup(scx_cgroup_ctx_t *cgx, u64 now)
 	 * Debt and burst credit are computed independently:
 	 *
 	 * Debt: overspend relative to period_budget (the effective budget for
-	 * the just-completed interval). Using period_budget rather than bare
-	 * nquota_ub is correct: if burst was granted last interval, spending
-	 * up to period_budget is not a violation and should not incur debt.
+	 * the just-completed interval), plus any carried_debt accumulated from
+	 * previous periods where the natural budget would have been <= 0.
+	 * Using period_budget rather than bare nquota_ub is correct: if burst
+	 * was granted last interval, spending up to period_budget is not a
+	 * violation and should not incur debt.
 	 *
 	 * Burst credit: underspend relative to nquota (the cgroup's own
 	 * quota), clamped to [0, burst_remaining], matching cpu.max.burst
@@ -1948,7 +1975,8 @@ bool cbw_replenish_cgroup(scx_cgroup_ctx_t *cgx, u64 now)
 	 * also 0, so clamp(..., 0LL, 0LL) = 0 and burst_credit is always
 	 * zero without any special casing.
 	 */
-	debt = max(cgx->runtime_total_last - cgx->period_budget, 0LL);
+	carried_debt = READ_ONCE(cgx->carried_debt);
+	debt = max(cgx->runtime_total_last - cgx->period_budget, 0LL) + carried_debt;
 	burst_credit = clamp((s64)cgx->nquota - cgx->runtime_total_last,
 			     0LL, cgx->burst_remaining);
 
@@ -1964,16 +1992,33 @@ bool cbw_replenish_cgroup(scx_cgroup_ctx_t *cgx, u64 now)
 			   cgx->burst_remaining - burst_credit);
 
 	budget = (s64)cgx->nquota_ub + burst_credit - debt;
+
+	/*
+	 * Always grant at least 1 ns so that period_budget > 0 and
+	 * is_throttled is never kept set solely due to accumulated debt.
+	 * This ensures the BTQ drain loop can always make forward progress
+	 * each period (at least CBW_REENQ_MAX_BATCH tasks per replenish).
+	 * Any deficit beyond nquota_ub is spilled into carried_debt and paid
+	 * back at ~nquota_ub per period until cleared.
+	 */
+	if (budget < 1) {
+		s64 max_debt = CBW_CARRIED_DEBT_MAX_PERIODS * (s64)cgx->nquota_ub;
+
+		WRITE_ONCE(cgx->carried_debt, min(1LL - budget, max_debt));
+		budget = 1;
+	} else {
+		WRITE_ONCE(cgx->carried_debt, 0);
+	}
+
 	WRITE_ONCE(cgx->period_budget, budget);
 
 	/*
-	 * If budget <= 0, the cgroup's debt exceeds its quota and burst for
-	 * this period, so it has no CPU time to spend. Keep it throttled so
-	 * that (a) the bottom half does not drain its BTQ and (b) the caller
-	 * can propagate the throttle to descendants immediately via
-	 * cbw_throttle_cgroups() without waiting for the next accounting tick.
+	 * keep_throttled is always false: period_budget >= 1 guarantees the
+	 * BTQ drain loop is never blocked.  Throttling (is_throttled=true)
+	 * will still happen intra-period once runtime_total_sloppy >= 1, but
+	 * it is always cleared at the next replenish.
 	 */
-	keep_throttled = (budget <= 0);
+	keep_throttled = false;
 
 	/*
 	 * Update the EWMA consumption rate (CBW_SCALE = 1024 means 100% of
