@@ -57,7 +57,7 @@ enum scx_cgroup_consts {
 	/* maximum number of re-enqueue tasks in one dispatch */
 	CBW_REENQ_MAX_BATCH		= 2,
 	/* size of the deferred BTQ destroy queue */
-	CBW_DEFERRED_BTQ_SIZE		= 256,
+	CBW_DEFERRED_BTQ_SIZE		= (CBW_NR_CGRP_LLC_MAX * 2),
 	/*
 	 * Maximum carried_debt expressed as a multiple of nquota_ub.
 	 * Caps the number of replenish periods during which a cgroup is
