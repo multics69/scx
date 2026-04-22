@@ -64,7 +64,17 @@ enum scx_cgroup_consts {
 	 * throttled at period_budget=1 after a one-time overuse spike.
 	 */
 	CBW_CARRIED_DEBT_MAX_PERIODS	= 10,
+	/*
+	 * Shift used to split the 64-bit BTQ key into a wall-clock epoch
+	 * (upper 34 bits) and a scheduler vtime (lower 30 bits).  Tasks
+	 * queued in the same ~1-second epoch (2^30 ns ~= 1.07 s) compete by
+	 * their vtime; tasks from an earlier epoch are always dispatched
+	 * first, bounding the maximum BTQ wait to ~1 second.
+	 */
+	CBW_BTQ_VTIME_MASK_SHIFT	= 30,
 };
+#define CBW_BTQ_VTIME_LOWER_MASK	((1ULL << CBW_BTQ_VTIME_MASK_SHIFT) - 1ULL)
+#define CBW_BTQ_VTIME_UPPER_MASK	((u64)~CBW_BTQ_VTIME_LOWER_MASK)
 
 /*
  * Root cgroup id; Inside a cgroup namespace
@@ -1830,8 +1840,9 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id)
 {
 	scx_task_common *taskc = (scx_task_common *)ctx;
 	scx_cgroup_llc_ctx_t *llcx;
-	scx_atq_t *btq;
 	int llc_id, ret;
+	scx_atq_t *btq;
+	u64 btq_vtime;
 
 	/* Get the current LLC ID. */
 	if ((llc_id = cbw_get_current_llc_id()) < 0) {
@@ -1857,6 +1868,17 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id)
 	if (!btq)
 		return -ESRCH;
 
+	/*
+	 * Build the BTQ sort key by blending the current wall-clock time
+	 * (upper 34 bits) with the scheduler-provided vtime (lower 30 bits).
+	 * Tasks enqueued within the same ~1-second window compete by their
+	 * vtime, preserving relative fairness.  Once the wall-clock epoch
+	 * advances, earlier-queued tasks take priority regardless of vtime,
+	 * guaranteeing forward progress for any task stalled in the BTQ.
+	 */
+	btq_vtime = (scx_bpf_now() & CBW_BTQ_VTIME_UPPER_MASK) |
+		    (vtime & CBW_BTQ_VTIME_LOWER_MASK);
+
 	ret = scx_atq_lock(btq);
 	if (ret) {
 		cbw_dbg("Failed to lock ATQ.");
@@ -1876,7 +1898,7 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id)
 		return 0;
 	}
 
-	ret = scx_atq_insert_vtime_unlocked(btq, taskc, vtime);
+	ret = scx_atq_insert_vtime_unlocked(btq, taskc, btq_vtime);
 	if (ret)
 		cbw_dbg("Failed to insert a task to BTQ: %d", ret);
 
