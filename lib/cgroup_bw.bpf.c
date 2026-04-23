@@ -75,6 +75,27 @@ enum scx_cgroup_consts {
 	 * first, bounding the maximum BTQ wait to ~1 second.
 	 */
 	CBW_BTQ_VTIME_MASK_SHIFT	= 30,
+	/*
+	 * Scheduling pressure hint, 1024-scale.  The BPF scheduler scales a
+	 * task's time slice as:
+	 *
+	 *   slice = (base_slice * CBW_PRESSURE_SCALE) / pressure
+	 *
+	 * CBW_PRESSURE_NORMAL (== CBW_PRESSURE_SCALE) means no reduction.
+	 * CBW_PRESSURE_MAX caps the reduction at 1/16 of the base slice.
+	 *
+	 * Two signals combine via max():
+	 *   Budget pressure:  hyperbolic below CBW_PRESSURE_BUDGET_KNEE (25%).
+	 *   Backlog pressure: linear with BTQ depth, capped at
+	 *                     CBW_PRESSURE_BACKLOG_CAP tasks.
+	 *                     1024 + 128 * 128 = 17408 → clamped to MAX.
+	 */
+	CBW_PRESSURE_SCALE		= 1024,
+	CBW_PRESSURE_NORMAL		= CBW_PRESSURE_SCALE,
+	CBW_PRESSURE_MAX		= 16384,
+	CBW_PRESSURE_BUDGET_KNEE	= 256,
+	CBW_PRESSURE_BACKLOG_STEP	= 128,
+	CBW_PRESSURE_BACKLOG_CAP	= 128,
 };
 #define CBW_BTQ_VTIME_LOWER_MASK	((1ULL << CBW_BTQ_VTIME_MASK_SHIFT) - 1ULL)
 #define CBW_BTQ_VTIME_UPPER_MASK	((u64)~CBW_BTQ_VTIME_LOWER_MASK)
@@ -130,6 +151,14 @@ struct scx_cgroup_ctx {
 		 * treated as read-only in the hot path.
 		 */
 		bool		has_llcx;
+
+		/*
+		 * Scheduling pressure hint (CBW_PRESSURE_SCALE = 1024 means no
+		 * reduction). Written at ~10 Hz by cbw_replenish_cgroup(); fits
+		 * in the 7-byte natural padding after has_llcx so this cache
+		 * line stays at 64 bytes.
+		 */
+		u32		pressure;
 	} __attribute__((aligned(SCX_CACHELINE_SIZE)));
 
 	/* read-write cache line */
@@ -1145,6 +1174,7 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 	cgx->period_budget = cgx->nquota_ub;
 	cgx->carried_debt = 0;
 	cgx->is_throttled = false;
+	cgx->pressure = CBW_PRESSURE_NORMAL;
 
 	/*
 	 * The parent of @cgrp becomes non-leaf. If the parent is not
@@ -1954,6 +1984,84 @@ bool cbw_has_backlogged_tasks(scx_cgroup_ctx_t *cgx)
 	return false;
 }
 
+static u32 cbw_compute_pressure(scx_cgroup_ctx_t *cgx)
+{
+	/*
+	 * Returns a CBW_PRESSURE_SCALE (1024) based value that the BPF scheduler
+	 * uses to shorten a task's time slice:
+	 *
+	 *   slice = (base_slice * CBW_PRESSURE_SCALE) / pressure
+	 *
+	 * When a cgroup is throttled, tasks that are already running hold the CPU
+	 * for the full base slice before yielding.  This delays the scheduler from
+	 * rechecking the throttle state and causes task-stall latency.  Shorter
+	 * slices make running tasks yield more often, giving the scheduler more
+	 * opportunities to move them to the BTQ once the budget is exhausted.
+	 */
+	u64 budget_frac, budget_pressure, backlog_pressure;
+	u32 nr_pending = 0;
+	int i;
+
+	/*
+	 * Budget pressure
+	 * ---------------
+	 * Reflects how much of the newly replenished period_budget remains.  When
+	 * period_budget is close to nquota_ub the cgroup has plenty of headroom and
+	 * pressure stays at CBW_PRESSURE_NORMAL (1024).  Below CBW_PRESSURE_BUDGET_KNEE
+	 * (25% of quota) the curve turns hyperbolic: halving the remaining budget
+	 * doubles the pressure, so time slices shrink proportionally.  This ensures
+	 * that the last few nanoseconds of quota are consumed in small steps rather
+	 * than one long task run that overshoots the limit.
+	 *
+	 * A small period_budget also indicates accumulated debt from previous
+	 * periods (carried_debt reduced the new budget).  High pressure in this
+	 * case is correct: the cgroup already owes CPU time and should not be
+	 * allowed to accumulate more debt through long slices.
+	 */
+	budget_frac = min((u64)max(cgx->period_budget, 0LL) *
+			  CBW_PRESSURE_SCALE / cgx->nquota_ub,
+			  (u64)CBW_PRESSURE_SCALE);
+	if (budget_frac >= CBW_PRESSURE_BUDGET_KNEE)
+		budget_pressure = CBW_PRESSURE_NORMAL;
+	else
+		budget_pressure = (u64)CBW_PRESSURE_NORMAL * CBW_PRESSURE_BUDGET_KNEE /
+				  max(budget_frac, (u64)1);
+
+	/*
+	 * Backlog pressure
+	 * ----------------
+	 * Counts tasks queued in the BTQs of all LLC domains.  Each pending task
+	 * adds CBW_PRESSURE_BACKLOG_STEP (128) to the pressure floor.  A growing
+	 * backlog means the reenqueue path cannot drain the BTQ fast enough; making
+	 * running tasks yield sooner reduces the time any single task holds the CPU
+	 * and allows the scheduler to interleave reenqueued tasks more quickly.
+	 */
+	if (cgx->has_llcx) {
+		bpf_for(i, 0, TOPO_NR(LLC)) {
+			scx_cgroup_llc_ctx_t *llcx =
+				cbw_get_llc_ctx_with_id(cgx->id, i);
+			if (llcx)
+				nr_pending += scx_atq_nr_queued(llcx->btq);
+		}
+	}
+	backlog_pressure = CBW_PRESSURE_NORMAL +
+			   CBW_PRESSURE_BACKLOG_STEP *
+			   min(nr_pending, (u32)CBW_PRESSURE_BACKLOG_CAP);
+
+	/*
+	 * Two independent signals are combined by addition:
+	 *
+	 *   pressure = (budget_pressure - NORMAL) + (backlog_pressure - NORMAL) + NORMAL
+	 *
+	 * Each signal contributes its excess above the NORMAL baseline.  The two
+	 * signals reflect orthogonal stress factors: low budget AND a deep queue
+	 * is genuinely more urgent than either condition alone, so their effects
+	 * should compound.
+	 */
+	return (u32)clamp(budget_pressure + backlog_pressure - CBW_PRESSURE_NORMAL,
+			  (u64)CBW_PRESSURE_NORMAL, (u64)CBW_PRESSURE_MAX);
+}
+
 static
 bool cbw_replenish_cgroup(scx_cgroup_ctx_t *cgx, u64 now)
 {
@@ -2036,6 +2144,7 @@ bool cbw_replenish_cgroup(scx_cgroup_ctx_t *cgx, u64 now)
 	}
 
 	WRITE_ONCE(cgx->period_budget, budget);
+	WRITE_ONCE(cgx->pressure, cbw_compute_pressure(cgx));
 
 	/*
 	 * keep_throttled is always false: period_budget >= 1 guarantees the
@@ -2116,6 +2225,43 @@ __hidden
 int scx_cgroup_bw_cancel(u64 ctx)
 {
 	return scx_atq_cancel((scx_task_common *)ctx);
+}
+
+/**
+ * scx_cgroup_bw_pressure - Return the scheduling pressure for a cgroup.
+ * @cgrp_id: cgroup id.
+ * @taskc_raw: per-task context (scx_task_cgroup_bw *) cast to u64 for caching;
+ *             pass 0 when no task context is available.
+ *
+ * Returns a 1024-scale pressure value computed at the last replenishment
+ * boundary.  The BPF scheduler should scale a task's time slice as:
+ *
+ *   slice = (base_slice * 1024) / pressure
+ *
+ * Return 1024 on error or when no throttle applies.
+ */
+__hidden
+int scx_cgroup_bw_pressure(u64 cgrp_id, u64 taskc_raw)
+{
+	scx_task_cgroup_bw_t *taskc = (scx_task_cgroup_bw_t *)taskc_raw;
+	scx_cgroup_ctx_t *cgx;
+	u64 cgx_raw;
+
+	if (cgrp_id == ROOT_CGID)
+		return CBW_PRESSURE_NORMAL;
+
+	if (taskc && taskc->cgx_raw) {
+		cgx_raw = taskc->cgx_raw;
+	} else {
+		cgx_raw = cbw_get_cgroup_ctx_raw(cgrp_id);
+		if (!cgx_raw)
+			return CBW_PRESSURE_NORMAL;
+		if (taskc)
+			taskc->cgx_raw = cgx_raw;
+	}
+	cgx = (scx_cgroup_ctx_t *)cgx_raw;
+
+	return (int)READ_ONCE(cgx->pressure);
 }
 
 /*
