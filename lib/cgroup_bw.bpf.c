@@ -119,6 +119,11 @@ enum scx_cgroup_consts {
 	 * first, bounding the maximum BTQ wait to ~1 second.
 	 */
 	CBW_BTQ_VTIME_MASK_SHIFT	= 30,
+	/*
+	 * Tasks stalled in a BTQ longer than this trigger emergency drain:
+	 * the cgroup bypasses its throttle check so no task waits forever.
+	 */
+	CBW_EMERGENCY_THRESHOLD_NS	= (5ULL * 1000ULL * 1000ULL * 1000ULL),
 };
 #define CBW_BTQ_VTIME_LOWER_MASK	((1ULL << CBW_BTQ_VTIME_MASK_SHIFT) - 1ULL)
 #define CBW_BTQ_VTIME_UPPER_MASK	((u64)~CBW_BTQ_VTIME_LOWER_MASK)
@@ -176,10 +181,21 @@ struct scx_cgroup_ctx {
 		bool		has_llcx;
 
 		/*
+		 * True when at least one BTQ task has waited longer than
+		 * CBW_EMERGENCY_THRESHOLD_NS.  Computed by
+		 * cbw_compute_pressure() each replenish period; causes
+		 * cbw_reenqueue_cgroup() to bypass the throttle check so
+		 * the stalled task can run.  Fits in the 1-byte hole at
+		 * offset 57 between has_llcx and pressure; the 64-byte
+		 * cache line does not expand.
+		 */
+		bool		has_emergency;
+
+		/*
 		 * Scheduling pressure hint (CBW_PRESSURE_SCALE = 1024 means no
 		 * reduction). Written at ~10 Hz by cbw_replenish_cgroup(); fits
-		 * in the 7-byte natural padding after has_llcx so this cache
-		 * line stays at 64 bytes.
+		 * in the natural padding after has_llcx so this cache line
+		 * stays at 64 bytes.
 		 */
 		u32		pressure;
 	} __attribute__((aligned(SCX_CACHELINE_SIZE)));
@@ -1555,6 +1571,7 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 	cgx->runtime_total_sloppy = 0;
 	cgx->period_budget = cgx->nquota_ub;
 	cgx->is_throttled = false;
+	cgx->has_emergency = false;
 	cgx->pressure = CBW_PRESSURE_NORMAL;
 
 	/*
@@ -2229,10 +2246,10 @@ __hidden
 int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id)
 {
 	scx_task_common *taskc = (scx_task_common *)ctx;
+	u64 btq_vtime, throttle_clk;
 	scx_cgroup_llc_ctx_t *llcx;
 	int llc_id, ret;
 	scx_atq_t *btq;
-	u64 btq_vtime;
 
 	/* Get the current LLC ID. */
 	if ((llc_id = cbw_get_current_llc_id()) < 0) {
@@ -2292,7 +2309,8 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id)
 	 * advances, earlier-queued tasks take priority regardless of vtime,
 	 * guaranteeing forward progress for any task stalled in the BTQ.
 	 */
-	btq_vtime = (scx_bpf_now() & CBW_BTQ_VTIME_UPPER_MASK) |
+	throttle_clk = scx_bpf_now();
+	btq_vtime = (throttle_clk & CBW_BTQ_VTIME_UPPER_MASK) |
 		    (vtime & CBW_BTQ_VTIME_LOWER_MASK);
 
 	ret = scx_atq_lock(btq);
@@ -2314,6 +2332,7 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 cgrp_id)
 		return 0;
 	}
 
+	((scx_task_cgroup_bw_t *)ctx)->throttle_clk = throttle_clk;
 	ret = scx_atq_insert_vtime_unlocked(btq, taskc, btq_vtime);
 	if (ret)
 		cbw_err("Failed to insert a task to BTQ: %d", ret);
@@ -2367,8 +2386,13 @@ bool cbw_has_backlogged_tasks(scx_cgroup_ctx_t *cgx)
 	return false;
 }
 
-static u32 cbw_compute_pressure(scx_cgroup_ctx_t *cgx, u32 nr_pending)
+static __noinline u32 cbw_compute_pressure(u64 cgx_raw, u32 nr_pending, u64 now)
 {
+	/*
+	 * Accept cgx as u64 rather than scx_cgroup_ctx_t * to avoid a BPF
+	 * verifier type mismatch.  See cbw_update_nquota_ub() for details.
+	 */
+	scx_cgroup_ctx_t *cgx = (scx_cgroup_ctx_t *)cgx_raw;
 	/*
 	 * Returns a CBW_PRESSURE_SCALE (1024) based value that the BPF scheduler
 	 * uses to shorten a task's time slice:
@@ -2382,6 +2406,8 @@ static u32 cbw_compute_pressure(scx_cgroup_ctx_t *cgx, u32 nr_pending)
 	 * opportunities to move them to the BTQ once the budget is exhausted.
 	 */
 	u64 budget_frac, budget_pressure, backlog_pressure;
+	bool has_emergency = false;
+	int i;
 
 	/*
 	 * Budget pressure
@@ -2419,7 +2445,50 @@ static u32 cbw_compute_pressure(scx_cgroup_ctx_t *cgx, u32 nr_pending)
 	 *
 	 * @nr_pending is computed by the caller (cbw_replenish_cgroup), so we
 	 * don't iterate the LLC list a second time here.
+	 *
+	 * Emergency detection
+	 * -------------------
+	 * Peek at the front task of each LLC's BTQ.  The BTQ is ordered by
+	 * btq_vtime, whose upper bits encode the enqueue epoch, so the front
+	 * task is approximately the oldest waiting task.  If its throttle_clk
+	 * predates now by more than CBW_EMERGENCY_THRESHOLD_NS, the cgroup
+	 * has_emergency flag is set, which causes cbw_reenqueue_cgroup() to
+	 * bypass the throttle check and drain the BTQ regardless of the
+	 * current budget.  The peek is skipped once an emergency is already
+	 * confirmed to avoid redundant work.
 	 */
+	if (cgx->has_llcx) {
+		bpf_for(i, 0, TOPO_NR(LLC)) {
+			scx_cgroup_llc_ctx_t *llcx;
+			u64 front_raw;
+			scx_task_cgroup_bw_t *front;
+
+			if (has_emergency)
+				break;
+			llcx = cbw_get_llc_ctx_with_id(cgx->id, i);
+			if (!llcx)
+				continue;
+			front_raw = scx_atq_peek(llcx->btq);
+			if (!front_raw)
+				continue;
+			front = (scx_task_cgroup_bw_t *)front_raw;
+			if (time_delta(now, front->throttle_clk) >
+			    CBW_EMERGENCY_THRESHOLD_NS)
+				has_emergency = true;
+		}
+	}
+	if (has_emergency && !READ_ONCE(cgx->has_emergency)) {
+		struct cgroup *cgrp = bpf_cgroup_from_id(cgx->id);
+		char name[64] = "<unknown>";
+
+		if (cgrp) {
+			bpf_probe_read_kernel_str(name, sizeof(name),
+						  BPF_CORE_READ(cgrp->kn, name));
+			bpf_cgroup_release(cgrp);
+		}
+		cbw_warn("cgid%llu %s entered emergency mode", cgx->id, name);
+	}
+	WRITE_ONCE(cgx->has_emergency, has_emergency);
 	backlog_pressure = CBW_PRESSURE_NORMAL +
 			   CBW_PRESSURE_BACKLOG_STEP *
 			   min(nr_pending, (u32)CBW_PRESSURE_BACKLOG_CAP);
@@ -2533,7 +2602,7 @@ bool cbw_replenish_cgroup(scx_cgroup_ctx_t *cgx, u64 now)
 	cap = min(nr_pending, max_per_jiffy);
 	WRITE_ONCE(cgx->nr_drainable_tasks, max((s32)cap, 1));
 
-	WRITE_ONCE(cgx->pressure, cbw_compute_pressure(cgx, nr_pending));
+	WRITE_ONCE(cgx->pressure, cbw_compute_pressure((u64)cgx, nr_pending, now));
 
 	/*
 	 * If budget <= 0, the cgroup's debt exceeds its quota and burst for
@@ -3043,6 +3112,17 @@ int cbw_drain_btq_batch(scx_cgroup_ctx_t *cgx,
 		     __sync_sub_and_fetch(&cgx->nr_drainable_tasks, 1) < 0))
 			break;
 
+		/*
+		 * If the cgroup is throttled, all its LLC contexts are
+		 * throttled too.  Stop draining immediately, unless the
+		 * cgroup is in emergency mode: a task has been stalled
+		 * longer than CBW_EMERGENCY_THRESHOLD_NS and must run
+		 * even at the cost of accumulating more debt.
+		 */
+		if (!READ_ONCE(cgx->has_emergency) &&
+		    cbw_cgroup_bw_throttled(cgx->id, 0) == -EAGAIN)
+			break;
+
 		if (!(btq = READ_ONCE(llcx->btq)) ||
 		    !(taskc = (scx_task_common *)scx_atq_pop(btq)))
 			break;
@@ -3057,6 +3137,9 @@ int cbw_drain_btq_batch(scx_cgroup_ctx_t *cgx,
 		 * outcomes are safe here: any task we did not pop stays in the
 		 * BTQ and will be retried at the next replenish tick.
 		 */
+		if (!(btq = READ_ONCE(llcx->btq)) ||
+		    !(taskc = (scx_task_common *)scx_atq_pop(btq)))
+			break;
 
 		scx_cgroup_bw_enqueue_cb((u64)taskc);
 		cbw_dbg("cgid%llu", cgx->id);
@@ -3090,13 +3173,6 @@ int cbw_reenqueue_cgroup(struct cgroup *cgrp, scx_cgroup_ctx_t *cgx,
 			cbw_err("Failed to lookup an LLC context: cgid%llu", cgrp_id);
 			continue;
 		}
-
-		/*
-		 * If the cgroup is throttled, all its LLC contexts are
-		 * throttled too. Stop draining immediately.
-		 */
-		if (cbw_cgroup_bw_throttled(cgroup_get_id(cgrp), 0) == -EAGAIN)
-			break;
 
 		nr_enq += cbw_drain_btq_batch(cgx, llcx);
 		if (nr_enq >= CBW_REENQ_MAX_BATCH)

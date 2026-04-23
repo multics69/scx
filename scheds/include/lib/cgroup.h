@@ -248,15 +248,19 @@ int scx_cgroup_bw_dump(u64 cgrp_id, bool descendent, bool accurate, bool indent)
  * existing scx_task_common casts still work.
  *
  * @common:      Must be first; all existing scx_task_common casts still work.
- * @cgx_raw:     Cached arena pointer to scx_cgroup_ctx (0 = not cached).
- * @llcx_raw:    Cached arena pointer to scx_cgroup_llc_ctx (0 = not cached).
- * @last_llc_id: LLC id for which @llcx_raw was cached.
+ * @cgx_raw:      Cached arena pointer to scx_cgroup_ctx (0 = not cached).
+ * @llcx_raw:     Cached arena pointer to scx_cgroup_llc_ctx (0 = not cached).
+ * @last_llc_id:  LLC id for which @llcx_raw was cached.
+ * @throttle_clk: Wall-clock time when this task was put aside into a BTQ.
+ *                Set before the BTQ insert so scx_atq_peek/pop() always
+ *                observe a valid value. 0 = not throttled.
  */
 struct scx_task_cgroup_bw {
 	struct scx_task_common	common;		/* MUST be first */
 	u64			cgx_raw;	/* 0 = not cached */
 	u64			llcx_raw;	/* 0 = not cached */
 	int			last_llc_id;
+	u64			throttle_clk;	/* 0 = not throttled */
 };
 
 typedef struct scx_task_cgroup_bw __arena scx_task_cgroup_bw_t;
