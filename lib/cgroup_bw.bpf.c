@@ -13,8 +13,24 @@
 #ifndef U64_MAX
 #define U64_MAX		((u64)~0ULL)
 #endif
+#ifndef INT_MAX
+#define INT_MAX		((int)0x7fffffff)
+#endif
 
 extern int scx_cgroup_bw_enqueue_cb(u64 taskc);
+
+/*
+ * One jiffy in ns, derived from the kernel's CONFIG_HZ at lib init.
+ * Used by the drain-side bound: each running task contributes one
+ * jiffy of CPU per jiffy of wall-clock via ops.tick() ->
+ * scx_cgroup_bw_consume(), so period_budget / cbw_jiffy_ns is the
+ * largest concurrent population whose collective per-jiffy
+ * contribution doesn't exceed period_budget.  Default 1 ms is a
+ * conservative pre-init value (HZ=1000); replaced in
+ * scx_cgroup_bw_lib_init().
+ */
+extern unsigned CONFIG_HZ __kconfig;
+static u64 cbw_jiffy_ns = 1000ULL * 1000ULL;
 
 enum scx_cgroup_consts {
 	/* cache line size of an architecture */
@@ -182,6 +198,18 @@ struct scx_cgroup_ctx {
 		 * Total runtime at the last replenishment period.
 		 */
 		s64		runtime_total_last;
+
+		/*
+		 * Per-period BTQ drain budget.  Refilled at each replenish to
+		 * min(nr_pending, period_budget / cbw_jiffy_ns), then atomically
+		 * decremented at each drain in cbw_drain_btq_batch().  When it
+		 * goes negative the drain bails out, leaving remaining tasks in
+		 * the BTQ until the next replenish.  Signed because concurrent
+		 * decrement may transiently push it below zero -- harmless,
+		 * since the next replenish overwrites it.  Set to INT_MAX for
+		 * unconstrained (CBW_RUNTUME_INF) cgroups.
+		 */
+		s32		nr_drainable_tasks;
 
 		/*
 		 * EWMA of CPU consumption rate within a replenish interval, in
@@ -701,6 +729,9 @@ int scx_cgroup_bw_lib_init(struct scx_cgroup_bw_config *config)
 	if (!config)
 		return -EINVAL;
 	cbw_config = *config;
+
+	/* Compute one jiffy in nanoseconds from the kernel's CONFIG_HZ. */
+	cbw_jiffy_ns = (1000ULL * 1000ULL * 1000ULL) / max((unsigned)CONFIG_HZ, 1U);
 
 	/* Initialize the replenish timer. */
 	rp_timer = bpf_map_lookup_elem(&replenish_timer, &key);
@@ -1419,6 +1450,14 @@ int cbw_update_nquota_ub(struct cgroup *cgrp __arg_trusted, u64 cgx_raw)
 		cgx->nquota_ub = min(cgx->nquota_ub, parentx->nquota);
 		bpf_cgroup_release(parent);
 	}
+
+	/*
+	 * Unconstrained cgroups never bound the drain path; mark
+	 * nr_drainable_tasks unbounded once so the drain hot path can skip
+	 * its atomic decrement.  See cbw_drain_btq_batch().
+	 */
+	if (cgx->nquota_ub == CBW_RUNTUME_INF)
+		WRITE_ONCE(cgx->nr_drainable_tasks, INT_MAX);
 	return 0;
 }
 
@@ -1527,6 +1566,7 @@ int cbw_unthrottle_cgroup_for_exit(u64 cgrp_id)
 
 	WRITE_ONCE(cgx->nquota_ub, CBW_RUNTUME_INF);
 	WRITE_ONCE(cgx->period_budget, CBW_RUNTUME_INF);
+	WRITE_ONCE(cgx->nr_drainable_tasks, INT_MAX);
 	/*
 	 * Ensure nquota_ub = INF is globally visible before clearing
 	 * is_throttled. Without this, the accounting timer could observe
@@ -2282,6 +2322,8 @@ bool cbw_replenish_cgroup(scx_cgroup_ctx_t *cgx, u64 now)
 {
 	static s64 burst_credit, debt, budget; /* Add `static` to work around the verifier error (-E2BIG) */
 	bool period_end, was_throttled, keep_throttled;
+	u32 nr_pending, max_per_jiffy, cap;
+	int i;
 
 	burst_credit = debt = 0;
 	keep_throttled = false;
@@ -2341,6 +2383,34 @@ bool cbw_replenish_cgroup(scx_cgroup_ctx_t *cgx, u64 now)
 
 	budget = (s64)cgx->nquota_ub + burst_credit - debt;
 	WRITE_ONCE(cgx->period_budget, budget);
+
+	/*
+	 * Refill the per-period drain budget.
+	 *
+	 * A running task burns one jiffy of CPU per jiffy of wall-clock,
+	 * so N concurrent runners burn at most N * cbw_jiffy_ns per jiffy.
+	 * Bound N <= period_budget / cbw_jiffy_ns to keep one jiffy of
+	 * runtime within budget; jiffy is the right unit because tick-mode
+	 * SCX accounts consumption at tick granularity.  Any later overshoot
+	 * (until is_throttled flips) is absorbed by carried_debt.
+	 *
+	 * Cap at nr_pending so we don't reserve slots beyond the actual
+	 * backlog; floor at 1 so a tiny period_budget still admits one task.
+	 *
+	 * The local nr_pending is also reused by cbw_compute_pressure() below.
+	 */
+	nr_pending = 0;
+	if (cgx->has_llcx) {
+		bpf_for(i, 0, TOPO_NR(LLC)) {
+			scx_cgroup_llc_ctx_t *llcx =
+				cbw_get_llc_ctx_with_id(cgx->id, i);
+			if (llcx)
+				nr_pending += scx_atq_nr_queued(llcx->btq);
+		}
+	}
+	max_per_jiffy = (u32)((u64)budget / cbw_jiffy_ns);
+	cap = min(nr_pending, max_per_jiffy);
+	WRITE_ONCE(cgx->nr_drainable_tasks, max((s32)cap, 1));
 
 	/*
 	 * If budget <= 0, the cgroup's debt exceeds its quota and burst for
@@ -2786,9 +2856,35 @@ int cbw_drain_btq_batch(scx_cgroup_ctx_t *cgx,
 	 * this field before destroying the ATQ; catching NULL between
 	 * iterations prevents operating on a freed ATQ.
 	 */
-	for (i = 0; can_loop && i < CBW_REENQ_MAX_BATCH &&
-		    (btq = READ_ONCE(llcx->btq)) &&
-		    (taskc = (scx_task_common *)scx_atq_pop(btq)); i++) {
+	for (i = 0; can_loop && i < CBW_REENQ_MAX_BATCH; i++) {
+		/*
+		 * Per-period drain bound: claim a slot from this cgroup's
+		 * drain budget.
+		 *
+		 * Three-way gating to keep shared-cacheline traffic minimal:
+		 *
+		 *   1. Unconstrained cgroups (nquota_ub == CBW_RUNTUME_INF)
+		 *      have nr_drainable_tasks pinned at INT_MAX -- no atomic
+		 *      write ever needed on the drain hot path.
+		 *
+		 *   2. Already-exhausted budget (relaxed read sees a negative
+		 *      value): once the counter goes negative it stays negative
+		 *      until the next replenish, so a relaxed read suffices and
+		 *      we avoid the atomic decrement entirely.
+		 *
+		 *   3. Otherwise, atomically claim a slot.  If the decrement
+		 *      pushes the counter below zero we over-claimed and must
+		 *      not actually drain; bail out.
+		 */
+		if (READ_ONCE(cgx->nquota_ub) != CBW_RUNTUME_INF &&
+		    (READ_ONCE(cgx->nr_drainable_tasks) < 0 ||
+		     __sync_sub_and_fetch(&cgx->nr_drainable_tasks, 1) < 0))
+			break;
+
+		if (!(btq = READ_ONCE(llcx->btq)) ||
+		    !(taskc = (scx_task_common *)scx_atq_pop(btq)))
+			break;
+
 		/*
 		 * Note that we do not worry about racing with .dequeue() here,
 		 * because even if we do, the callback's insert_vtime call will
