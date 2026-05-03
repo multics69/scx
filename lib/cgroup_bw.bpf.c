@@ -39,8 +39,6 @@ enum scx_cgroup_consts {
 	CBW_CLOCK_BOOTTIME		= 7,
 	/* replenish period in nsec: 100 msec */
 	CBW_REPLENISH_PERIOD		= (100ULL * 1000ULL * 1000ULL),
-	/* min replenish period in nsec after jitter compensation: 1 msec */
-	CBW_REPLENISH_PERIOD_MIN	= (1ULL * 1000ULL * 1000ULL),
 	/* min/max accounting period in nsec: 1 msec and 20 msec */
 	CBW_ACCOUNTING_PERIOD_MIN	= (1ULL * 1000ULL * 1000ULL),
 	CBW_ACCOUNTING_PERIOD_MAX	= (20ULL * 1000ULL * 1000ULL),
@@ -2823,9 +2821,17 @@ rearm_out:
 	if (unlikely(READ_ONCE(cbw_nr_deferred_moves)))
 		cbw_move_deferred_tasks();
 
+	/*
+	 * Re-arm with jitter compensation: if we fired late, fire correspondingly
+	 * early next time so the long-run cadence stays at CBW_REPLENISH_PERIOD.
+	 *
+	 * Floor at half a jiffy.  Half a jiffy is the average time until the
+	 * next tick (and thus the next consume() update of runtime_total), so
+	 * any sooner wouldn't, on average, observe new state.
+	 */
 	interval = time_delta(now, cbw_last_replenish_at);
 	jitter = time_delta(interval, CBW_REPLENISH_PERIOD);
-	period = max(time_delta(CBW_REPLENISH_PERIOD, jitter), CBW_REPLENISH_PERIOD_MIN);
+	period = max(time_delta(CBW_REPLENISH_PERIOD, jitter), cbw_jiffy_ns / 2);
 	if ((ret = bpf_timer_start(timer, period, 0)))
 		cbw_err("Failed to re-arm replenish timer: %d", ret);
 	cbw_last_replenish_at = now;
