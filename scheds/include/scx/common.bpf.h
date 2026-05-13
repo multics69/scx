@@ -518,6 +518,7 @@ static bool __scx_prolog_disables_migration = true;
  */
 static inline int scx_lib_init(void)
 {
+#if 0
 	/*
 	 * Probe whether the BPF prolog calls migrate_disable() by checking
 	 * migration_disabled of the current task. Since we are executing BPF
@@ -528,6 +529,11 @@ static inline int scx_lib_init(void)
 		const struct task_struct *p = bpf_get_current_task_btf();
 		__scx_prolog_disables_migration = p->migration_disabled > 0;
 	}
+#else	
+	const struct task_struct *p = bpf_get_current_task_btf();
+	bpf_printk("p->migration_disabled at init: %d", p->migration_disabled);
+	__scx_prolog_disables_migration = false;
+#endif
 	return 0;
 }
 
