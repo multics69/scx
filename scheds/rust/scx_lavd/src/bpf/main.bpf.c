@@ -608,9 +608,13 @@ static void update_stat_for_refill(struct task_struct *p,
 
 static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
 {
+#if 0
 	return (is_cpu_idle && !queued_on_cpu(cpuc)) ||
 	       (lb_local_dsq_util_wall > 0 &&
 		cpuc->avg_util_wall < lb_local_dsq_util_wall);
+#else
+	return is_cpu_idle && !queued_on_cpu(cpuc);
+#endif
 }
 
 /*
