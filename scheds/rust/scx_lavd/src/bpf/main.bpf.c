@@ -909,6 +909,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 	account_queued_load(taskc, cpuc->cpdom_id);
 
+#if 0
 	/*
 	 * If a new overflow CPU was assigned while finding a proper DSQ,
 	 * kick the new CPU and go.
@@ -917,6 +918,17 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		return;
 	}
+#else
+	/*
+	 * Skips the kick when either:
+	 * 1) ops.select_cpu() already selected this CPU for the enqueue
+	 * 2) The task is already running on its current CPU
+	 */
+	if ( !(__COMPAT_is_enq_cpu_selected(enq_flags) || (cpu == task_cpu &&
+	       scx_bpf_task_running(p))) ) {
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+	}
+#endif
 
 	/*
 	 * If there is no idle CPU for an eligible task, try to preempt a task.
@@ -926,7 +938,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * In the case of the forced enqueue mode, we don't try preemption
 	 * since it is a batch of bulk enqueues.
 	 */
-	if (!no_preemption)
+	if (!is_idle && !no_preemption)
 		try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpuc->cpdom_id));
 }
 
