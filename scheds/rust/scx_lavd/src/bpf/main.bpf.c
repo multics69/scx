@@ -221,6 +221,10 @@ const volatile u8	mig_delta_pct = 0;
 /* Disable batch-migration load balancer; set via --no-fast-lb. */
 const volatile u8	no_fast_lb = 0;
 
+/* Disable the proactive overflow-set extension on wake-up;
+ * set via --no-ovrflw-extend. */
+const volatile u8	no_ovrflw_extend;
+
 /*
  * Skip periodic load balancing when average system utilization is below this
  * threshold. The value is pre-scaled by userspace. 0 = disabled.
@@ -747,7 +751,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * on the idle cpu. Even if there is no idle cpu, still respect
 	 * the chosen cpu.
 	 */
-	cpu_id = pick_idle_cpu(&ictx, &found_idle);
+	cpu_id = pick_idle_cpu(&ictx, true, &found_idle);
 	cpu_id = cpu_id >= 0 ? cpu_id : prev_cpu;
 	ictx.taskc->suggested_cpu_id = cpu_id;
 
@@ -857,7 +861,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 			.wake_flags = 0,
 		};
 
-		cpu = pick_idle_cpu(&ictx, &is_idle);
+		cpu = pick_idle_cpu(&ictx, false, &is_idle);
 	} else {
 		cpu = task_cpu;
 		is_idle = test_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
