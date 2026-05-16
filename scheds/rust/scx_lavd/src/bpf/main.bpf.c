@@ -1317,11 +1317,11 @@ bool scan_dsq_for_ovflw_ext(u64 dsq_id, s32 cpu,
 		if (is_permanently_pinned(p)) {
 			new_cpu = scx_bpf_task_cpu(p);
 			if (new_cpu == cpu) {
-				bpf_cpumask_set_cpu(new_cpu, ovrflw);
+				ovrflw_test_and_set(ovrflw, new_cpu);
 				bpf_task_release(p);
 				return true;
 			}
-			if (!bpf_cpumask_test_and_set_cpu(new_cpu, ovrflw))
+			if (!ovrflw_test_and_set(ovrflw, new_cpu))
 				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
 			bpf_task_release(p);
 			continue;
@@ -1357,11 +1357,11 @@ bool scan_dsq_for_ovflw_ext(u64 dsq_id, s32 cpu,
 		new_cpu = find_cpu_in(p->cpus_ptr, cpuc);
 		if (new_cpu >= 0) {
 			if (new_cpu == cpu) {
-				bpf_cpumask_set_cpu(new_cpu, ovrflw);
+				ovrflw_test_and_set(ovrflw, new_cpu);
 				bpf_task_release(p);
 				return true;
 			}
-			else if (!bpf_cpumask_test_and_set_cpu(new_cpu, ovrflw))
+			else if (!ovrflw_test_and_set(ovrflw, new_cpu))
 				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
 		}
 		bpf_task_release(p);
@@ -1444,7 +1444,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 * add this CPU to the overflow set.
 	 */
 	if (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu))) {
-		bpf_cpumask_set_cpu(cpu, ovrflw);
+		ovrflw_test_and_set(ovrflw, cpu);
 		bpf_rcu_read_unlock();
 		goto consume_out;
 	}
@@ -1457,7 +1457,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		 * and handled in the else-if branch without overflow churn.
 		 */
 		if (is_permanently_pinned(prev)) {
-			bpf_cpumask_set_cpu(cpu, ovrflw);
+			ovrflw_test_and_set(ovrflw, cpu);
 			bpf_rcu_read_unlock();
 			goto consume_out;
 		} else if (is_migration_disabled(prev)) {
@@ -1475,7 +1475,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 		    bpf_cpumask_test_cpu(cpu, prev->cpus_ptr) &&
 		    !bpf_cpumask_intersects(cast_mask(active), prev->cpus_ptr) &&
 		    !bpf_cpumask_intersects(cast_mask(ovrflw), prev->cpus_ptr)) {
-			bpf_cpumask_set_cpu(cpu, ovrflw);
+			ovrflw_test_and_set(ovrflw, cpu);
 			bpf_rcu_read_unlock();
 			goto consume_out;
 		}
