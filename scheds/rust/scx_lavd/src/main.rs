@@ -162,6 +162,23 @@ struct Opts {
     #[clap(long = "lb-local-dsq-util-pct", default_value = "10", value_parser=Opts::lb_local_dsq_util_pct_range)]
     lb_local_dsq_util_pct: u8,
 
+    /// Migration gain threshold (%) for completion-time-based load
+    /// balancing across big and LITTLE clusters. When the sticky cpdom
+    /// has insufficient idle capacity, a task is migrated to a neighbor
+    /// cpdom only if the neighbor's estimated wait + capacity-adjusted
+    /// runtime is at least this many percent shorter than staying on
+    /// the sticky cpdom.
+    ///
+    /// Only active on heterogeneous (big.LITTLE) systems where
+    /// have_little_core is true; ignored on homogeneous systems where
+    /// completion-time-based migration would override the cache-locality
+    /// bias without a capacity payoff.
+    ///
+    /// Default is 20 (require >=20% completion-time gain to migrate).
+    /// Set to 0 to disable.
+    #[clap(long = "lb-ct-mig-delta-pct", default_value = "20", value_parser=Opts::lb_ct_mig_delta_pct_range)]
+    lb_ct_mig_delta_pct: u8,
+
     /// Slice duration in microseconds to use for all tasks when pinned tasks
     /// are running on a CPU. Must be between slice-min-us and slice-max-us.
     /// When this option is enabled, pinned tasks are always enqueued to per-CPU DSQs
@@ -416,6 +433,10 @@ impl Opts {
     }
 
     fn lb_local_dsq_util_pct_range(s: &str) -> Result<u8, String> {
+        number_range(s, 0, 100)
+    }
+
+    fn lb_ct_mig_delta_pct_range(s: &str) -> Result<u8, String> {
         number_range(s, 0, 100)
     }
 }
@@ -693,6 +714,7 @@ impl<'a> Scheduler<'a> {
         rodata.mig_delta_pct = opts.mig_delta_pct;
         rodata.lb_low_util_wall = ((opts.lb_low_util_pct as u64) << 10) / 100;
         rodata.lb_local_dsq_util_wall = ((opts.lb_local_dsq_util_pct as u64) << 10) / 100;
+        rodata.lb_ct_mig_delta_pct = opts.lb_ct_mig_delta_pct;
         rodata.no_use_em = opts.no_use_em as u8;
         rodata.no_fast_lb = opts.no_fast_lb as u8;
         rodata.no_wake_sync = opts.no_wake_sync;
