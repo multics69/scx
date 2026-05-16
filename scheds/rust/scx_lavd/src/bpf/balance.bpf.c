@@ -413,6 +413,8 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 					decrement_stealee_budget(cpdomc_pick, task_load);
 					decrement_stealer_budget(cpdomc, task_load);
 				}
+				debugln("migrate: try_steal stealer=cpdom%llu stealee=cpdom%llu load=%llu",
+					cpdomc->id, cpdomc_pick->id, task_load);
 				return true;
 			}
 		}
@@ -487,6 +489,8 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 					decrement_stealee_budget(cpdomc_pick, task_load);
 					decrement_stealer_budget(cpdomc, task_load);
 				}
+				debugln("migrate: force_steal stealer=cpdom%llu stealee=cpdom%llu load=%llu",
+					cpdomc->id, cpdomc_pick->id, task_load);
 				return true;
 			}
 		}
