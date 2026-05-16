@@ -229,6 +229,15 @@ const volatile u8	no_fast_lb = 0;
 const volatile u64	lb_low_util_wall = 0;
 
 /*
+ * Migration gain threshold (%) for completion-time-based cross-cpdom
+ * load balancing on big.LITTLE systems. When non-zero (and have_little_core
+ * is true), tasks migrate to a neighbor cpdom only if the neighbor's
+ * estimated wait + capacity-adjusted runtime is at least this many percent
+ * shorter than staying on the sticky cpdom. 0 disables the feature.
+ */
+const volatile u8	lb_ct_mig_delta_pct = 0;
+
+/*
  * Slice time for all tasks when pinned tasks are running on the CPU.
  * When this is set (non-zero), pinned tasks always use per-CPU DSQs and
  * the dispatch logic compares vtimes across DSQs.
