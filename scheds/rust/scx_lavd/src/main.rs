@@ -218,6 +218,15 @@ struct Opts {
     #[clap(long = "no-fast-lb", action = clap::ArgAction::SetTrue)]
     no_fast_lb: bool,
 
+    /// Default: --no-ovrflw-extend is deactivated (overflow-set extension
+    /// on wake-up is on). Disable the proactive overflow-set extension in
+    /// ops.select_cpu() that absorbs bursty wake-ups by adding a fresh
+    /// LLC-anchored CPU to the overflow set when active+overflow has no
+    /// idle CPU. Only meaningful on systems where some LLC contains more
+    /// than one cpdom (e.g., big.LITTLE on a single-LLC SoC).
+    #[clap(long = "no-ovrflw-extend", action = clap::ArgAction::SetTrue)]
+    no_ovrflw_extend: bool,
+
     /// Disable preemption.
     #[clap(long = "no-preemption", action = clap::ArgAction::SetTrue)]
     no_preemption: bool,
@@ -719,6 +728,8 @@ impl<'a> Scheduler<'a> {
         rodata.lb_ct_mig_delta_pct = opts.lb_ct_mig_delta_pct;
         rodata.no_use_em = opts.no_use_em as u8;
         rodata.no_fast_lb = opts.no_fast_lb as u8;
+        rodata.no_ovrflw_extend = opts.no_ovrflw_extend as u8;
+
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
