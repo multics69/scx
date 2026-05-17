@@ -528,6 +528,33 @@ bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 	turbulent = cpuc->lat_headroom < LAVD_LC_LATENCY_SENSITIVE_THRESH;
 
 	/*
+	 * Per-CPU DSQ priority: this CPU prefers to handle the singly-
+	 * pinned tasks queued on its cpu_dsq, on the expectation that
+	 * the wider-pinned tasks on cpdom_dsq can be picked up by any
+	 * of the *other* CPUs in the cpdom. Letting this CPU dispatch
+	 * its own pinned tasks and the others dispatch the shared ones
+	 * means both groups run concurrently instead of serializing on
+	 * the same CPU.
+	 *
+	 * The rule fires when:
+	 *   - the previous task on this CPU was not effectively pinned
+	 *     (so the cpu_dsq holds tasks that need *this* CPU and have
+	 *      been waiting while a non-pinned task ran here), or
+	 *   - cpu_dsq has piled up to LAVD_CPU_DSQ_PILEUP_THRESH or
+	 *     more queued tasks (so the backlog drains tightly rather
+	 *     than alternating one-by-one with cpdom_dsq).
+	 */
+	if (!no_pinned_preempt && use_per_cpu_dsq()) {
+		u64 nr_pinned = scx_bpf_dsq_nr_queued(cpu_dsq_id);
+		if (nr_pinned > 0 &&
+		    (!test_cpu_flag(cpuc, LAVD_FLAG_IS_EFFECTIVELY_PINNED) ||
+		     nr_pinned >= LAVD_CPU_DSQ_PILEUP_THRESH)) {
+			if (consume_dsq(cpdomc, cpu_dsq_id))
+				return true;
+		}
+	}
+
+	/*
 	 * If the current compute domain is a stealer, try to steal
 	 * a task from any of stealee domains probabilistically.
 	 */
