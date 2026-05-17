@@ -225,6 +225,10 @@ const volatile u8	no_fast_lb = 0;
  * set via --no-ovrflw-extend. */
 const volatile u8	no_ovrflw_extend;
 
+/* Disable the pinned-task preemption fast path;
+ * set via --no-pinned-preempt. */
+const volatile u8	no_pinned_preempt;
+
 /*
  * Warm-CPU wait budget. When > 0, a waking latency-tolerant task waits up to
  * this many ns for its previous CPU to free up before migrating to an idle one,
