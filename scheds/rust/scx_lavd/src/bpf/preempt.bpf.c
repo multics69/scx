@@ -356,12 +356,93 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	struct cpu_ctx *cpuc_cur = NULL;
 	u64 now, duration_wall, new_slice_wall = 0;
 
+	/* Greedy tasks never preempt. */
+	if (test_task_flag(taskc, LAVD_FLAG_IS_GREEDY))
+		return;
+	now = scx_bpf_now();
+
 	/*
-	 * Don't even try to perform expensive preemption for greedy tasks.
-	 * And, check if it is worth to try to kick other CPU.
+	 * Fast path for effectively-pinned tasks (a stricter subset of
+	 * affinitized): they can run on a single CPU, so target that CPU
+	 * directly -- no lat_cri worth-kick gate, no power-of-2 search,
+	 * no soft "finish normal slice" treatment. Runs ahead of the
+	 * slice-boost handling below so a wider-pinned victim doesn't
+	 * get the soft "cancel boost + finish normal slice" landing
+	 * just because it had been slice-boosted.
+	 *
+	 * The point is to let the pinned task and the displaced
+	 * (wider-pinned) task run concurrently on different CPUs:
+	 * preempting the wider-pinned task here means it migrates to
+	 * another CPU in its own cpumask via its select_cpu/enqueue path
+	 * on the next dispatch, rather than the pinned task sitting
+	 * idle waiting for the wider-pinned task's slice to expire.
+	 *
+	 * Example: task A is pinned to CPUs 1..4 and running on CPU 1;
+	 * task B is pinned to CPU 1 and just woke up. Without this
+	 * fast path, B waits until A's slice expires on CPU 1. With
+	 * it, A is preempted immediately and lands on CPU 2..4 via its
+	 * own enqueue and select_cpu on the next dispatch, while B
+	 * starts on CPU 1 right away -- both run concurrently instead
+	 * of serializing.
+	 *
+	 * See the dispatch-side complement in consume_task()
+	 * (balance.bpf.c): once this CPU yields, consume_task() biases
+	 * toward cpu_dsq when the previous task was non-pinned (or when
+	 * cpu_dsq has piled up), so the singly-pinned task actually wins
+	 * the next dispatch on this CPU rather than losing by vtime to
+	 * a cpdom_dsq task. The two halves are designed together: this
+	 * yields the CPU, consume_task() makes sure the pinned task
+	 * gets it.
 	 */
-	if (test_task_flag(taskc, LAVD_FLAG_IS_GREEDY) ||
-	    !is_worth_kick_other_task(taskc))
+	if (!no_pinned_preempt && is_effectively_pinned(taskc)) {
+		if (preferred_cpu < 0)
+			return;
+		cpuc_victim = get_cpu_ctx_id(preferred_cpu);
+		if (!cpuc_victim)
+			return;
+
+		if (is_lock_holder_running(cpuc_victim)) {
+			/*
+			 * Don't preempt a lock holder. But if it is
+			 * slice-boosted, cancel the boost so its slice
+			 * shrinks to a normal one; the pinned task waits
+			 * less after the lock is released.
+			 */
+			if (test_cpu_flag(cpuc_victim, LAVD_FLAG_SLICE_BOOST)) {
+				duration_wall = time_delta(now,
+						cpuc_victim->running_clk);
+				if (sys_stat.slice_wall > duration_wall) {
+					new_slice_wall = time_delta(
+							sys_stat.slice_wall,
+							duration_wall);
+					ask_cpu_yield_after(cpuc_victim,
+							    new_slice_wall);
+				}
+				reset_cpu_flag(cpuc_victim,
+					       LAVD_FLAG_SLICE_BOOST);
+			}
+			return;
+		}
+
+		/* Don't displace another effectively-pinned task. */
+		if (test_cpu_flag(cpuc_victim, LAVD_FLAG_IS_EFFECTIVELY_PINNED))
+			return;
+
+		/*
+		 * new_slice_wall stays 0 -> ask_cpu_yield_after clamps to 1
+		 * -> immediate yield at the next scheduling point.
+		 */
+		goto kick_out;
+	}
+
+	/*
+	 * Non-pinned path. Preemption is not free -- context switch,
+	 * possibly an IPI, and a hit to the victim's cache locality --
+	 * so check whether the enqueuing task is latency-critical
+	 * enough to be worth the effort before falling into the
+	 * slice-boost handling and the power-of-2 victim search below.
+	 */
+	if (!is_worth_kick_other_task(taskc))
 		return;
 
 	/*
@@ -369,7 +450,6 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	 * if it is necessary to preempt the task immediately or reduce
 	 * its time slice.
 	 */
-	now = scx_bpf_now();
 	if (!no_slice_boost &&
 	    (preferred_cpu >= 0) &&
 	    (cpuc_victim = get_cpu_ctx_id(preferred_cpu)) &&
