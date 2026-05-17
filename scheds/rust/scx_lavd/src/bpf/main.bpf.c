@@ -225,6 +225,10 @@ const volatile u8	no_fast_lb = 0;
  * set via --no-ovrflw-extend. */
 const volatile u8	no_ovrflw_extend;
 
+/* Disable the pinned-task preemption fast path;
+ * set via --no-pinned-preempt. */
+const volatile u8	no_pinned_preempt;
+
 /*
  * Skip periodic load balancing when average system utilization is below this
  * threshold. The value is pre-scaled by userspace. 0 = disabled.
