@@ -625,6 +625,7 @@ extern const volatile u64	pinned_slice_ns;
 extern const volatile u8	lb_ct_mig_delta_pct;
 extern const volatile u8	no_ovrflw_extend;
 extern const volatile bool	has_multi_cpdom_per_llc;
+extern const volatile u8	no_pinned_preempt;
 
 extern volatile bool		reinit_cpumask_for_performance;
 extern volatile bool		no_preemption;
