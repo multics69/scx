@@ -226,6 +226,15 @@ struct Opts {
     #[clap(long = "no-ovrflw-extend", action = clap::ArgAction::SetTrue)]
     no_ovrflw_extend: bool,
 
+    /// Default: --no-pinned-preempt is deactivated (pinned-task
+    /// preemption is on). Disable the fast-path that lets an
+    /// effectively-pinned task immediately preempt a wider-pinned
+    /// task running on its single allowed CPU, and the related
+    /// slice-boost cancellation for slice-boosted lock holders on
+    /// that CPU.
+    #[clap(long = "no-pinned-preempt", action = clap::ArgAction::SetTrue)]
+    no_pinned_preempt: bool,
+
     /// Disable preemption.
     #[clap(long = "no-preemption", action = clap::ArgAction::SetTrue)]
     no_preemption: bool,
@@ -726,6 +735,7 @@ impl<'a> Scheduler<'a> {
         rodata.no_use_em = opts.no_use_em as u8;
         rodata.no_fast_lb = opts.no_fast_lb as u8;
         rodata.no_ovrflw_extend = opts.no_ovrflw_extend as u8;
+        rodata.no_pinned_preempt = opts.no_pinned_preempt as u8;
 
         // Detect whether any LLC contains more than one cpdom. Used by
         // the overflow-extension fast-fail path in
