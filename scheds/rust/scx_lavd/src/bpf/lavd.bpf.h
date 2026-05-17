@@ -122,6 +122,11 @@ enum consts_internal {
 	LAVD_CPDOM_MIG_SHIFT_OL		= 4, /* when over-loaded:   1/2**4 = [-6.25%, +6.25%] */
 	LAVD_CPDOM_MIG_PROB_FT		= (LAVD_SYS_STAT_INTERVAL_NS / LAVD_SLICE_MAX_NS_DFL), /* roughly twice per interval */
 
+	LAVD_CPU_DSQ_PILEUP_THRESH	= 2, /* prefer cpu_dsq over cpdom_dsq even after a
+						singly-pinned dispatch when this many or
+						more pinned tasks are queued on the CPU,
+						to drain pile-ups */
+
 	LAVD_FUTEX_OP_INVALID		= -1,
 };
 
