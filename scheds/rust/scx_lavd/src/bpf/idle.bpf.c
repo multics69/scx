@@ -898,6 +898,24 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	/* NOTE: There is a sticky domain. */
 
 	/*
+	 * If something is waiting specifically for ctx->prev_cpu --
+	 * cpu_dsq has queued tasks pinned (or affinitized via pinned_slice_ns)
+	 * to it -- don't bias the search back to prev_cpu. Yielding prev_cpu
+	 * to the waiter while @p lands on a different CPU in the same cpdom
+	 * lets the two run concurrently instead of serializing on prev_cpu.
+	 * Keep sticky_cpdom intact so cpdom locality is preserved.
+	 *
+	 * @p itself cannot be the singly-pinned waiter: the effectively-
+	 * pinned / migrate_disabled early-out above exits before this
+	 * point, so @p has at least 2 CPUs available in its cpumask.
+	 */
+	if (!no_pinned_preempt && use_per_cpu_dsq() &&
+	    sticky_cpu == ctx->prev_cpu &&
+	    scx_bpf_dsq_nr_queued(cpu_to_dsq(ctx->prev_cpu)) > 0) {
+		sticky_cpu = -ENOENT;
+	}
+
+	/*
 	 * If there is no idle CPU, stay on the sticky CPU or domain.
 	 */
 	idle_cpumask = scx_bpf_get_idle_cpumask();
