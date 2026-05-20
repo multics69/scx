@@ -838,6 +838,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		.prev_cpu = prev_cpu,
 		.cpuc_cur = cpuc_cur,
 		.wake_flags = wake_flags,
+		.enq_flags = 0,
 	};
 	struct task_struct *waker;
 	bool found_idle = false;
@@ -941,25 +942,45 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 	task_cpu = scx_bpf_task_cpu(p);
 
-	/*
-	 * A reenqueue (SCX_ENQ_REENQ) means the task was already placed once
-	 * but bounced -- a higher-priority class (RT/DL) took the CPU and the
-	 * local DSQ was drained via scx_bpf_reenqueue_local() (from the
-	 * sched_switch hook, or ops.cpu_release on older kernels). The task
-	 * has not run since, so its slice, CPU choice, cgroup-throttle state,
-	 * and queued-load accounting are still valid -- reuse the cached
-	 * suggested_cpu_id and reinsert into the previously chosen cpdom DSQ,
-	 * never the local DSQ it was just drained from. The deadline, however,
-	 * is recomputed below (the logical clock may have advanced while the
-	 * task waited behind the higher class).
-	 */
 	if (unlikely(enq_flags & SCX_ENQ_REENQ)) {
-		cpu = taskc->suggested_cpu_id;
+		/*
+		 * SCX_ENQ_REENQ: a higher-priority class (RT/DL) took the CPU
+		 * (prev_cpu = taskc->suggested_cpu_id) and the local DSQ was
+		 * drained via scx_bpf_reenqueue_local() (from the sched_switch
+		 * hook, or ops.cpu_release on older kernels). The task has not
+		 * run since the first enqueue, so its slice and cgroup-throttle
+		 * state are still valid, but the cached CPU choice is not
+		 * (re-pick below) and the deadline may be stale (recompute
+		 * below).
+		 */
+		struct pick_ctx ictx = {
+			.p = p,
+			.taskc = taskc,
+			.prev_cpu = task_cpu,
+			.cpuc_cur = cpuc_cur,
+			.enq_flags = enq_flags,
+		};
+		cpu = pick_idle_cpu(&ictx, false, &is_idle);
+
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 			return;
 		}
+
+		/*
+		 * If we landed in a different cpdom than the first pick,
+		 * migrate the queued-load accounting (still owed to the old
+		 * cpdom). Same-cpdom -> both calls are no-ops via their
+		 * idempotency guards.
+		 */
+		if (cpuc->cpdom_id != taskc->queued_in_cpdom_id) {
+			unaccount_queued_load(taskc);
+			account_queued_load(taskc, cpuc->cpdom_id);
+		}
+
+		taskc->suggested_cpu_id = cpu;
+		taskc->cpdom_id = cpuc->cpdom_id;
 
 		/*
 		 * Recompute the deadline: the logical clock may have advanced
@@ -1001,6 +1022,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 			.prev_cpu = task_cpu,
 			.cpuc_cur = cpuc_cur,
 			.wake_flags = 0,
+			.enq_flags = enq_flags,
 		};
 
 		cpu = pick_idle_cpu(&ictx, false, &is_idle);
@@ -1072,7 +1094,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 
 kick_cpu_out:
 	/*
-	 * Kick @cpu so an idle CPU picks up the task.
+	 * If a new overflow CPU was assigned while finding a proper DSQ,
+	 * kick the new CPU and go.
 	 */
 	if (is_idle) {
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
@@ -2179,7 +2202,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 		taskc->svc_time_iwgt = sys_stat.avg_svc_time_iwgt;
 	}
 
-	taskc->suggested_cpu_id = scx_bpf_task_cpu(p);
+	/* Set cpu_ids to -ENOENT; they will be set upon enqueue. */
+	taskc->suggested_cpu_id = -ENOENT;
 	taskc->pinned_cpu_id = -ENOENT;
 	WRITE_ONCE(taskc->queued_in_cpdom_id, LAVD_CPDOM_MAX_NR);
 	WRITE_ONCE(taskc->queued_on_cpu_id, -1);
