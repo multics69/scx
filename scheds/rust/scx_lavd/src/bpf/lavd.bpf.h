@@ -979,6 +979,7 @@ struct pick_ctx {
 	const struct task_struct *p;
 	task_ctx *taskc;
 	u64 wake_flags;
+	u64 enq_flags;
 	s32 prev_cpu;
 	/*
 	 * Additional input arguments for find_sticky_cpu_and_cpdom().
@@ -1010,6 +1011,9 @@ struct pick_ctx {
 
 s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur);
 s32  pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle);
+#define LAVD_PICK_IDLE	(1LL << 32)
+s64 pick_idle_cpu_enq(struct task_struct *p, task_ctx *taskc, s32 prev_cpu,
+		      u64 enq_flags, bool extend_ovrflw);
 void set_cpu_idle_state(struct cpu_ctx *cpuc, s32 cpu);
 bool clear_cpu_idle_state(struct cpu_ctx *cpuc, s32 cpu);
 bool claim_idle_cpu(s32 cpu);

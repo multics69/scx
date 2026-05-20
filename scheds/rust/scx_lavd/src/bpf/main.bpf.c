@@ -919,6 +919,37 @@ static __always_inline void unaccount_queued_load_pcpu(task_ctx *taskc)
 	WRITE_ONCE(taskc->queued_on_cpu_id, -1);
 }
 
+/*
+ * Queue @p for @cpuc: straight into its local DSQ when direct dispatch is
+ * allowed or @in_flight requires it (see lavd_enqueue()), otherwise into
+ * the queue it would join. Charges the queued load either way.
+ */
+static __always_inline
+void insert_task(struct task_struct *p, task_ctx *taskc,
+		 struct cpu_ctx *cpuc, bool is_idle, bool in_flight,
+		 u64 enq_flags)
+{
+	s32 cpu = cpuc->cpu_id;
+	u64 dsq_id;
+
+	dsq_id = pick_target_dsq_id(p, cpuc, taskc);
+	reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
+
+	if (unlikely(in_flight) ||
+	    can_direct_dispatch(p, taskc, cpuc, dsq_id, is_idle)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
+				   enq_flags);
+		account_queued_load_pcpu(taskc, cpu, true);
+	} else {
+		queue_insert_vtime(p, taskc, dsq_id, p->scx.dsq_vtime);
+		if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU) {
+			account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id),
+						 false);
+		}
+	}
+	account_queued_load(taskc, cpuc->cpdom_id);
+}
+
 static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_aside)
 {
 	int ret, ret2;
@@ -956,6 +987,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		.prev_cpu = prev_cpu,
 		.cpuc_cur = cpuc_cur,
 		.wake_flags = wake_flags,
+		.enq_flags = 0,
 	};
 	struct task_struct *waker;
 	bool found_idle = false;
@@ -1052,7 +1084,6 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 task_cpu, cpu = -ENOENT;
 	bool is_idle = false, in_flight;
 	task_ctx *taskc;
-	u64 dsq_id;
 
 	cpuc_cur = get_cpu_ctx();
 	taskc = get_task_ctx_curcpu(p, cpuc_cur);
@@ -1095,38 +1126,29 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		}
 
 		/*
-		 * The task has not run since, so its CPU choice and
-		 * queued-load accounting are still valid -- reuse the cached
-		 * suggested_cpu_id and reinsert into the previously chosen
-		 * cpdom DSQ, never the local DSQ it was just drained from.
+		 * The task has not run since the first enqueue, so its
+		 * cgroup-throttle state is still valid, but the cached CPU
+		 * choice is not (re-pick below) and the deadline may be stale
+		 * (recompute below).
+		 *
+		 * Let the pick extend the overflow set as a wake-up would: the
+		 * task lost a CPU it already held, and under core compaction
+		 * the active CPUs it can use may all be busy while idle CPUs
+		 * in its cpumask sit outside the set.
 		 */
-		cpu = taskc->suggested_cpu_id;
-		/*
-		 * suggested_cpu_id may be stale. It was set by a previous
-		 * ops.select_cpu()/ops.enqueue(), but a REENQ arrives at
-		 * ops.enqueue() directly without going through select_task_rq(),
-		 * so the cache is only refreshed by a later non-REENQ enqueue.
-		 * Meanwhile, cpus_ptr can change underneath:
-		 *   - migrate_disable() narrows cpus_ptr to the CPU the
-		 *     task is currently running on, which may differ from
-		 *     the cached one
-		 *   - sched_setaffinity() or cgroup migration changes the
-		 *     task's affinity mask; if task_cpu is still allowed,
-		 *     the task is not re-enqueued, leaving the cache stale
-		 *   - CPU hotplug removes an offline CPU from cpus_ptr
-		 * Clamp to cpus_ptr to prevent routing the task to the
-		 * per-CPU DSQ of a CPU that cannot run it.
-		 */
-		if (cpu < 0 || cpu >= nr_cpu_ids ||
-		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-			cpu = bpf_cpumask_first(p->cpus_ptr);
-			taskc->suggested_cpu_id = cpu;
-		}
+		s64 pick = pick_idle_cpu_enq(p, taskc, task_cpu, enq_flags, true);
+
+		cpu = (s32)pick;
+		is_idle = pick & LAVD_PICK_IDLE;
+
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 			return;
 		}
+
+		taskc->suggested_cpu_id = cpu;
+		taskc->cpdom_id = cpuc->cpdom_id;
 
 		/*
 		 * Recompute the deadline: the logical clock may have advanced
@@ -1142,8 +1164,14 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		scx_bpf_task_set_slice(p, sys_stat.slice_wall);
 
-		dsq_id = get_target_dsq_id(p, cpuc, taskc);
-		queue_insert_vtime(p, taskc, dsq_id, p->scx.dsq_vtime);
+		/*
+		 * The load is still charged to the first placement's CPU and
+		 * cpdom. Drop it and let the insert charge the new one, which
+		 * may be the local DSQ of the CPU the pick just claimed.
+		 */
+		unaccount_queued_load(taskc);
+		unaccount_queued_load_pcpu(taskc);
+		insert_task(p, taskc, cpuc, is_idle, false, enq_flags);
 		goto kick_cpu_out;
 	}
 
@@ -1182,19 +1210,16 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 *    can be outside p->cpus_ptr and must be clamped before use.
 	 */
 	if (likely(!__COMPAT_is_enq_cpu_selected(enq_flags))) {
-		struct pick_ctx ictx = {
-			.p = p,
-			.taskc = taskc,
-			.prev_cpu = task_cpu,
-			.cpuc_cur = cpuc_cur,
-			.wake_flags = 0,
-		};
+		s32 prev_cpu = task_cpu;
+		s64 pick;
 
 		/* Case 3: task_cpu may be stale; clamp the pick input to cpus_ptr. */
-		if (!bpf_cpumask_test_cpu(ictx.prev_cpu, p->cpus_ptr))
-			ictx.prev_cpu = bpf_cpumask_first(p->cpus_ptr);
+		if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+			prev_cpu = bpf_cpumask_first(p->cpus_ptr);
 
-		cpu = pick_idle_cpu(&ictx, false, &is_idle);
+		pick = pick_idle_cpu_enq(p, taskc, prev_cpu, enq_flags, false);
+		cpu = (s32)pick;
+		is_idle = pick & LAVD_PICK_IDLE;
 	} else {
 		cpu = task_cpu;
 		is_idle = test_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
@@ -1249,21 +1274,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * When pinned_slice_ns is enabled, pinned tasks always use per-CPU DSQ
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
-	dsq_id = pick_target_dsq_id(p, cpuc, taskc);
-	reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
-
-	if (unlikely(in_flight) ||
-	    can_direct_dispatch(p, taskc, cpuc, dsq_id, is_idle)) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
-				   enq_flags);
-		account_queued_load_pcpu(taskc, cpu, true);
-	} else {
-		queue_insert_vtime(p, taskc, dsq_id, p->scx.dsq_vtime);
-		if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
-			account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id),
-						 false);
-	}
-	account_queued_load(taskc, cpuc->cpdom_id);
+	insert_task(p, taskc, cpuc, is_idle, in_flight, enq_flags);
 
 kick_cpu_out:
 	/*
@@ -2423,7 +2434,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 
 	taskc->avg_util_ravg.anchor_cpu = LAVD_CPU_ID_NONE;
 	taskc->util_est = 0;
-	taskc->suggested_cpu_id = scx_bpf_task_cpu(p);
+
+	/* Set cpu_ids to -ENOENT; they will be set upon enqueue. */
+	taskc->suggested_cpu_id = -ENOENT;
 	taskc->pinned_cpu_id = -ENOENT;
 	queue_task_init(taskc);
 	WRITE_ONCE(taskc->queued_in_cpdom_id, LAVD_CPDOM_MAX_NR);
