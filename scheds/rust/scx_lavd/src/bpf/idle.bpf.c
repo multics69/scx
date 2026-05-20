@@ -889,27 +889,39 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	/* NOTE: There is a sticky domain. */
 
 	/*
-	 * If something is waiting specifically for ctx->prev_cpu --
-	 * cpuc->nr_pinned_tasks counts effectively-pinned tasks queued for
-	 * this specific CPU (across LOCAL DSQ, per-CPU DSQ, and cpdom DSQ) --
-	 * don't bias the search back to prev_cpu. Yielding prev_cpu to the
-	 * waiter while @p lands on a different CPU in the same cpdom lets
-	 * the two run concurrently instead of serializing on prev_cpu.
-	 * Keep sticky_cpdom intact so cpdom locality is preserved.
+	 * Yield prev_cpu as the sticky pick when staying there would be
+	 * counter-productive. Two reasons:
 	 *
-	 * Using nr_pinned_tasks (not the per-CPU DSQ depth) is important
-	 * because a singly-pinned task can be direct-dispatched to the LOCAL
-	 * DSQ when prev_cpu was idle on its enqueue; counting only cpu_dsq
-	 * would miss that case.
+	 *  - SCX_ENQ_REENQ: prev_cpu is currently taken by a higher-class
+	 *    task (RT/DL/FIFO), so the kernel just bounced our LOCAL DSQ
+	 *    insert.
 	 *
-	 * @p itself cannot be the singly-pinned waiter: the effectively-
-	 * pinned / migrate_disabled early-out above exits before this
-	 * point, so @p has at least 2 CPUs available in its cpumask.
+	 *  - cpuc->nr_pinned_tasks > 0: effectively-pinned tasks are queued
+	 *    for this specific CPU (counted across LOCAL, per-CPU, and
+	 *    cpdom DSQs). Letting @p land on a different CPU in the same
+	 *    cpdom lets the pinned waiter and @p run concurrently instead
+	 *    of serializing on prev_cpu.
+	 *
+	 * In either case keep sticky_cpdom intact so cpdom locality is
+	 * preserved -- the fallback search picks an idle CPU within the
+	 * same cpdom.
+	 *
+	 * For the pinned-waiter case, using nr_pinned_tasks (not the per-CPU
+	 * DSQ depth) is important: a singly-pinned task can be direct-
+	 * dispatched to the LOCAL DSQ when prev_cpu was idle on its
+	 * enqueue; counting only cpu_dsq would miss that case. @p itself
+	 * cannot be the singly-pinned waiter -- the effectively-pinned /
+	 * migrate_disabled early-out above exits before this point, so @p
+	 * has at least 2 CPUs available in its cpumask.
 	 */
-	if (!no_pinned_preempt && sticky_cpu == ctx->prev_cpu) {
-		struct cpu_ctx *cpuc_prev = get_cpu_ctx_id(ctx->prev_cpu);
-		if (cpuc_prev && cpuc_prev->nr_pinned_tasks > 0)
+	if (sticky_cpu == ctx->prev_cpu) {
+		if (ctx->enq_flags & SCX_ENQ_REENQ) {
 			sticky_cpu = -ENOENT;
+		} else if (!no_pinned_preempt) {
+			struct cpu_ctx *cpuc_prev = get_cpu_ctx_id(ctx->prev_cpu);
+			if (cpuc_prev && cpuc_prev->nr_pinned_tasks > 0)
+				sticky_cpu = -ENOENT;
+		}
 	}
 
 	/*
