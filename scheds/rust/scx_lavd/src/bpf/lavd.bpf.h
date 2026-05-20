@@ -811,6 +811,7 @@ struct pick_ctx {
 	const struct task_struct *p;
 	task_ctx *taskc;
 	u64 wake_flags;
+	u64 enq_flags;
 	s32 prev_cpu;
 	/*
 	 * Additional input arguments for find_sticky_cpu_and_cpdom().

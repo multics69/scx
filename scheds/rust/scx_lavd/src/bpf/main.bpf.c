@@ -734,6 +734,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		.prev_cpu = prev_cpu,
 		.cpuc_cur = cpuc_cur,
 		.wake_flags = wake_flags,
+		.enq_flags = 0,
 	};
 	struct task_struct *waker;
 	bool found_idle = false;
@@ -833,6 +834,60 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
 	}
+	task_cpu = scx_bpf_task_cpu(p);
+
+	if (unlikely(enq_flags & SCX_ENQ_REENQ)) {
+		/*
+		 * SCX_ENQ_REENQ: SCX_OPS_ALWAYS_ENQ_IMMED bounced our LOCAL DSQ
+		 * insert because prev_cpu (= taskc->suggested_cpu_id) is taken
+		 * by a higher-class (RT/DL/FIFO) task. The task has not run
+		 * since the first enqueue, so deadline, slice, and
+		 * cgroup-throttle state are still valid, but the cached CPU
+		 * choice is not.
+		 *
+		 * For effectively pinned tasks there is nothing to re-pick, so
+		 * reuse the cached CPU. Otherwise re-run pick_idle_cpu() with
+		 * enq_flags so it knows to yield prev_cpu, and migrate the
+		 * queued-load accounting if the cpdom changed.
+		 */
+		if (is_effectively_pinned(taskc)) {
+			cpu = taskc->suggested_cpu_id;
+		} else {
+			struct pick_ctx ictx = {
+				.p = p,
+				.taskc = taskc,
+				.prev_cpu = task_cpu,
+				.cpuc_cur = cpuc_cur,
+				.enq_flags = enq_flags,
+			};
+			cpu = pick_idle_cpu(&ictx, false, &is_idle);
+		}
+
+		cpuc = get_cpu_ctx_id(cpu);
+		if (!cpuc) {
+			scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
+			return;
+		}
+
+		/*
+		 * If we landed in a different cpdom than the first pick,
+		 * migrate the queued-load accounting (still owed to the old
+		 * cpdom). Same-cpdom -> both calls are no-ops via their
+		 * idempotency guards.
+		 */
+		if (cpuc->cpdom_id != taskc->queued_in_cpdom_id) {
+			unaccount_queued_load(taskc);
+			account_queued_load(taskc, cpuc->cpdom_id);
+		}
+
+		taskc->suggested_cpu_id = cpu;
+		taskc->cpdom_id = cpuc->cpdom_id;
+
+		dsq_id = get_target_dsq_id(p, cpuc, taskc);
+		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
+					 p->scx.dsq_vtime, enq_flags);
+		goto kick_cpu_out;
+	}
 
 	/*
 	 * Calculate when a task can be scheduled for how long.
@@ -867,6 +922,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 			.prev_cpu = task_cpu,
 			.cpuc_cur = cpuc_cur,
 			.wake_flags = 0,
+			.enq_flags = enq_flags,
 		};
 
 		cpu = pick_idle_cpu(&ictx, false, &is_idle);
@@ -933,6 +989,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 	account_queued_load(taskc, cpuc->cpdom_id);
 
+kick_cpu_out:
 	/*
 	 * If a new overflow CPU was assigned while finding a proper DSQ,
 	 * kick the new CPU and go.
