@@ -293,11 +293,31 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 	 * with the highest RAVG-weighted queued load.
 	 */
 	if (use_cpdom_dsq()) {
-		pick_dsq_id = cpdom_to_dsq(cpdomc->id);
-		if (no_fast_lb)
+		if (no_fast_lb) {
+			pick_dsq_id = cpdom_to_dsq(cpdomc->id);
 			highest_load = scx_bpf_dsq_nr_queued(pick_dsq_id);
-		else
+		} else {
+			/*
+			 * Pick the steal target across both cpdom DSQs. When
+			 * this CPU can consume the steady DSQ, treat the two as
+			 * one logical DSQ and steal the lower-vtime head task
+			 * (on a tie, the steady DSQ, which holds the more
+			 * latency-critical tasks); otherwise stick to the
+			 * turbulent DSQ. This mirrors consume_task()'s
+			 * dispatch-side policy.
+			 */
+			u64 dsq_steady = cpdom_to_dsq(cpdomc->id);
+			u64 dsq_turb = cpdom_to_turb_dsq(cpdomc->id);
+
+			if (can_consume_steady_dsq(cpdomc)) {
+				u64 t_steady = peek_dsq_vtime(dsq_steady);
+				u64 t_turb = peek_dsq_vtime(dsq_turb);
+				pick_dsq_id = (t_steady <= t_turb) ? dsq_steady : dsq_turb;
+			} else {
+				pick_dsq_id = dsq_turb;
+			}
 			highest_load = READ_ONCE(cpdomc->qload_invr);
+		}
 	}
 
 	/*
@@ -538,14 +558,15 @@ bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 
 	/*
 	 * Determine if this CPU is turbulent (high IRQ/steal time).
-	 * Non-turbulent CPUs consume from all 3 DSQs.
-	 * Turbulent CPUs only consume from the turbulent DSQ
-	 * (which holds non-latency-critical tasks).
+	 * A turbulent CPU is a poor home for latency-critical tasks, which
+	 * live on the steady DSQ, so it primarily consumes the turbulent
+	 * DSQ (non-latency-critical tasks). A steady CPU is not IRQ-
+	 * disturbed and consumes from all DSQs.
 	 */
 	cpuc = get_cpu_ctx();
 	if (!cpuc)
 		return false;
-	turbulent = cpuc->lat_headroom < LAVD_LC_LATENCY_SENSITIVE_THRESH;
+	turbulent = is_turbulent_cpu(cpuc);
 
 	/*
 	 * If the current compute domain is a stealer, try to steal
@@ -557,10 +578,10 @@ bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 
 	/*
 	 * Collect eligible DSQs and consume in lowest-vtime-first order.
-	 * Non-turbulent CPUs always see the cpdom DSQ. Turbulent CPUs
-	 * also see it when it has more queued tasks than the turbulent
-	 * DSQ (to prevent starvation) or when there are no steady CPUs
-	 * to drain it.
+	 * A steady CPU always sees the steady cpdom DSQ. A turbulent CPU
+	 * pulls latency-critical tasks off it only to prevent starvation:
+	 * when it has more queued tasks than the turbulent DSQ, or there
+	 * is no steady CPU to drain it.
 	 */
 	dsqs[0] = (struct dsq_entry){ cpu_dsq_id,       U64_MAX, use_per_cpu_dsq() };
 	dsqs[1] = (struct dsq_entry){ cpdom_dsq_id,     U64_MAX, use_cpdom_dsq() &&
