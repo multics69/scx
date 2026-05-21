@@ -16,6 +16,7 @@
 struct preemption_info {
 	u64		est_stopping_clk;
 	u64		lat_cri;
+	u32		weight;
 	struct cpu_ctx	*cpuc;
 };
 
@@ -37,15 +38,26 @@ static bool can_x_kick_y(struct preemption_info *prm_x,
 {
 	/*
 	 * A caller should ensure that Y is not a lock holder.
+	 *
+	 * Two-tier compare. Weight (the user-set effective priority,
+	 * default 100 in scx scale) gates first to avoid priority
+	 * inversion:
+	 *
+	 *  - Same weight (the common case) => fall back to lat_cri +
+	 *    deadline. The deadline (completion-time) heuristic only
+	 *    breaks ties within a weight class, where the user expressed
+	 *    no preference.
+	 *  - Strictly higher weight => preempt unconditionally. Weight is
+	 *    the application designer's explicit priority, so honoring it
+	 *    must not hinge on the deadline heuristic -- gating on a sooner
+	 *    deadline would make a higher-priority task wait behind a
+	 *    lower-priority one just because the latter runs shorter.
+	 *  - Strictly lower weight => never preempt (inversion).
 	 */
-
-	/*
-	 * Check one's latency criticality and deadline.
-	 */
-	if ((prm_x->lat_cri > prm_y->lat_cri) &&
-	    (prm_x->est_stopping_clk < prm_y->est_stopping_clk))
-		return true;
-	return false;
+	if (likely(prm_x->weight == prm_y->weight))
+		return (prm_x->lat_cri > prm_y->lat_cri) &&
+		       (prm_x->est_stopping_clk < prm_y->est_stopping_clk);
+	return prm_x->weight > prm_y->weight;
 }
 
 static bool can_x_kick_cpu2(struct preemption_info *prm_x,
@@ -69,6 +81,7 @@ static bool can_x_kick_cpu2(struct preemption_info *prm_x,
 	 */
 	prm_cpu2->est_stopping_clk = cpuc2->est_stopping_clk;
 	prm_cpu2->lat_cri = cpuc2->lat_cri;
+	prm_cpu2->weight = cpuc2->weight;
 	prm_cpu2->cpuc = cpuc2;
 
 	/*
@@ -83,11 +96,20 @@ static void init_prm_by_task(struct preemption_info *prm_task,
 {
 	prm_task->est_stopping_clk = get_est_stopping_clk(taskc, p->scx.slice, now);
 	prm_task->lat_cri = taskc->lat_cri;
+	prm_task->weight = p->scx.weight;
 	prm_task->cpuc = NULL;
 }
 
-static bool is_worth_kick_other_task(task_ctx *taskc)
+static bool is_worth_kick_other_task(struct task_struct *p, task_ctx *taskc)
 {
+	/*
+	 * Negative nice (weight > default 100 in scx scale) is an explicit
+	 * user signal to favor this task; always consider preempting for it,
+	 * regardless of the latency-criticality threshold.
+	 */
+	if (p->scx.weight > 100)
+		return true;
+
 	/*
 	 * Preemption is not free. It is expensive involving context switching,
 	 * etc. Hence, we first judiciously check whether it is worth trying to
@@ -456,7 +478,7 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	 * enough to be worth the effort before falling into the
 	 * slice-boost handling and the power-of-2 victim search below.
 	 */
-	if (!is_worth_kick_other_task(taskc))
+	if (!is_worth_kick_other_task(p, taskc))
 		return;
 
 	/*
@@ -541,5 +563,6 @@ void reset_cpu_preemption_info(struct cpu_ctx *cpuc)
 	 */
 	cpuc->flags = 0;
 	cpuc->lat_cri = 0;
+	cpuc->weight = 0;
 	cpuc->est_stopping_clk = SCX_SLICE_INF;
 }
