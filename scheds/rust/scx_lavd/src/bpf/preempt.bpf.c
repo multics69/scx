@@ -253,6 +253,19 @@ static void ask_cpu_yield_after(struct cpu_ctx *victim_cpuc, u64 new_slice)
 			if (victim_p->scx.slice > new_slice)
 				WRITE_ONCE(victim_p->scx.slice, new_slice);
 		}
+
+		/*
+		 * __COMPAT_scx_bpf_cpu_curr() yields an untrusted_ptr that
+		 * bpf_task_storage_get() refuses; re-acquire via pid to get
+		 * a trusted reference, then release after setting the flag.
+		 */
+		victim_p = bpf_task_from_pid(victim_p->pid);
+		if (victim_p) {
+			task_ctx *victim_taskc = get_task_ctx(victim_p);
+			if (victim_taskc)
+				set_task_flag(victim_taskc, LAVD_FLAG_PREEMPTED);
+			bpf_task_release(victim_p);
+		}
 	}
 	bpf_rcu_read_unlock();
 }
