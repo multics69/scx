@@ -551,6 +551,7 @@ static void update_stat_for_running(struct task_struct *p,
 	 */
 	cpuc->flags = taskc->flags;
 	cpuc->lat_cri = taskc->lat_cri;
+	cpuc->weight = p->scx.weight;
 	cpuc->running_clk = now;
 	cpuc->est_stopping_clk = get_est_stopping_clk(taskc, p->scx.slice, now);
 
@@ -2118,6 +2119,7 @@ unlock_out:
 	cpuc->flags = 0;
 	cpuc->idle_start_clk = 0;
 	cpuc->lat_cri = 0;
+	cpuc->weight = 0;
 	cpuc->running_clk = 0;
 	cpuc->est_stopping_clk = SCX_SLICE_INF;
 	cpuc->avg_perf_factor = LAVD_SCALE;
@@ -2163,6 +2165,7 @@ unlock_out:
 	barrier();
 
 	cpuc->lat_cri = 0;
+	cpuc->weight = 0;
 	cpuc->running_clk = 0;
 	cpuc->est_stopping_clk = SCX_SLICE_INF;
 
