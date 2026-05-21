@@ -16,6 +16,7 @@
 struct preemption_info {
 	u64		est_stopping_clk;
 	u64		lat_cri;
+	u32		weight;
 	struct cpu_ctx	*cpuc;
 };
 
@@ -36,14 +37,21 @@ static bool can_x_kick_y(struct preemption_info *prm_x,
 {
 	/*
 	 * A caller should ensure that Y is not a lock holder.
+	 *
+	 * Two-tier compare. Weight (the user-set effective priority,
+	 * default 100 in scx scale) gates first to avoid priority
+	 * inversion:
+	 *
+	 *  - Same weight (the common case) => fall back to lat_cri +
+	 *    deadline.
+	 *  - Strictly higher weight + sooner deadline => preempt.
+	 *  - Strictly lower weight => never preempt (inversion).
 	 */
-
-	/*
-	 * Check one's latency criticality and deadline.
-	 */
-	if ((prm_x->lat_cri > prm_y->lat_cri) &&
-	    (prm_x->est_stopping_clk < prm_y->est_stopping_clk))
-		return true;
+	if (likely(prm_x->weight == prm_y->weight))
+		return (prm_x->lat_cri > prm_y->lat_cri) &&
+		       (prm_x->est_stopping_clk < prm_y->est_stopping_clk);
+	if (prm_x->weight > prm_y->weight)
+		return prm_x->est_stopping_clk < prm_y->est_stopping_clk;
 	return false;
 }
 
@@ -62,6 +70,7 @@ static bool can_x_kick_cpu2(struct preemption_info *prm_x,
 	 */
 	prm_cpu2->est_stopping_clk = cpuc2->est_stopping_clk;
 	prm_cpu2->lat_cri = cpuc2->lat_cri;
+	prm_cpu2->weight = cpuc2->weight;
 	prm_cpu2->cpuc = cpuc2;
 
 	/*
@@ -72,15 +81,24 @@ static bool can_x_kick_cpu2(struct preemption_info *prm_x,
 }
 
 static void init_prm_by_task(struct preemption_info *prm_task,
-			     task_ctx *taskc, u64 now)
+			     struct task_struct *p, task_ctx *taskc, u64 now)
 {
 	prm_task->est_stopping_clk = get_est_stopping_clk(taskc, now);
 	prm_task->lat_cri = taskc->lat_cri;
+	prm_task->weight = p->scx.weight;
 	prm_task->cpuc = NULL;
 }
 
-static bool is_worth_kick_other_task(task_ctx *taskc)
+static bool is_worth_kick_other_task(struct task_struct *p, task_ctx *taskc)
 {
+	/*
+	 * Negative nice (weight > default 100 in scx scale) is an explicit
+	 * user signal to favor this task; always consider preempting for it,
+	 * regardless of the latency-criticality threshold.
+	 */
+	if (p->scx.weight > 100)
+		return true;
+
 	/*
 	 * Preemption is not free. It is expensive involving context switching,
 	 * etc. Hence, we first judiciously check whether it is worth trying to
@@ -91,6 +109,7 @@ static bool is_worth_kick_other_task(task_ctx *taskc)
 
 static struct cpu_ctx *find_victim_cpu(const struct cpumask *cpumask,
 				       s32 preferred_cpu,
+				       struct task_struct *p,
 				       task_ctx *taskc, u64 now)
 {
 	/*
@@ -111,7 +130,7 @@ static struct cpu_ctx *find_victim_cpu(const struct cpumask *cpumask,
 	/*
 	 * Get task's preemption information for comparison.
 	 */
-	init_prm_by_task(&prm_task, taskc, now);
+	init_prm_by_task(&prm_task, p, taskc, now);
 
 	/*
 	 * If there is a preferred CPU on which a task wants to run,
@@ -449,7 +468,7 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	 * enough to be worth the effort before falling into the
 	 * slice-boost handling and the power-of-2 victim search below.
 	 */
-	if (!is_worth_kick_other_task(taskc))
+	if (!is_worth_kick_other_task(p, taskc))
 		return;
 
 	/*
@@ -468,7 +487,7 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 		 */
 		duration_wall = time_delta(now, cpuc_victim->running_clk);
 		if (duration_wall >= sys_stat.slice_wall) {
-			init_prm_by_task(&prm_t, taskc, now);
+			init_prm_by_task(&prm_t, p, taskc, now);
 			if (can_x_kick_cpu2(&prm_t, &prm_c, cpuc_victim)) {
 				reset_cpu_flag(cpuc_victim, LAVD_FLAG_SLICE_BOOST);
 				goto kick_out;
@@ -511,7 +530,7 @@ void try_find_and_kick_victim_cpu(struct task_struct *p,
 	/*
 	 * Find a victim CPU among CPUs that run lower-priority tasks.
 	 */
-	cpuc_victim = find_victim_cpu(cast_mask(cpumask), preferred_cpu, taskc, now);
+	cpuc_victim = find_victim_cpu(cast_mask(cpumask), preferred_cpu, p, taskc, now);
 
 	/*
 	 * If a victim CPU is chosen, preempt the victim by kicking it.
@@ -533,5 +552,6 @@ void reset_cpu_preemption_info(struct cpu_ctx *cpuc)
 	 */
 	cpuc->flags = 0;
 	cpuc->lat_cri = 0;
+	cpuc->weight = 0;
 	cpuc->est_stopping_clk = SCX_SLICE_INF;
 }
