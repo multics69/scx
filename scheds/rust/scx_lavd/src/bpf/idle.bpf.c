@@ -903,11 +903,16 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 
 	/*
 	 * Yield prev_cpu as the sticky pick when staying there would be
-	 * counter-productive. Two reasons:
+	 * counter-productive. Three reasons:
 	 *
 	 *  - SCX_ENQ_REENQ: prev_cpu is currently taken by a higher-class
 	 *    task (RT/DL/FIFO), so the kernel just bounced our LOCAL DSQ
 	 *    insert.
+	 *
+	 *  - LAVD_FLAG_PREEMPTED: ask_cpu_yield_after() recently shortened
+	 *    this task's slice to yield prev_cpu to a higher-priority
+	 *    waiter, so prev_cpu is by construction about to be (or
+	 *    already) running that waiter. Clear the flag on use.
 	 *
 	 *  - cpuc->nr_pinned_tasks > 0: effectively-pinned tasks are queued
 	 *    for this specific CPU (counted across LOCAL, per-CPU, and
@@ -915,7 +920,7 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 *    cpdom lets the pinned waiter and @p run concurrently instead
 	 *    of serializing on prev_cpu.
 	 *
-	 * In either case keep sticky_cpdom intact so cpdom locality is
+	 * In all cases keep sticky_cpdom intact so cpdom locality is
 	 * preserved -- the fallback search picks an idle CPU within the
 	 * same cpdom.
 	 *
@@ -930,6 +935,9 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	if (sticky_cpu == ctx->prev_cpu) {
 		if (ctx->enq_flags & SCX_ENQ_REENQ) {
 			sticky_cpu = -ENOENT;
+		} else if (test_task_flag(ctx->taskc, LAVD_FLAG_PREEMPTED)) {
+			sticky_cpu = -ENOENT;
+			reset_task_flag(ctx->taskc, LAVD_FLAG_PREEMPTED);
 		} else if (!no_pinned_preempt) {
 			struct cpu_ctx *cpuc_prev = get_cpu_ctx_id(ctx->prev_cpu);
 			if (cpuc_prev && cpuc_prev->nr_pinned_tasks > 0)
