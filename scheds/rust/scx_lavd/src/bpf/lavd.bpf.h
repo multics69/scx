@@ -363,6 +363,7 @@ struct cpu_ctx {
 	volatile u64	flags;		/* cached copy of task's flags */
 	volatile u64	est_stopping_clk; /* estimated stopping time */
 	volatile u64	running_clk;	/* when a task starts running */
+	volatile u32	weight;		/* cached running task's weight (scx scale, default 100) */
 	volatile u16	lat_cri;	/* latency criticality */
 	volatile u16	effective_capacity;/* the capacity that CPU can do right now */
 	u16		cpu_id;		/* cpu id */
