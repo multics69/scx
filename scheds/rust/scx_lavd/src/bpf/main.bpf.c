@@ -1810,9 +1810,13 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	}
 
 	/*
-	 * If there is a pinned task on this CPU, shrink its time slice.
+	 * If there is a pinned task on this CPU or the CPU is congested
+	 * (one or more tasks are waiting across its DSQs), shrink its
+	 * time slice. Even if the cpdom is underutilized, a CPU can
+	 * still be congested when tasks are affinitized to a subset of
+	 * CPUs in the cpdom.
 	 */
-	if (cpuc->nr_pinned_tasks)
+	if (cpuc->nr_pinned_tasks || is_cpu_congested(cpuc))
 		shrink_slice_at_tick(p, cpuc, now);
 }
 
