@@ -1078,7 +1078,7 @@ int cbw_update_nquota_ub(u64 cgx_raw)
 			return -ESRCH;
 		}
 
-		cgx->nquota_ub = min(cgx->nquota_ub, parentx->nquota);
+		cgx->nquota_ub = min(cgx->nquota_ub, parentx->nquota_ub);
 	}
 	return 0;
 }
