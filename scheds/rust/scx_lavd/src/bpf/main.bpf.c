@@ -648,9 +648,25 @@ static void update_stat_for_refill(struct task_struct *p,
 
 static bool can_direct_dispatch(struct cpu_ctx *cpuc, bool is_cpu_idle)
 {
-	return (is_cpu_idle && !queued_on_cpu(cpuc)) ||
-	       (lb_local_dsq_util_wall > 0 &&
-		cpuc->avg_util_wall < lb_local_dsq_util_wall);
+	/*
+	 * An idle CPU with nothing queued cannot be congested --
+	 * queued_on_cpu() covers every DSQ that is_cpu_congested()
+	 * counts -- so no congestion check is needed on this path.
+	 */
+	if (is_cpu_idle && !queued_on_cpu(cpuc))
+		return true;
+
+	/*
+	 * Bypass deadline ordering under low utilization, but never
+	 * direct-dispatch into a congested CPU: tasks are already waiting
+	 * across its DSQs, and inserting into the local DSQ would let the
+	 * new task jump ahead of them. is_cpu_congested() walks multiple
+	 * DSQs, so evaluate it last, only after the cheap utilization
+	 * checks pass.
+	 */
+	return lb_local_dsq_util_wall > 0 &&
+	       cpuc->avg_util_wall < lb_local_dsq_util_wall &&
+	       !is_cpu_congested(cpuc);
 }
 
 /*
