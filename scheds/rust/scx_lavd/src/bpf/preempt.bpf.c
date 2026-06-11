@@ -2,6 +2,7 @@
 #include <scx/common.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
+#include "util.bpf.h"
 #include <errno.h>
 #include <stdbool.h>
 #include <bpf/bpf_core_read.h>
@@ -50,6 +51,12 @@ static bool can_x_kick_cpu2(struct preemption_info *prm_x,
 			    struct preemption_info *prm_cpu2,
 			    struct cpu_ctx *cpuc2)
 {
+	/*
+	 * A CPU taken by an RT/DL task cannot be a victim.
+	 */
+	if (is_rt_or_dl_task_running(cpuc2->cpu_id))
+		return false;
+
 	/*
 	 * Never preeempt a CPU running a lock holder.
 	 */
