@@ -283,7 +283,8 @@ static s32 find_cpu_for_ovrflw_extend(struct pick_ctx *ctx)
 }
 
 
-static s32 pick_idle_cpu_at_cpdom(struct pick_ctx *ctx, s64 cpdom, u64 scope,
+__hidden __noinline
+s32 pick_idle_cpu_at_cpdom(struct pick_ctx *ctx, s64 cpdom, u64 scope,
 			   bool *is_idle)
 {
 	struct bpf_cpumask *cpd_mask;
@@ -346,7 +347,7 @@ s32 cpumask_any_distribute(struct pick_ctx *ctx)
 	return -ENOENT;
 }
 
-static
+__hidden __noinline
 s32 pick_random_cpu(struct pick_ctx *ctx)
 {
 	/*
@@ -471,7 +472,7 @@ bool test_cpu_stickable(struct pick_ctx *ctx, struct sticky_ctx *sctx,
 	return false;
 }
 
-static
+__hidden __noinline
 bool is_sync_wakeup(struct pick_ctx *ctx)
 {
 	struct task_struct *waker;
@@ -609,7 +610,7 @@ err_out:
 	return -ENOENT;
 }
 
-static
+__hidden __noinline
 bool is_sync_waker_idle(struct pick_ctx * ctx, s64 *cpdom_id)
 {
 	struct cpu_ctx *cpuc_waker, *cpuc_prev;
@@ -660,7 +661,7 @@ bool is_sync_waker_idle(struct pick_ctx * ctx, s64 *cpdom_id)
  * Both domains must share the same LLC so the migration cost is
  * negligible.
  */
-static __always_inline bool
+__hidden __noinline bool
 ct_migration_wins(struct pick_ctx *ctx, struct cpdom_ctx *sticky,
 		  struct cpdom_ctx *target)
 {
@@ -694,7 +695,7 @@ ct_migration_wins(struct pick_ctx *ctx, struct cpdom_ctx *sticky,
 	return total_t * (100 + lb_ct_mig_delta_pct) < total_s * 100;
 }
 
-static
+__hidden __noinline
 s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 			u64 scope, s64 *sticky_cpdom, bool *is_idle)
 {
@@ -756,10 +757,6 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 					WRITE_ONCE(mig_cpdc->is_stealer, false);
 					WRITE_ONCE(cpdc->is_stealee, false);
 				}
-				debugln("migrate: neighbor %s[pid%d] cpdom%llu -> cpdom%llu cpu%d via=%s",
-					ctx->p->comm, ctx->p->pid,
-					cpdc->id, mig_cpdc->id, cpu,
-					via_stealer ? "stealer" : "completion-time");
 				*sticky_cpdom = mig_cpdom;
 				break;
 			}
