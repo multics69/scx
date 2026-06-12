@@ -466,7 +466,8 @@ static s32 find_cpu_for_ovrflw_extend(struct pick_ctx *ctx)
 }
 
 
-static s32 pick_idle_cpu_at_cpdom(struct pick_ctx *ctx, s64 cpdom, u64 scope)
+__hidden __noinline
+s32 pick_idle_cpu_at_cpdom(struct pick_ctx *ctx, s64 cpdom, u64 scope)
 {
 	struct cpdom_ctx *cpdc;
 	s32 cpu;
@@ -520,7 +521,7 @@ s32 cpumask_any_distribute(struct pick_ctx *ctx)
 	return -ENOENT;
 }
 
-static
+__hidden __noinline
 s32 pick_random_cpu(struct pick_ctx *ctx)
 {
 	/*
@@ -645,7 +646,7 @@ bool test_cpu_stickable(struct pick_ctx *ctx, struct sticky_ctx *sctx,
 	return false;
 }
 
-static
+__hidden __noinline
 bool is_sync_wakeup(struct pick_ctx *ctx)
 {
 	struct task_struct *waker;
@@ -783,7 +784,7 @@ err_out:
 	return -ENOENT;
 }
 
-static
+__hidden __noinline
 bool is_sync_waker_idle(struct pick_ctx * ctx, s64 *cpdom_id)
 {
 	struct cpu_ctx *cpuc_waker, *cpuc_prev;
@@ -830,7 +831,7 @@ comp_time_gain(u64 svc_invr, u64 ct_s, struct cpdom_ctx *sticky,
 	return (s64)ct_s - (s64)calc_comp_time_on_cpdom(svc_invr, target);
 }
 
-static
+__hidden __noinline
 s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 			u64 scope, bool stealer_only, bool *is_idle)
 {
