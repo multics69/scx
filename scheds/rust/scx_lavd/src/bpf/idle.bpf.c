@@ -284,7 +284,8 @@ static s32 find_cpu_for_ovrflw_extend(struct pick_ctx *ctx)
 }
 
 
-static s32 pick_idle_cpu_at_cpdom(struct pick_ctx *ctx, s64 cpdom, u64 scope,
+__hidden __noinline
+s32 pick_idle_cpu_at_cpdom(struct pick_ctx *ctx, s64 cpdom, u64 scope,
 			   bool *is_idle)
 {
 	struct bpf_cpumask *cpd_mask;
@@ -347,7 +348,7 @@ s32 cpumask_any_distribute(struct pick_ctx *ctx)
 	return -ENOENT;
 }
 
-static
+__hidden __noinline
 s32 pick_random_cpu(struct pick_ctx *ctx)
 {
 	/*
@@ -472,7 +473,7 @@ bool test_cpu_stickable(struct pick_ctx *ctx, struct sticky_ctx *sctx,
 	return false;
 }
 
-static
+__hidden __noinline
 bool is_sync_wakeup(struct pick_ctx *ctx)
 {
 	struct task_struct *waker;
@@ -610,7 +611,7 @@ err_out:
 	return -ENOENT;
 }
 
-static
+__hidden __noinline
 bool is_sync_waker_idle(struct pick_ctx * ctx, s64 *cpdom_id)
 {
 	struct cpu_ctx *cpuc_waker, *cpuc_prev;
@@ -657,7 +658,7 @@ comp_time_gain(u64 svc_invr, u64 ct_s, struct cpdom_ctx *sticky,
 	return (s64)ct_s - (s64)calc_comp_time_on_cpdom(svc_invr, target);
 }
 
-static
+__hidden __noinline
 s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 			u64 scope, s64 *sticky_cpdom, bool *is_idle)
 {
@@ -666,7 +667,6 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 	s32 cpu = -ENOENT;
 	bool ct_enabled = xmig_min_gain_ns > 0; /* Userspace forces this to 0 on a homogeneous machine. */
 	u64 ct_s;
-	bool via_idle = false;
 	int i, j;
 
 	/*
@@ -722,7 +722,6 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 
 			cpu = pick_idle_cpu_at_cpdom(ctx, mig_cpdom, scope, is_idle);
 			if (cpu >= 0) {
-				via_idle = true;
 				goto found;
 			}
 
@@ -746,9 +745,6 @@ found:
 		WRITE_ONCE(mig_cpdc->is_stealer, false);
 		WRITE_ONCE(cpdc->is_stealee, false);
 	}
-	debugln("migrate: neighbor %s[pid%d] cpdom%llu -> cpdom%llu cpu%d via=%s",
-		ctx->p->comm, ctx->p->pid, cpdc->id, mig_cpdc->id, cpu,
-		via_idle ? "idle-cpu" : "queue");
 	*sticky_cpdom = mig_cpdom;
 	return cpu;
 }

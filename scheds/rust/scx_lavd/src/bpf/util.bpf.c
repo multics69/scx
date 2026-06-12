@@ -381,7 +381,6 @@ u32 __attribute__ ((noinline)) get_primary_cpu(u32 cpu)
 
 	sibling = MEMBER_VPTR(cpu_sibling, [cpu]);
 	if (unlikely(!sibling)) {
-		debugln("Infeasible CPU id: %d", cpu);
 		return cpu;
 	}
 
