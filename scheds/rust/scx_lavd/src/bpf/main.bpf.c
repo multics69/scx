@@ -2768,4 +2768,5 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .init			= (void *)lavd_init,
 	       .exit			= (void *)lavd_exit,
 	       .timeout_ms		= 30000U,
+	       .exit_dump_len		= 64 * 1024 * 1024,	/* DIAGNOSTIC: 64 MiB; default 32 KiB. Revert. */
 	       .name			= "lavd");
