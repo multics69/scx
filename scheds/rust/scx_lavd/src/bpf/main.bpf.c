@@ -2063,6 +2063,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	}
 
 	/*
+	 * DIAGNOSTIC (revert): a fresh slot must be zeroed (free memsets the
+	 * payload, pool memory starts zero). A populated slot means scx_alloc()
+	 * handed out an idx still owned by a live task -- idx double-allocation,
+	 * the suspected source of zeroed-ctx orphans.
+	 */
+	if (taskc->pid != 0 || taskc->cgrp_id != 0)
+		bpf_printk("BAD-ALLOC: new pid %d got live slot of pid %d cgid %llu",
+			   p->pid, taskc->pid, taskc->cgrp_id);
+
+	/*
 	 * Initialize @p's context.
 	 *
 	 * Inherit its parent properties, if possible, to maintain the same
