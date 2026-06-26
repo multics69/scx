@@ -2159,9 +2159,30 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
 	 * queued here. Cancel it before the free; scx_atq_cancel() unlinks it
 	 * wherever teardown moved it.
 	 */
+	/*
+	 * DIAGNOSTIC (revert): the slot we are about to cancel+free must belong
+	 * to the exiting task. If get_task_ctx() resolved a slot whose stored
+	 * pid is some other live task, the task allocator aliased an idx -- the
+	 * suspected source of zeroed-ctx BTQ corruption.
+	 */
+	if (taskc && taskc->pid != p->pid)
+		bpf_printk("BAD-FREE: exit pid %d resolved slot of pid %d cgid %llu",
+			   p->pid, taskc->pid, taskc->cgrp_id);
+
 	if (enable_cpu_bw && taskc &&
-	    scx_cgroup_bw_is_task_throttled((u64)taskc))
+	    scx_cgroup_bw_is_task_throttled((u64)taskc)) {
 		scx_cgroup_bw_cancel((u64)taskc);
+		/*
+		 * DIAGNOSTIC (revert): after an authoritative cancel the task
+		 * must be in no BTQ. If it still reads throttled, the cancel
+		 * could not unlink it (e.g. ->atq disagrees with the rbtree the
+		 * node is actually linked in) and scx_task_free() is about to
+		 * zero a still-linked node.
+		 */
+		if (scx_cgroup_bw_is_task_throttled((u64)taskc))
+			bpf_printk("BAD-FREE: pid %d still BTQ-linked after cancel",
+				   p->pid);
+	}
 
 	scx_task_free(p);
 	return 0;
