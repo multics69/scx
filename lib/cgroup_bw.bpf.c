@@ -2681,6 +2681,17 @@ int scx_cgroup_bw_move(struct task_struct *p __arg_trusted, u64 taskc,
 	if (!scx_cgroup_bw_is_task_throttled(taskc))
 		return 0;
 
+	/*
+	 * DIAGNOSTIC (revert): this cancel+put_aside is non-atomic and leaves
+	 * ->atq == NULL between the two steps. Log every throttled move so we
+	 * can correlate the orphan burst with cgroup_move, and flag PF_EXITING
+	 * -- the race partner whose scx_task_free() can zero the node in the
+	 * window, so put_aside below re-links a freed node and corrupts @to.
+	 */
+	cbw_info("MOVE-THROTTLED: %s[%d] cgid%llu->cgid%llu exiting=%d",
+		 p->comm, p->pid, cgroup_get_id(from), cgroup_get_id(to),
+		 !!(p->flags & PF_EXITING));
+
 	if ((ret = scx_cgroup_bw_cancel(taskc))) {
 		cbw_err("Fail to cancel a throttled task (%s:%d) from a cgroup (cgid%llu): %d",
 			p->comm, p->pid, cgroup_get_id(from), ret);
