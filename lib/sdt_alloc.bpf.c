@@ -410,6 +410,20 @@ int scx_alloc_free_idx(struct scx_allocator *alloc, __u64 idx)
 	chunk = desc->chunk;
 
 	pos = idx & mask;
+
+	/*
+	 * DIAGNOSTIC (revert): the leaf bit must be set (allocated) when we free
+	 * it. If it is already clear, this idx is being freed a second time --
+	 * mark_nodes_avail() would over-count nr_free and later hand the still
+	 * live idx to another task (slot aliasing). Catch the double free here
+	 * before it corrupts the bitmap, and leave the slot untouched.
+	 */
+	if (!(desc->allocated[pos / 64] & ((__u64)1 << (pos % 64)))) {
+		bpf_spin_unlock(&alloc_lock);
+		bpf_printk("DOUBLE-FREE: idx 0x%llx already free", idx);
+		return -EINVAL;
+	}
+
 	data = chunk->data[pos];
 	if (likely(data)) {
 		*data = (struct sdt_data) {
