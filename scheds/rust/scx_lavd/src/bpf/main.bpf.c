@@ -963,6 +963,18 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * cgroup is throttled.
 	 */
 	if (enable_cpu_bw && (cgroup_throttled(p, taskc, true) == -EAGAIN)) {
+		/*
+		 * DIAGNOSTIC (revert): -EAGAIN means the task was put aside into
+		 * a BTQ, so we drop it here without dispatching. If it is NOT
+		 * actually in any BTQ now, we are about to leave a runnable task
+		 * in QUEUED state on no queue -- the orphan we are hunting. (A
+		 * concurrent BTQ drain can pop it in the window after put_aside,
+		 * which would re-dispatch it, so this can false-fire; correlate
+		 * the pid against the orphan tasks in the exit dump.)
+		 */
+		if (!scx_cgroup_bw_is_task_throttled((u64)taskc))
+			bpf_printk("ORPHAN-ENQ: %s[%d] cgid=%llu dropped but not in BTQ",
+				   p->comm, p->pid, taskc->cgrp_id);
 		debugln("Task %s[pid%d/cgid%llu] is throttled.",
 			p->comm, p->pid, taskc->cgrp_id);
 		return;
