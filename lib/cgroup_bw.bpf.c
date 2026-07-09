@@ -1967,6 +1967,7 @@ static
 bool cbw_has_backlogged_tasks(scx_cgroup_ctx_t *cgx)
 {
 	scx_cgroup_llc_ctx_t *llcx;
+	scx_atq_t *btq;
 	int i;
 
 	if (!cgx || !cgx->has_llcx)
@@ -1977,7 +1978,7 @@ bool cbw_has_backlogged_tasks(scx_cgroup_ctx_t *cgx)
 		if (!llcx)
 			continue;
 
-		if (scx_atq_nr_queued(llcx->btq))
+		if ((btq = READ_ONCE(llcx->btq)) && scx_atq_nr_queued(btq))
 			return true;
 	}
 
