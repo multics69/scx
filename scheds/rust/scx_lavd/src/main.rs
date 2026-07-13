@@ -213,6 +213,10 @@ struct Opts {
     #[clap(long = "no-futex-boost", action = clap::ArgAction::SetTrue)]
     no_futex_boost: bool,
 
+    /// Do not boost woken lock waiters (lock waiter preemption, LWP).
+    #[clap(long = "no-lwp-boost", action = clap::ArgAction::SetTrue)]
+    no_lwp_boost: bool,
+
     /// Default: --no-fast-lb is deactivated (fast load balancer is on).
     /// Disable the fast (batch-migration) load balancer and fall back to
     /// the pre-fast-lb load-balancer behavior.
@@ -514,11 +518,27 @@ impl<'a> Scheduler<'a> {
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, lavd_ops, open_opts)?;
 
-        // Enable futex tracing using ftrace if available. If the ftrace is not
-        // available, use tracepoint, which is known to be slower than ftrace.
-        if !opts.no_futex_boost {
-            if Self::attach_futex_ftraces(&mut skel)? == false {
-                info!("Fail to attach futex ftraces. Try with tracepoints.");
+        // Futex boosting. Two independent features:
+        //   - holder boost (LHP), gated by --no-futex-boost, via the fexit
+        //     ftraces (or the sys_exit_futex tracepoints);
+        //   - lock-waiter tagging (LWP), gated by --no-lwp-boost, via the
+        //     fentry ftraces (or the sys_enter_futex tracepoint).
+        // Prefer ftrace and attach each requested feature independently; if
+        // ftrace is unavailable (or the symbols are missing), fall back to the
+        // shared tracepoints, which serve both and are gated by the BPF
+        // variables no_futex_boost / no_lwp_boost instead of by attachment.
+        // The short-circuit && avoids a partial ftrace attach before falling
+        // back (LWP symbols are a subset of the holder symbols, so if the
+        // holder ftraces attach, the LWP ones do too).
+        if !opts.no_futex_boost || !opts.no_lwp_boost {
+            let ftrace_ok = compat::tracer_available("function")?;
+            if ftrace_ok
+                && (opts.no_futex_boost || Self::attach_futex_ftraces(&mut skel)?)
+                && (opts.no_lwp_boost || Self::attach_lwp_ftraces(&mut skel)?)
+            {
+                // Requested features attached via ftrace.
+            } else {
+                info!("Futex ftraces unavailable; using tracepoints.");
                 if Self::attach_futex_tracepoints(&mut skel)? == false {
                     info!("Fail to attach futex tracepoints.");
                 }
@@ -590,10 +610,26 @@ impl<'a> Scheduler<'a> {
             ("futex_unlock_pi", &skel.progs.fexit_futex_unlock_pi),
         ];
 
-        if compat::tracer_available("function")? == false {
-            info!("Ftrace is not enabled in the kernel.");
-            return Ok(false);
-        }
+        compat::cond_kprobes_enable(ftraces)
+    }
+
+    // Tag lock waiters at wait entry (LWP). These fentry hooks are separate
+    // from the holder ftraces so they can be skipped under --no-lwp-boost.
+    // On the tracepoint-fallback path, the tagging lives in sys_enter_futex
+    // and is gated by the no_lwp_boost BPF variable instead.
+    fn attach_lwp_ftraces(skel: &mut OpenBpfSkel) -> Result<bool> {
+        let ftraces = vec![
+            ("__futex_wait", &skel.progs.fentry___futex_wait),
+            (
+                "futex_wait_multiple",
+                &skel.progs.fentry_futex_wait_multiple,
+            ),
+            (
+                "futex_wait_requeue_pi",
+                &skel.progs.fentry_futex_wait_requeue_pi,
+            ),
+            ("futex_lock_pi", &skel.progs.fentry_futex_lock_pi),
+        ];
 
         compat::cond_kprobes_enable(ftraces)
     }
@@ -724,6 +760,8 @@ impl<'a> Scheduler<'a> {
         bss_data.no_preemption = opts.no_preemption;
         bss_data.no_core_compaction = opts.no_core_compaction;
         bss_data.no_freq_scaling = opts.no_freq_scaling;
+        bss_data.no_futex_boost = opts.no_futex_boost;
+        bss_data.no_lwp_boost = opts.no_lwp_boost;
         bss_data.is_powersave_mode = opts.powersave;
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.nr_llcs = order.nr_llcs as u64;
