@@ -424,6 +424,49 @@ int rtp_sys_exit_futex_wake(struct tp_syscall_exit *ctx)
 	return 0;
 }
 
+/*
+ * SysV semaphores (ipc/sem.c). A blocking down (sem_op < 0) may become a
+ * lock waiter, so tag it at semop entry (LWP). Up/post ops are the waker
+ * side and are not tagged. There is no cheap way to distinguish a binary
+ * from a counting SysV semaphore, so no holder (LHP) boost is applied here.
+ *
+ * __do_semtimedop() is the shared worker for both semop() and semtimedop().
+ * At this point sops is a kernel copy, so its first op is read directly.
+ */
+SEC("?fentry/__do_semtimedop")
+int BPF_PROG(fentry___do_semtimedop, int semid, struct sembuf *sops, unsigned int nsops)
+{
+	if (sops && BPF_CORE_READ(sops, sem_op) < 0)
+		set_lock_waiter();
+	return 0;
+}
+
+/*
+ * Tracepoint fallback. Syscall-enter args are recorded in unsigned-long
+ * slots, so scalar args are declared as `long` to land tsops (args[1]) at
+ * the right offset. tsops is a user pointer here (pre-copy_from_user), so
+ * probe-read the first op's sem_op and tag only on a confirmed down; a
+ * failed read is treated as not-a-waiter (a missed boost is benign, whereas
+ * over-tagging a non-waiter is not).
+ */
+struct tp_syscall_enter_semtimedop {
+	struct trace_entry ent;
+	int __syscall_nr;
+	long semid;
+	struct sembuf __attribute__((btf_type_tag("user"))) * tsops;
+};
+
+SEC("?tracepoint/syscalls/sys_enter_semtimedop")
+int rtp_sys_enter_semtimedop(struct tp_syscall_enter_semtimedop *ctx)
+{
+	short sem_op;
+
+	if (!bpf_probe_read_user(&sem_op, sizeof(sem_op), &ctx->tsops->sem_op) &&
+	    sem_op < 0)
+		set_lock_waiter();
+	return 0;
+}
+
 /**
  * TODO: NTsync driver in recent kernel (when ntsync is fully mainlined)
  * - https://lore.kernel.org/lkml/20240519202454.1192826-28-zfigura@codeweavers.com/
