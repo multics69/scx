@@ -1229,7 +1229,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
-		return;
+		goto lwp_reset_out;
 	}
 	taskc->suggested_cpu_id = cpu;
 	taskc->cpdom_id = cpuc->cpdom_id;
@@ -1251,7 +1251,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	if (enable_cpu_bw && (cgroup_throttled(p, taskc, true) == -EAGAIN)) {
 		debugln("Task %s[pid%d/cgid%llu] is throttled.",
 			p->comm, p->pid, taskc->cgrp_id);
-		return;
+		goto lwp_reset_out;
 	}
 
 	/*
@@ -1279,19 +1279,26 @@ kick_cpu_out:
 	/*
 	 * Kick @cpu if it was claimed idle or is marked idle; a hint
 	 * missed in bypass mode is repaired by the sys_stat resync.
+	 * Otherwise, try to preempt a task -- find and kick a victim CPU
+	 * running a less urgent task.
 	 */
 	if (is_idle || is_cpu_hinted_idle(cpuc)) {
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-		return;
-	}
-
-	/*
-	 * If there is no idle CPU, try to preempt a task. Find and kick a
-	 * victim CPU, which runs a less urgent task.
-	 */
-	if (!no_preemption) {
+	} else if (!no_preemption) {
 		try_find_and_kick_victim_cpu(p, taskc, cpu, cpuc->cpdom_id);
 	}
+
+lwp_reset_out:
+	/*
+	 * Clear the one-shot LWP tag at this single exit of the dispatch path,
+	 * AFTER the preemption attempt above: try_find_and_kick_victim_cpu()
+	 * consults it via is_worth_kick_other_task(), so it must still be set
+	 * during that call. Resetting here (not earlier) makes the lat_cri boost
+	 * and the preemption eligibility fire exactly once per wakeup. Most
+	 * enqueues are not lock-waiter wakeups, so gate the write on the tag.
+	 */
+	if (unlikely(test_task_flag_mask(taskc, LAVD_FLAG_LOCK_WAITER)))
+		reset_task_flag(taskc, LAVD_FLAG_LOCK_WAITER);
 }
 
 static
