@@ -158,6 +158,7 @@ enum consts_flags {
 	LAVD_FLAG_IS_EFFECTIVELY_PINNED	= (0x1 << 16), /* effective cpumask weight is 1 (permanent or migrate-disable) */
 	LAVD_FLAG_WARM_CPU		= (0x1 << 17), /* wait on the previous CPU: enqueue on its per-CPU DSQ */
 	LAVD_FLAG_PREEMPTED		= (0x1 << 18), /* asked to yield via ask_cpu_yield_after(); cleared on next pick_idle_cpu() */
+	LAVD_FLAG_LOCK_WAITER		= (0x1 << 19), /* blocked in a lock/sem wait; boost on wakeup (LWP) */
 };
 
 #define LAVD_MASK_MIGRATION		(LAVD_FLAG_MIGRATION_AGGRESSIVE)
