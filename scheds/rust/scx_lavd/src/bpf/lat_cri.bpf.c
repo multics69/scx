@@ -21,6 +21,8 @@
 static u64 calc_weight_factor(struct task_struct *p, task_ctx *taskc)
 {
 	u64 weight_boost = 1;
+	u64 n = nr_cpus_onln;
+	u64 k = is_migration_disabled(p) ? 1 : taskc->nr_cpus_allowed;
 
 	/*
 	 * Prioritize a wake-up task since this is a clear sign of immediate
@@ -85,19 +87,19 @@ static u64 calc_weight_factor(struct task_struct *p, task_ctx *taskc)
 		weight_boost += LAVD_LC_WEIGHT_BOOST_REGULAR;
 
 	/*
-	 * Prioritize an affinitized task since it has restrictions
-	 * in placement so it tends to be delayed.
+	 * Boost a placement-restricted task in proportion to how few CPUs
+	 * it can run on: the fewer CPUs, the less chance to be picked up
+	 * promptly, so the more its latency criticality is boosted to
+	 * compensate. K == N (unrestricted) -> 0; K == 1 -> ~HIGH.
+	 * migrate_disable is a transient one-CPU pin the cached weight
+	 * cannot observe, so force K = 1.
 	 */
-	if (test_task_flag(taskc, LAVD_FLAG_IS_AFFINITIZED))
-		weight_boost += LAVD_LC_WEIGHT_BOOST_REGULAR;
-
-	/*
-	 * Prioritize an effectively pinned task (permanent pinning or
-	 * migrate_disable) since its restricted placement tends to delay
-	 * it; boost its latency criticality.
-	 */
-	if (is_effectively_pinned(taskc) || is_migration_disabled(p))
-		weight_boost += LAVD_LC_WEIGHT_BOOST_MEDIUM;
+	if (k < 1) {
+		k = 1;
+	}
+	if (k < n) {
+		weight_boost += LAVD_LC_WEIGHT_BOOST_HIGH * (n - k) / n;
+	}
 
 	/*
 	 * Prioritize a lock holder for faster system-wide forward progress.

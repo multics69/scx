@@ -284,6 +284,7 @@ void set_affinity_flags(task_ctx __arg_arena *taskc,
 		return;
 
 	weight = bpf_cpumask_weight(cpumask);
+	taskc->nr_cpus_allowed = weight;
 	is_affinitized = weight != nr_cpu_ids;
 	if (weight == 1)
 		set_task_flag(taskc, LAVD_FLAG_IS_EFFECTIVELY_PINNED);
