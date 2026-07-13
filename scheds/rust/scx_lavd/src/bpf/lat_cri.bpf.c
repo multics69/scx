@@ -108,6 +108,17 @@ static u64 calc_weight_factor(struct task_struct *p, task_ctx *taskc)
 	}
 
 	/*
+	 * Prioritize a woken lock waiter (LWP): it is on the critical path,
+	 * about to receive a lock hand-over, so run it promptly. Symmetric with
+	 * the lock-holder boost above (both ends of the same hand-over). The
+	 * flag is intentionally NOT reset here -- the preemption path in
+	 * lavd_enqueue() also consults it; it is reset at the end of enqueue.
+	 */
+	if (test_task_flag(taskc, LAVD_FLAG_LOCK_WAITER)) {
+		weight_boost += LAVD_LC_WEIGHT_BOOST_REGULAR;
+	}
+
+	/*
 	 * Respect nice priority.
 	 */
 	return p->scx.weight * weight_boost + 1;
