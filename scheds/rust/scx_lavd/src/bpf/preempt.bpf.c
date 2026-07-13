@@ -110,6 +110,15 @@ static bool is_worth_kick_other_task(struct task_struct *p, task_ctx *taskc)
 		return true;
 
 	/*
+	 * A woken lock waiter (LWP) is on the critical path -- about to receive
+	 * a lock hand-over -- so always attempt preemption to run it promptly.
+	 * The actual kick stays throttled by can_x_kick_y() (a genuinely
+	 * less-urgent victim) and the RT/DL guard, so this cannot storm.
+	 */
+	if (test_task_flag(taskc, LAVD_FLAG_LOCK_WAITER))
+		return true;
+
+	/*
 	 * Preemption is not free. It is expensive involving context switching,
 	 * etc. Hence, we first judiciously check whether it is worth trying to
 	 * victimize another CPU as the current task is urgent enough.
