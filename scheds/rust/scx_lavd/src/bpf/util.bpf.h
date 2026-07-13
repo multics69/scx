@@ -14,6 +14,8 @@ extern volatile bool		reinit_cpumask_for_performance;
 extern volatile bool		no_preemption;
 extern volatile bool		no_core_compaction;
 extern volatile bool		no_freq_scaling;
+extern volatile bool		no_futex_boost;
+extern volatile bool		no_lwp_boost;
 
 extern const volatile bool	no_wake_sync;
 extern const volatile bool	no_slice_boost;
