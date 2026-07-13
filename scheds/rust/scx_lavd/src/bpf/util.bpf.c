@@ -40,6 +40,8 @@ volatile bool		no_preemption;
 volatile bool		no_core_compaction;
 volatile bool		ovrflw_counted_active; /* overflow CPUs also counted as active */
 volatile bool		no_freq_scaling;
+volatile bool		no_futex_boost;
+volatile bool		no_lwp_boost;
 
 const volatile bool	no_wake_sync;
 const volatile bool	no_slice_boost;
