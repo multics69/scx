@@ -16,19 +16,22 @@
 
 static void __inc_futex_boost(struct cpu_ctx *cpuc)
 {
-	struct task_struct *p = bpf_get_current_task_btf();
+	struct task_struct *p;
 	task_ctx *taskc;
+
+	if (no_futex_boost)
+		return;
 
 	/*
 	 * These hooks are system-wide, so they also fire for RT and DL
 	 * tasks. sched_ext does not manage those, so they have no task_ctx
 	 * and get_task_ctx() would report the miss as an error.
 	 */
+	p = bpf_get_current_task_btf();
 	if (rt_or_dl_task(p))
 		return;
 
 	taskc = get_task_ctx(p);
-
 	if (taskc) {
 		if (!cpuc)
 			cpuc = get_cpu_ctx();
@@ -45,19 +48,22 @@ static void __inc_futex_boost(struct cpu_ctx *cpuc)
 
 static void __dec_futex_boost(struct cpu_ctx *cpuc)
 {
-	struct task_struct *p = bpf_get_current_task_btf();
+	struct task_struct *p;
 	task_ctx *taskc;
+
+	if (no_futex_boost)
+		return;
 
 	/*
 	 * These hooks are system-wide, so they also fire for RT and DL
 	 * tasks. sched_ext does not manage those, so they have no task_ctx
 	 * and get_task_ctx() would report the miss as an error.
 	 */
+	p = bpf_get_current_task_btf();
 	if (rt_or_dl_task(p))
 		return;
 
 	taskc = get_task_ctx(p);
-
 	if (taskc && test_task_flag(taskc, LAVD_FLAG_FUTEX_BOOST)) {
 		if (!cpuc)
 			cpuc = get_cpu_ctx();
@@ -80,6 +86,30 @@ static void inc_futex_boost(void)
 static void dec_futex_boost(void)
 {
 	__dec_futex_boost(NULL);
+}
+
+/*
+ * Tag the current task as a lock waiter (LWP): set when the task enters a
+ * lock/sem wait, before it blocks. Consumed on wakeup in the enqueue path
+ * (calc_lat_cri() boost + is_worth_kick_other_task() preemption) and cleared
+ * once at the end of lavd_enqueue().
+ */
+static void set_lock_waiter(void)
+{
+	struct task_struct *p;
+	task_ctx *taskc;
+
+	if (no_lwp_boost)
+		return;
+
+	/* System-wide hook: skip RT and DL tasks, which have no task_ctx. */
+	p = bpf_get_current_task_btf();
+	if (rt_or_dl_task(p))
+		return;
+
+	taskc = get_task_ctx(p);
+	if (taskc)
+		set_task_flag(taskc, LAVD_FLAG_LOCK_WAITER);
 }
 
 __hidden
@@ -149,6 +179,39 @@ void reset_lock_futex_boost(task_ctx *taskc, struct cpu_ctx *cpuc)
  */
 struct futex_vector;
 struct hrtimer_sleeper;
+
+/*
+ * Tag the task as a lock waiter (LWP) when it enters a futex wait, before it
+ * blocks -- the wakeup enqueue consumes the tag to boost the woken waiter.
+ * (fexit is too late: it fires only after the task has already been scheduled.)
+ */
+SEC("?fentry/__futex_wait")
+int BPF_PROG(fentry___futex_wait, u32 *uaddr, unsigned int flags, u32 val, struct hrtimer_sleeper *to, u32 bitset)
+{
+	set_lock_waiter();
+	return 0;
+}
+
+SEC("?fentry/futex_wait_multiple")
+int BPF_PROG(fentry_futex_wait_multiple, struct futex_vector *vs, unsigned int count, struct hrtimer_sleeper *to)
+{
+	set_lock_waiter();
+	return 0;
+}
+
+SEC("?fentry/futex_wait_requeue_pi")
+int BPF_PROG(fentry_futex_wait_requeue_pi, u32 *uaddr, unsigned int flags, u32 val, ktime_t *abs_time, u32 bitset, u32 *uaddr2)
+{
+	set_lock_waiter();
+	return 0;
+}
+
+SEC("?fentry/futex_lock_pi")
+int BPF_PROG(fentry_futex_lock_pi, u32 *uaddr, unsigned int flags, ktime_t *time, int trylock)
+{
+	set_lock_waiter();
+	return 0;
+}
 
 SEC("?fexit/__futex_wait")
 int BPF_PROG(fexit___futex_wait, u32 *uaddr, unsigned int flags, u32 val, struct hrtimer_sleeper *to, u32 bitset, int ret)
@@ -295,6 +358,20 @@ int rtp_sys_enter_futex(struct tp_syscall_enter_futex *ctx)
 
 	if (cpuc)
 		cpuc->futex_op = ctx->op;
+
+	/*
+	 * Tag as a lock waiter (LWP) on a wait/lock op, before it may block.
+	 */
+	switch (ctx->op & FUTEX_CMD_MASK) {
+	case FUTEX_WAIT:
+	case FUTEX_WAIT_BITSET:
+	case FUTEX_WAIT_REQUEUE_PI:
+	case FUTEX_LOCK_PI:
+	case FUTEX_LOCK_PI2:
+	case FUTEX_TRYLOCK_PI:
+		set_lock_waiter();
+		break;
+	}
 	return 0;
 }
 
