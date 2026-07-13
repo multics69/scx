@@ -165,6 +165,7 @@ enum consts_flags {
 	LAVD_FLAG_WARM_CPU		= (0x1 << 17), /* wait on the previous CPU: enqueue on its per-CPU DSQ */
 	LAVD_FLAG_QUEUED_ON_LOCAL	= (0x1 << 18), /* this task is queued on a local DSQ, so its service time is in qload_svc_local_invr too */
 	LAVD_FLAG_PREEMPTED		= (0x1 << 19), /* asked to yield via ask_cpu_yield_after(); cleared on next pick_idle_cpu() */
+	LAVD_FLAG_LOCK_WAITER		= (0x1 << 20), /* blocked in a lock/sem wait; boost on wakeup (LWP) */
 };
 
 #define LAVD_MASK_MIGRATION		(LAVD_FLAG_MIGRATION_AGGRESSIVE)
