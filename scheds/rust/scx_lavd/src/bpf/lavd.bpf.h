@@ -207,7 +207,8 @@ struct task_ctx {
 	volatile u32	cpdom_id;		/* chosen compute domain id at ops.enqueue() */
 	volatile u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
-	u32	__pad0;
+	u16	nr_cpus_allowed;	/* cached bpf_cpumask_weight(cpus_ptr) */
+	u16	__pad0;
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
