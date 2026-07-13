@@ -545,6 +545,23 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        // SysV semaphore LWP: tag woken lock waiters (waiter tagging only; no
+        // holder boost, since a binary vs counting semaphore can't be told
+        // apart cheaply). Gated by --no-lwp-boost. Prefer the fentry hook and
+        // fall back to the tracepoint (which is gated by the no_lwp_boost BPF
+        // variable there).
+        if !opts.no_lwp_boost {
+            let ftrace_ok = compat::tracer_available("function")?;
+            if ftrace_ok && Self::attach_sysv_sem_ftrace(&mut skel)? {
+                // Attached via ftrace.
+            } else {
+                info!("SysV sem ftrace unavailable; using tracepoint.");
+                if Self::attach_sysv_sem_tracepoint(&mut skel)? == false {
+                    info!("Fail to attach SysV sem tracepoint.");
+                }
+            }
+        }
+
         // Initialize CPU topology with CLI arguments
         let order = CpuOrder::new(opts.topology.as_ref(), opts.no_use_em).unwrap();
         Self::init_cpus(&mut skel, &order);
@@ -651,6 +668,23 @@ impl<'a> Scheduler<'a> {
                 &skel.progs.rtp_sys_exit_futex_wake,
             ),
         ];
+
+        compat::cond_tracepoints_enable(tracepoints)
+    }
+
+    // Tag SysV-semaphore lock waiters at semop entry (LWP). Separate from the
+    // futex attach so a missing __do_semtimedop symbol can't disable futex.
+    fn attach_sysv_sem_ftrace(skel: &mut OpenBpfSkel) -> Result<bool> {
+        let ftraces = vec![("__do_semtimedop", &skel.progs.fentry___do_semtimedop)];
+
+        compat::cond_kprobes_enable(ftraces)
+    }
+
+    fn attach_sysv_sem_tracepoint(skel: &mut OpenBpfSkel) -> Result<bool> {
+        let tracepoints = vec![(
+            "syscalls:sys_enter_semtimedop",
+            &skel.progs.rtp_sys_enter_semtimedop,
+        )];
 
         compat::cond_tracepoints_enable(tracepoints)
     }
