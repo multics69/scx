@@ -372,6 +372,17 @@ static inline void scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime)
 }
 
 /*
+ * v6.20: New scx_bpf_dsq_reenq() that allows re-enqueues on more DSQs. This
+ * will eventually deprecate scx_bpf_reenqueue_local().
+ */
+void scx_bpf_dsq_reenq___compat(u64 dsq_id, u64 reenq_flags, const struct bpf_prog_aux *aux__prog) __ksym __weak;
+
+static inline bool __COMPAT_has_generic_reenq(void)
+{
+	return bpf_ksym_exists(scx_bpf_dsq_reenq___compat);
+}
+
+/*
  * v6.19: The new void variant can be called from anywhere while the older v1
  * variant can only be called from ops.cpu_release(). The double ___ prefixes on
  * the v2 variant need to be removed once libbpf is updated to ignore ___ prefix
@@ -388,7 +399,9 @@ static inline bool __COMPAT_scx_bpf_reenqueue_local_from_anywhere(void)
 
 static inline void scx_bpf_reenqueue_local(void)
 {
-	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere())
+	if (__COMPAT_has_generic_reenq())
+		scx_bpf_dsq_reenq___compat(SCX_DSQ_LOCAL, 0, NULL);
+	else if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere())
 		scx_bpf_reenqueue_local___v2___compat();
 	else
 		scx_bpf_reenqueue_local___v1();
@@ -396,22 +409,21 @@ static inline void scx_bpf_reenqueue_local(void)
 
 static inline int scx_bpf_reenqueue_local_from_anywhere(void)
 {
+	/*
+	 * The generic reenq kfunc and the v2 reenqueue-local variant can both be
+	 * called from anywhere; v1 cannot. Test each ksym in its own branch with a
+	 * distinct call: combining them with || would fold into a bitwise OR of the
+	 * two ksym addresses, which the verifier rejects.
+	 */
+	if (__COMPAT_has_generic_reenq()) {
+		scx_bpf_dsq_reenq___compat(SCX_DSQ_LOCAL, 0, NULL);
+		return 0;
+	}
 	if (__COMPAT_scx_bpf_reenqueue_local_from_anywhere()) {
 		scx_bpf_reenqueue_local___v2___compat();
 		return 0;
 	}
 	return -ENOTSUP;
-}
-
-/*
- * v6.20: New scx_bpf_dsq_reenq() that allows re-enqueues on more DSQs. This
- * will eventually deprecate scx_bpf_reenqueue_local().
- */
-void scx_bpf_dsq_reenq___compat(u64 dsq_id, u64 reenq_flags, const struct bpf_prog_aux *aux__prog) __ksym __weak;
-
-static inline bool __COMPAT_has_generic_reenq(void)
-{
-	return bpf_ksym_exists(scx_bpf_dsq_reenq___compat);
 }
 
 static inline void scx_bpf_dsq_reenq(u64 dsq_id, u64 reenq_flags)
