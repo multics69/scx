@@ -222,6 +222,14 @@ const volatile u8	mig_delta_pct = 0;
 const volatile u8	no_fast_lb = 0;
 
 /*
+ * Warm-CPU wait budget. When > 0, a waking latency-tolerant task waits up to
+ * this many ns for its previous CPU to free up before migrating to an idle one,
+ * queueing on that CPU's per-CPU DSQ meanwhile. Warm cache and TLB state on the
+ * CPU extend the wait up to 2x. 0 disables. Set via --warm-cpu-us.
+ */
+const volatile u64	warm_cpu_ns = 0;
+
+/*
  * Skip periodic load balancing when average system utilization is below this
  * threshold. The value is pre-scaled by userspace. 0 = disabled.
  * Default: p2s(25) = 256.
@@ -628,6 +636,9 @@ static void update_stat_for_stopping(struct task_struct *p,
 	 */
 	taskc->last_slice_used_wall = time_delta(now, taskc->last_running_clk);
 
+	/* Add this slice to the per-CPU warmth that drives warm-CPU placement. */
+	task_update_cpu_warmth(taskc, cpuc, taskc->last_slice_used_wall, now);
+
 	/*
 	 * Update the current service time if necessary.
 	 */
@@ -898,22 +909,65 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
 	}
+	task_cpu = scx_bpf_task_cpu(p);
+
+	/*
+	 * A reenqueue (SCX_ENQ_REENQ) means the task was already placed once
+	 * but bounced -- a higher-priority class (RT/DL) took the CPU and the
+	 * local DSQ was drained via scx_bpf_reenqueue_local() (from the
+	 * sched_switch hook, or ops.cpu_release on older kernels).
+	 */
+	if (unlikely(enq_flags & SCX_ENQ_REENQ)) {
+		/*
+		 * If the task’s cgroup is throttled, the task should be
+		 * backlogged, and its accounted load should be reverted since
+		 * it is no longer in a DSQ. Otherwise, we enqueue the task.
+		 */
+		if (enable_cpu_bw && (cgroup_throttled(p, taskc, true) == -EAGAIN)) {
+			unaccount_queued_load(taskc);
+			unaccount_queued_load_pcpu(taskc);
+
+			debugln("Task %s[pid%d/cgid%llu] is throttled.",
+				p->comm, p->pid, taskc->cgrp_id);
+			return;
+		}
+
+		/*
+		 * The task has not run since, so its slice, CPU choice, and
+		 * queued-load accounting are still valid -- reuse the cached
+		 * suggested_cpu_id and reinsert into the previously chosen
+		 * cpdom DSQ, never the local DSQ it was just drained from.
+		 */
+		cpu = taskc->suggested_cpu_id;
+		cpuc = get_cpu_ctx_id(cpu);
+		if (!cpuc) {
+			scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
+			return;
+		}
+
+		/*
+		 * Recompute the deadline: the logical clock may have advanced
+		 * while the task was bounced, so reusing the stale (smaller)
+		 * deadline would over-prioritize it. Re-anchor to the current
+		 * clock.
+		 */
+		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+
+		dsq_id = get_target_dsq_id(p, cpuc, taskc);
+		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
+					 p->scx.dsq_vtime, enq_flags);
+		goto kick_cpu_out;
+	}
 
 	/*
 	 * Calculate when a task can be scheduled for how long.
-	 *
-	 * If the task is re-enqueued due to a higher-priority scheduling class
-	 * taking the CPU, we don't need to recalculate the task's deadline and
-	 * timeslice, as the task hasn't yet run.
 	 */
-	if (!(enq_flags & SCX_ENQ_REENQ)) {
-		if (enq_flags & SCX_ENQ_WAKEUP)
-			set_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
-		else
-			reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
+	if (enq_flags & SCX_ENQ_WAKEUP)
+		set_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
+	else
+		reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
 
-		scx_bpf_task_set_dsq_vtime(p, calc_when_to_run(p, taskc));
-	}
+	scx_bpf_task_set_dsq_vtime(p, calc_when_to_run(p, taskc));
 	scx_bpf_task_set_slice(p, LAVD_SLICE_MIN_NS_DFL);
 
 	/*
@@ -935,7 +989,6 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 *    mask and re-enqueues before affine_move_task() migrates -- so it
 	 *    can be outside p->cpus_ptr and must be clamped before use.
 	 */
-	task_cpu = scx_bpf_task_cpu(p);
 	if (likely(!__COMPAT_is_enq_cpu_selected(enq_flags))) {
 		struct pick_ctx ictx = {
 			.p = p,
@@ -1008,8 +1061,18 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
 	if (can_direct_dispatch(cpuc, is_idle)) {
+		reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
 				   enq_flags);
+		account_queued_load_pcpu(taskc, get_primary_cpu(cpu));
+	} else if (test_task_flag(taskc, LAVD_FLAG_WARM_CPU)) {
+		/*
+		 * Only queue on per core DSQ to ensure task doesn't
+		 * migrate away.
+		 */
+		reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
+		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu), p->scx.slice,
+					 p->scx.dsq_vtime, enq_flags);
 		account_queued_load_pcpu(taskc, get_primary_cpu(cpu));
 	} else {
 		dsq_id = get_target_dsq_id(p, cpuc, taskc);
@@ -1020,9 +1083,9 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 	account_queued_load(taskc, cpuc->cpdom_id);
 
+kick_cpu_out:
 	/*
-	 * If a new overflow CPU was assigned while finding a proper DSQ,
-	 * kick the new CPU and go.
+	 * Kick @cpu so an idle CPU picks up the task.
 	 */
 	if (is_idle) {
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
@@ -1037,8 +1100,10 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * In the case of the forced enqueue mode, we don't try preemption
 	 * since it is a batch of bulk enqueues.
 	 */
-	if (!no_preemption)
-		try_find_and_kick_victim_cpu(p, taskc, cpu, cpdom_to_dsq(cpuc->cpdom_id));
+	if (!no_preemption) {
+		try_find_and_kick_victim_cpu(p, taskc, cpu,
+					     cpdom_to_dsq(cpuc->cpdom_id));
+	}
 }
 
 static
@@ -1917,7 +1982,7 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 		 * As an idle task cannot be preempted,
 		 * per-CPU preemption information should be cleared.
 		 */
-		reset_cpu_preemption_info(cpuc, false);
+		reset_cpu_preemption_info(cpuc);
 	}
 	/*
 	 * The CPU is exiting from the idle state.
@@ -1974,53 +2039,42 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 	set_affinity_flags(taskc, cpumask);
 }
 
-void BPF_STRUCT_OPS(lavd_cpu_acquire, s32 cpu,
-		    struct scx_cpu_acquire_args *args)
-{
-	struct cpu_ctx *cpuc;
-
-	cpuc = get_cpu_ctx_id(cpu);
-	if (!cpuc) {
-		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
-		return;
-	}
-
-	/*
-	 * The higher-priority scheduler class could change the CPU frequency,
-	 * so let's keep track of the frequency when we gain the CPU control.
-	 * This helps to make the frequency update decision.
-	 */
-	cpuc->cpuperf_cur = scx_bpf_cpuperf_cur(cpu);
-}
-
 void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
 {
-	struct cpu_ctx *cpuc;
-
-	cpuc = get_cpu_ctx_id(cpu);
-	if (!cpuc) {
-		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
-		return;
-	}
-	cpuc->flags = 0;
-
 	/*
-	 * When a CPU is released to serve higher priority scheduler class,
-	 * reset the CPU's preemption information so it cannot be a victim.
-	 */
-	reset_cpu_preemption_info(cpuc, true);
-
-	/*
-	 * Requeue the tasks in a local DSQ to the global enqueue.
+	 * Requeue tasks stranded on the local DSQ when a higher-priority
+	 * scheduling class takes the CPU, so the BPF scheduler can
+	 * redispatch them. Registered only on kernels where the
+	 * scx_bpf_reenqueue_local() kfunc is restricted to ops.cpu_release
+	 * context and cannot be called from a tracepoint hook. Rust nulls
+	 * this slot out on newer kernels (>= 6.19) where the v2 kfunc lifts
+	 * the restriction and the sched_switch hook takes over.
 	 */
 	scx_bpf_reenqueue_local();
+}
 
+SEC("?tp_btf/sched_switch")
+int BPF_PROG(lavd_sched_switch, bool preempt,
+	     struct task_struct *prev, struct task_struct *next,
+	     unsigned int prev_state)
+{
 	/*
-	 * Reset the current CPU's performance target, so we can set
-	 * the target properly after regaining the control.
+	 * Fire only on fair -> RT/DL transitions. Tasks with
+	 * prio < MAX_RT_PRIO are DL (prio = -1) or RT (prio 0..99);
+	 * fair / idle / SCX tasks have prio >= MAX_RT_PRIO.
+	 *
+	 * Short-circuit evaluation makes next->prio the dominant gate:
+	 * one load + compare rejects ~all context switches (most have
+	 * a fair next). Marked unlikely so the early-return is the hot
+	 * path.
 	 */
-	reset_cpuperf_target(cpuc);
+	if (unlikely(next->prio < MAX_RT_PRIO &&
+		     prev->prio >= MAX_RT_PRIO)) {
+		/* Reenqueue any SCX tasks stranded on the local DSQ. */
+		scx_bpf_reenqueue_local_from_anywhere();
+	}
+	return 0;
 }
 
 void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
@@ -2087,7 +2141,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	 */
 	parent = bpf_task_from_pid(p->real_parent->pid);
 	if (parent && (taskc_parent = get_task_ctx(parent))) {
-		for (i = 0; i < sizeof(*taskc) && can_loop; i++)
+		/* Do not inherit cgroup status. */
+		for (i = 0; i < sizeof(taskc->atq) && can_loop; i++)
+			((char __arena *)taskc)[i] = 0;
+
+		for (i = sizeof(taskc->atq); i < sizeof(*taskc) && can_loop; i++)
 			((char __arena *)taskc)[i] = ((char __arena *)taskc_parent)[i];
 	} else {
 		for (i = 0; i < sizeof(*taskc) && can_loop; i++)
@@ -2108,6 +2166,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	WRITE_ONCE(taskc->queued_on_cpu_id, -1);
 	taskc->pid = p->pid;
 	taskc->cgrp_id = args->cgroup->kn->id;
+
+	/* Per-CPU warmth is task+CPU private -- never inherit it. */
+	taskc->cpu_heat = 0;
+	taskc->last_stopping_clk = scx_bpf_now();
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
@@ -2465,7 +2527,10 @@ static s32 init_per_cpu_ctx(u64 now)
 			continue;
 
 		bpf_for(i, 0, LAVD_CPU_ID_MAX/64) {
-			u64 cpumask = cpdomc->__cpumask[i];
+			u64 cpumask;
+			if ((u32)i * 64 >= nr_cpu_ids)
+				break;
+			cpumask = cpdomc->__cpumask[i];
 			bpf_for(k, 0, 64) {
 				j = cpumask_next_set_bit(&cpumask);
 				if (j < 0)
@@ -2770,7 +2835,6 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .cpu_offline		= (void *)lavd_cpu_offline,
 	       .update_idle		= (void *)lavd_update_idle,
 	       .set_cpumask		= (void *)lavd_set_cpumask,
-	       .cpu_acquire		= (void *)lavd_cpu_acquire,
 	       .cpu_release		= (void *)lavd_cpu_release,
 	       .enable			= (void *)lavd_enable,
 	       .init_task		= (void *)lavd_init_task,
