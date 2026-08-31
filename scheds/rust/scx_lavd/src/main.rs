@@ -253,6 +253,14 @@ struct Opts {
     #[clap(long = "no-ovrflw-extend", action = clap::ArgAction::SetTrue)]
     no_ovrflw_extend: bool,
 
+    /// Never let a turbulent CPU take a task from a steady DSQ that the
+    /// steady/turbulent policy closes to it, even when the CPU would
+    /// otherwise go idle. By default such a DSQ is tried last, after every
+    /// other queue the CPU may consume, in its own domain and when stealing
+    /// from a neighbor.
+    #[clap(long = "no-steady-fallback", action = clap::ArgAction::SetTrue)]
+    no_steady_fallback: bool,
+
     /// Default: --no-pinned-preempt is deactivated (pinned-task
     /// preemption is on). Disable the fast-path that lets an
     /// effectively-pinned task immediately preempt a wider-pinned
@@ -890,6 +898,7 @@ impl<'a> Scheduler<'a> {
         rodata.no_fast_lb = opts.no_fast_lb as u8;
         rodata.no_force_steal_limit = opts.no_force_steal_limit as u8;
         rodata.no_ovrflw_extend = opts.no_ovrflw_extend as u8;
+        rodata.no_steady_fallback = opts.no_steady_fallback as u8;
         rodata.no_pinned_preempt = opts.no_pinned_preempt as u8;
 
         rodata.no_wake_sync = opts.no_wake_sync;
