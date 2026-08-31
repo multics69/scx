@@ -19,6 +19,7 @@
 
 extern const volatile u8	mig_delta_pct;
 extern const volatile u8	no_fast_lb;
+extern const volatile u8	no_steady_fallback;
 extern const volatile u64	lb_low_util_wall;
 
 u64 __attribute__ ((noinline)) calc_mig_delta(u64 avg_load_invr, int nz_qlen,
@@ -450,70 +451,128 @@ u64 __attribute__((noinline)) dsq_peek_task_load(u64 dsq_id)
 	return 0;
 }
 
-u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
+/*
+ * The most loaded per-CPU DSQ of @cpdomc, or -ENOENT. Only meaningful when
+ * tasks on per-CPU DSQs may migrate, i.e. --per-cpu-dsq.
+ */
+static u64 __attribute__((noinline))
+pick_most_loaded_cpu_dsq(struct cpdom_ctx *cpdomc)
 {
-	u64 pick_dsq_id = -ENOENT;
+	int pick_cpu = -ENOENT, cpu, i, j, k;
 	u64 highest_load = 0;
 
-	if (!cpdomc) {
-		scx_bpf_error("Invalid cpdom context");
-		return -ENOENT;
-	}
+	bpf_for(i, 0, LAVD_CPU_ID_MAX/64) {
+		u64 cpumask;
+		if ((u32)i * 64 >= nr_cpu_ids)
+			break;
+		cpumask = cpdomc->__cpumask[i];
+		bpf_for(k, 0, 64) {
+			u64 load;
 
-	/*
-	 * Pick the (per-CPU or per-domain) DSQ in this compute domain
-	 * with the highest RAVG-weighted queued load.
-	 */
-	if (use_cpdom_dsq()) {
-		pick_dsq_id = cpdom_to_dsq(cpdomc->id);
-		if (no_fast_lb)
-			highest_load = scx_bpf_dsq_nr_queued(pick_dsq_id);
-		else
-			highest_load = READ_ONCE(cpdomc->qload_invr);
-	}
-
-	/*
-	 * When tasks on a per-CPU DSQ are not migratable
-	 * (e.g., pinned_slice_ns is on but per_cpu_dsq is not),
-	 * there is no need to check per-CPU DSQs.
-	 */
-	if (is_per_cpu_dsq_migratable()) {
-		int pick_cpu = -ENOENT, cpu, i, j, k;
-
-		bpf_for(i, 0, LAVD_CPU_ID_MAX/64) {
-			u64 cpumask;
-			if ((u32)i * 64 >= nr_cpu_ids)
+			j = cpumask_next_set_bit(&cpumask);
+			if (j < 0)
 				break;
-			cpumask = cpdomc->__cpumask[i];
-			bpf_for(k, 0, 64) {
-				u64 load;
+			cpu = (i * 64) + j;
+			if (cpu >= nr_cpu_ids)
+				break;
 
-				j = cpumask_next_set_bit(&cpumask);
-				if (j < 0)
-					break;
-				cpu = (i * 64) + j;
-				if (cpu >= nr_cpu_ids)
-					break;
-
-				if (no_fast_lb) {
-					load = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
-					       scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
-				} else {
-					struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
-					load = cpuc ? READ_ONCE(cpuc->qload_invr) : 0;
-				}
-				if (load > highest_load) {
-					highest_load = load;
-					pick_cpu = cpu;
-				}
+			if (no_fast_lb) {
+				load = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
+				       scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
+			} else {
+				struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+				load = cpuc ? READ_ONCE(cpuc->qload_invr) : 0;
+			}
+			if (load > highest_load) {
+				highest_load = load;
+				pick_cpu = cpu;
 			}
 		}
-
-		if (pick_cpu != -ENOENT)
-			pick_dsq_id = cpu_to_dsq(pick_cpu);
 	}
 
-	return pick_dsq_id;
+	return pick_cpu >= 0 ? cpu_to_dsq(pick_cpu) : -ENOENT;
+}
+
+/*
+ * Rank the DSQs of @cpdomc this CPU may consume, lowest head-task vtime
+ * first, into @dsqs[3]. An entry with vtime U64_MAX is not to be consumed:
+ * the DSQ is empty, unused, or the steady DSQ is closed to this CPU by
+ * can_consume_steady_dsq(). @cpu_dsq_id is this CPU's own per-CPU DSQ when
+ * consuming its own domain; pass -ENOENT when stealing, and the domain's
+ * most loaded per-CPU DSQ stands in if tasks there may migrate.
+ *
+ * @work_conserving turns the steady gate from a skip into a last resort: a
+ * steady DSQ the gate would close is ranked after every other entry, so it
+ * is tried only when nothing else yields a task. A turbulent CPU is a poor
+ * home for a latency-critical task, but idling beside one is worse.
+ * --no-steady-fallback keeps the gate a skip.
+ *
+ * The order is a preference, not a verdict: the kernel skips tasks this CPU
+ * cannot run, so the DSQ with the earliest head may yield nothing. Callers
+ * try the entries in order.
+ */
+static void rank_dsqs(struct cpdom_ctx *cpdomc, s64 cpu_dsq_id,
+		      struct dsq_entry *dsqs, bool work_conserving)
+{
+	u64 steady = cpdom_to_dsq(cpdomc->id);
+	u64 turb = cpdom_to_turb_dsq(cpdomc->id);
+	u64 steady_vtime = U64_MAX;
+
+	if (use_cpdom_dsq()) {
+		if (can_consume_steady_dsq(cpdomc)) {
+			steady_vtime = peek_dsq_vtime(steady);
+		} else if (work_conserving && !no_steady_fallback &&
+			   peek_dsq_vtime(steady) != U64_MAX) {
+			steady_vtime = U64_MAX - 1;
+		}
+	}
+
+	if (cpu_dsq_id < 0 && is_per_cpu_dsq_migratable())
+		cpu_dsq_id = pick_most_loaded_cpu_dsq(cpdomc);
+
+	dsqs[0] = (struct dsq_entry){
+			cpu_dsq_id,
+			(cpu_dsq_id >= 0 && use_per_cpu_dsq()) ?
+				peek_dsq_vtime(cpu_dsq_id) : U64_MAX };
+	dsqs[1] = (struct dsq_entry){ steady, steady_vtime };
+	dsqs[2] = (struct dsq_entry){
+			turb,
+			use_cpdom_dsq() ? peek_dsq_vtime(turb) : U64_MAX };
+
+	sort_dsqs(&dsqs[0], &dsqs[1], &dsqs[2]);
+}
+
+/*
+ * Steal a task from @victim onto this CPU, trying its DSQs in preference
+ * order; @work_conserving as for rank_dsqs(). Returns the head load of the
+ * DSQ consumed from, peeked just before the consume, or -ENOENT if nothing
+ * was stolen. The load is a hint for the budgets: another CPU may take the
+ * head first, or the task consumed may not be the head, and the next LB
+ * round recomputes the budgets anyway.
+ *
+ * A global subprogram, so the verifier checks it once rather than on every
+ * iteration of the callers' neighbor loops.
+ */
+s64 __attribute__((noinline)) steal_from(struct cpdom_ctx *victim,
+					 bool work_conserving)
+{
+	struct dsq_entry dsqs[3];
+	u64 task_load = 0;
+	int i;
+
+	if (!victim)
+		return -ENOENT;
+
+	rank_dsqs(victim, -ENOENT, dsqs, work_conserving);
+	for (i = 0; i < 3; i++) {
+		if (dsqs[i].vtime == U64_MAX)
+			continue;
+		if (!no_fast_lb)
+			task_load = dsq_peek_task_load(dsqs[i].dsq_id);
+		if (consume_dsq(victim, dsqs[i].dsq_id))
+			return task_load;
+	}
+	return -ENOENT;
 }
 
 static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
@@ -543,7 +602,7 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 		 * Traverse neighbors in the same distance in circular distance order.
 		 */
 		for (int j = 0; j < LAVD_CPDOM_MAX_NR; j++) {
-			u64 dsq_id;
+			s64 task_load;
 			if (j >= nr_nbr)
 				break;
 
@@ -563,34 +622,6 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			if (READ_ONCE(cpdomc_pick->stealee_budget_invr) <= 0)
 				continue;
 
-			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
-
-			/*
-			 * No DSQ in cpdomc_pick has any queued load.
-			 * Move on to the next neighbor rather than passing
-			 * -ENOENT to dsq_peek_task_load() / consume_dsq(),
-			 * which would abort the scheduler.
-			 */
-			if ((s64)dsq_id < 0)
-				continue;
-
-			/*
-			 * Peek at the head task to get its size for budget
-			 * accounting. Skip the peek when no_fast_lb is set
-			 * since the budget path below is bypassed and the
-			 * value would be unused.
-			 *
-			 * TOCTOU: the task peeked here may not be the one
-			 * actually consumed by consume_dsq() below. To be more
-			 * specific, another CPU may grab the head first, or the
-			 * task may become ineligible during the window between
-			 * the peek and the consume_dsq. The budget is just a
-			 * hint, and over-debiting will be self-corrected
-			 * because the next LB round recomputes budgets from
-			 * scratch.
-			 */
-			u64 task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
-
 			/*
 			 * On success, decrement both egress and ingress
 			 * budgets. The stealer stays active for the
@@ -598,7 +629,8 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			 * is_stealee/is_stealer flags via the decrement
 			 * helpers.
 			 */
-			if (consume_dsq(cpdomc_pick, dsq_id)) {
+			task_load = steal_from(cpdomc_pick, false);
+			if (task_load >= 0) {
 				if (no_fast_lb) {
 					WRITE_ONCE(cpdomc_pick->is_stealee, false);
 					WRITE_ONCE(cpdomc->is_stealer, false);
@@ -646,7 +678,7 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 		 * Traverse neighbors in the same distance in circular distance order.
 		 */
 		for (int j = 0; j < LAVD_CPDOM_MAX_NR; j++) {
-			u64 dsq_id;
+			s64 task_load;
 			if (j >= nr_nbr)
 				break;
 
@@ -663,28 +695,14 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			if (!cpdomc_pick->is_valid)
 				continue;
 
-			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
-			/*
-			 * Same defensive check as the try_to_steal_task
-			 * path above.
-			 */
-			if ((s64)dsq_id < 0)
-				continue;
-
-			/*
-			 * Peek at the head task to get its size. Skip the
-			 * peek when no_fast_lb is set since the budget
-			 * accounting below is bypassed and the value would
-			 * be unused.
-			 */
-			u64 task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
-
 			/*
 			 * Force steal is unconditional for work
-			 * conservation. Decrement budgets to keep
-			 * the accounting consistent.
+			 * conservation, so the steady gate is lifted.
+			 * Decrement budgets to keep the accounting
+			 * consistent.
 			 */
-			if (consume_dsq(cpdomc_pick, dsq_id)) {
+			task_load = steal_from(cpdomc_pick, true);
+			if (task_load >= 0) {
 				if (!no_fast_lb) {
 					decrement_stealee_budget(cpdomc_pick, task_load);
 					decrement_stealer_budget(cpdomc, task_load);
@@ -705,7 +723,6 @@ bool consume_task(u64 cpdom_id)
 {
 	struct cpdom_ctx *cpdomc;
 	struct cpu_ctx *cpuc;
-	u64 cpu_dsq_id, cpdom_dsq_id, cpdom_turb_dsq_id;
 	struct dsq_entry dsqs[3];
 	int i;
 
@@ -720,10 +737,6 @@ bool consume_task(u64 cpdom_id)
 		return false;
 	}
 
-	cpu_dsq_id        = cpu_to_dsq(cpuc->cpu_id);
-	cpdom_dsq_id      = cpdom_to_dsq(cpdom_id);
-	cpdom_turb_dsq_id = cpdom_to_turb_dsq(cpdom_id);
-
 	/*
 	 * If the current compute domain is a stealer, try to steal
 	 * a task from any of stealee domains probabilistically.
@@ -733,28 +746,12 @@ bool consume_task(u64 cpdom_id)
 		goto x_domain_migration_out;
 
 	/*
-	 * Collect the DSQs this CPU may consume and take them in
-	 * lowest-vtime-first order. Each entry is seeded with its head-task
-	 * vtime, or U64_MAX when this CPU should not consume it (sorts last
-	 * and is skipped). can_consume_steady_dsq() gates the steady cpdom
-	 * DSQ on the steady/turbulent policy.
+	 * Consume this domain's DSQs in preference order; an entry with
+	 * vtime U64_MAX is skipped. Work conserving: a steady DSQ the gate
+	 * closes is still tried, after everything else, rather than idle
+	 * beside it.
 	 */
-	dsqs[0] = (struct dsq_entry){
-			cpu_dsq_id,
-			use_per_cpu_dsq() ?
-				peek_dsq_vtime(cpu_dsq_id) : U64_MAX };
-	dsqs[1] = (struct dsq_entry){
-			cpdom_dsq_id,
-			(use_cpdom_dsq() && can_consume_steady_dsq(cpdomc)) ?
-				peek_dsq_vtime(cpdom_dsq_id) : U64_MAX };
-	dsqs[2] = (struct dsq_entry){
-			cpdom_turb_dsq_id,
-			use_cpdom_dsq() ?
-				peek_dsq_vtime(cpdom_turb_dsq_id) : U64_MAX };
-
-	sort_dsqs(&dsqs[0], &dsqs[1], &dsqs[2]);
-
-	/* Consume in lowest-vtime-first order; U64_MAX vtime marks skip. */
+	rank_dsqs(cpdomc, cpu_to_dsq(cpuc->cpu_id), dsqs, true);
 	for (i = 0; i < 3; i++) {
 		if (dsqs[i].vtime != U64_MAX &&
 		    consume_dsq(cpdomc, dsqs[i].dsq_id)) {
