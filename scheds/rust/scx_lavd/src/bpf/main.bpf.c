@@ -225,6 +225,10 @@ const volatile u8	no_fast_lb = 0;
  * set via --no-ovrflw-extend. */
 const volatile u8	no_ovrflw_extend;
 
+/* Never let a turbulent CPU take from a steady DSQ the steady gate closes,
+ * even when it would otherwise idle; set via --no-steady-fallback. */
+const volatile u8	no_steady_fallback;
+
 /* Disable the pinned-task preemption fast path;
  * set via --no-pinned-preempt. */
 const volatile u8	no_pinned_preempt;
