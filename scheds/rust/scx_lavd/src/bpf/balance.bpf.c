@@ -295,11 +295,31 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 	 * with the highest RAVG-weighted queued load.
 	 */
 	if (use_cpdom_dsq()) {
-		pick_dsq_id = cpdom_to_dsq(cpdomc->id);
-		if (no_fast_lb)
+		if (no_fast_lb) {
+			pick_dsq_id = cpdom_to_dsq(cpdomc->id);
 			highest_load = scx_bpf_dsq_nr_queued(pick_dsq_id);
-		else
+		} else {
+			/*
+			 * Pick the steal target across both cpdom DSQs. When
+			 * this CPU can consume the steady DSQ, treat the two as
+			 * one logical DSQ and steal the lower-vtime head task
+			 * (on a tie, the steady DSQ, which holds the more
+			 * latency-critical tasks); otherwise stick to the
+			 * turbulent DSQ. This mirrors consume_task()'s
+			 * dispatch-side policy.
+			 */
+			u64 dsq_steady = cpdom_to_dsq(cpdomc->id);
+			u64 dsq_turb = cpdom_to_turb_dsq(cpdomc->id);
+
+			if (can_consume_steady_dsq(cpdomc)) {
+				u64 t_steady = peek_dsq_vtime(dsq_steady);
+				u64 t_turb = peek_dsq_vtime(dsq_turb);
+				pick_dsq_id = (t_steady <= t_turb) ? dsq_steady : dsq_turb;
+			} else {
+				pick_dsq_id = dsq_turb;
+			}
 			highest_load = READ_ONCE(cpdomc->qload_invr);
+		}
 	}
 
 	/*
