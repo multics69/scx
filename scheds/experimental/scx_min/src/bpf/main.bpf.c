@@ -79,10 +79,17 @@ void BPF_STRUCT_OPS(min_stopping, struct task_struct *p, bool runnable)
 		return;
 
 	runtime = bpf_ktime_get_ns() - taskc->running_at;
+	/*
+	 * p->prio is 100 to 139 for normal tasks, 120 + nice, where a lower
+	 * value means a higher priority. 120 is nice 0, whose runtime stays
+	 * as is. A higher-priority task's runtime counts for less and a
+	 * lower-priority task's for more.
+	 */
+	runtime = runtime * p->prio / 120;
 	taskc->avg_runtime = (taskc->avg_runtime / 2) + (runtime / 2);
 
-	bpf_printk("%s:%d: %s[%d] runtime=%llu avg_runtime=%llu", __func__, __LINE__,
-		   p->comm, p->pid, runtime, taskc->avg_runtime);
+	bpf_printk("%s:%d: %s[%d] prio=%d runtime=%llu avg_runtime=%llu", __func__, __LINE__,
+		   p->comm, p->pid, p->prio, runtime, taskc->avg_runtime);
 }
 
 s32 BPF_STRUCT_OPS(min_init_task, struct task_struct *p,
