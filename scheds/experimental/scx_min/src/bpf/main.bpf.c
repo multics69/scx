@@ -22,11 +22,19 @@ struct {
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
 
+#define min(x, y) (((x) < (y)) ? (x) : (y))
+
 void BPF_STRUCT_OPS(min_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	struct task_ctx *taskc;
 	u64 vtime = bpf_ktime_get_ns();
 
-	bpf_printk("%s:%d: %s[%d]", __func__, __LINE__, p->comm, p->pid);
+	taskc = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
+	if (taskc) {
+		vtime = (vtime & ~0xFFF) + min(taskc->avg_runtime / 4000, 0xFFF);
+	}
+
+	bpf_printk("%s:%d: %s[%d] -- %llu", __func__, __LINE__, p->comm, p->pid, vtime);
 	scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime, enq_flags);
 }
 
