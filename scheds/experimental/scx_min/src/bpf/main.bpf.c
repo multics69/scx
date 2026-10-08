@@ -11,6 +11,7 @@ UEI_DEFINE(uei);
 #define SHARED_DSQ 0
 
 struct task_ctx {
+	u64 running_at;
 	u64 avg_runtime;
 };
 
@@ -33,6 +34,35 @@ void BPF_STRUCT_OPS(min_dispatch, s32 cpu, struct task_struct *prev)
 {
 	bpf_printk("%s:%d", __func__, __LINE__);
 	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
+}
+
+void BPF_STRUCT_OPS(min_running, struct task_struct *p)
+{
+	struct task_ctx *taskc;
+
+	bpf_printk("%s:%d: %s[%d]", __func__, __LINE__, p->comm, p->pid);
+
+	taskc = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
+	if (!taskc)
+		return;
+
+	taskc->running_at = bpf_ktime_get_ns();
+}
+
+void BPF_STRUCT_OPS(min_stopping, struct task_struct *p, bool runnable)
+{
+	struct task_ctx *taskc;
+	u64 runtime;
+
+	taskc = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
+	if (!taskc)
+		return;
+
+	runtime = bpf_ktime_get_ns() - taskc->running_at;
+	taskc->avg_runtime = (taskc->avg_runtime / 2) + (runtime / 2);
+
+	bpf_printk("%s:%d: %s[%d] runtime=%llu avg_runtime=%llu", __func__, __LINE__,
+		   p->comm, p->pid, runtime, taskc->avg_runtime);
 }
 
 s32 BPF_STRUCT_OPS(min_init_task, struct task_struct *p,
@@ -62,6 +92,8 @@ void BPF_STRUCT_OPS(min_exit, struct scx_exit_info *ei)
 SCX_OPS_DEFINE(min_ops,
 	       .enqueue			= (void *)min_enqueue,
 	       .dispatch		= (void *)min_dispatch,
+	       .running			= (void *)min_running,
+	       .stopping		= (void *)min_stopping,
 	       .init_task		= (void *)min_init_task,
 	       .init			= (void *)min_init,
 	       .exit			= (void *)min_exit,
