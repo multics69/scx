@@ -12,8 +12,10 @@ UEI_DEFINE(uei);
 
 void BPF_STRUCT_OPS(min_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	u64 vtime = bpf_ktime_get_ns();
+
 	bpf_printk("%s:%d: %s[%d]", __func__, __LINE__, p->comm, p->pid);
-	scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+	scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime, enq_flags);
 }
 
 void BPF_STRUCT_OPS(min_dispatch, s32 cpu, struct task_struct *prev)
