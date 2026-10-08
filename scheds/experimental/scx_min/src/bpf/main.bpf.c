@@ -24,6 +24,14 @@ struct {
 
 #define min(x, y) (((x) < (y)) ? (x) : (y))
 
+s32 BPF_STRUCT_OPS(min_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+	bool is_idle = false;
+
+	bpf_printk("%s:%d: %s[%d]", __func__, __LINE__, p->comm, p->pid);
+	return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+}
+
 void BPF_STRUCT_OPS(min_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *taskc;
@@ -31,7 +39,11 @@ void BPF_STRUCT_OPS(min_enqueue, struct task_struct *p, u64 enq_flags)
 
 	taskc = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 	if (taskc) {
-		vtime = (vtime & ~0xFFF) + min(taskc->avg_runtime / 4000, 0xFFF);
+		u64 runtime = taskc->avg_runtime;
+
+		if (enq_flags & SCX_ENQ_WAKEUP)
+			runtime /= 2;
+		vtime = (vtime & ~0xFFF) + min(runtime / 4000, 0xFFF);
 	}
 
 	bpf_printk("%s:%d: %s[%d] -- %llu", __func__, __LINE__, p->comm, p->pid, vtime);
@@ -98,6 +110,7 @@ void BPF_STRUCT_OPS(min_exit, struct scx_exit_info *ei)
 }
 
 SCX_OPS_DEFINE(min_ops,
+	       .select_cpu		= (void *)min_select_cpu,
 	       .enqueue			= (void *)min_enqueue,
 	       .dispatch		= (void *)min_dispatch,
 	       .running			= (void *)min_running,
