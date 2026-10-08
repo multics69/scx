@@ -16,6 +16,12 @@ void BPF_STRUCT_OPS(min_enqueue, struct task_struct *p, u64 enq_flags)
 	scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
 }
 
+void BPF_STRUCT_OPS(min_dispatch, s32 cpu, struct task_struct *prev)
+{
+	bpf_printk("%s:%d", __func__, __LINE__);
+	scx_bpf_dsq_move_to_local(SHARED_DSQ, 0);
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(min_init)
 {
 	bpf_printk("%s:%d", __func__, __LINE__);
@@ -30,6 +36,7 @@ void BPF_STRUCT_OPS(min_exit, struct scx_exit_info *ei)
 
 SCX_OPS_DEFINE(min_ops,
 	       .enqueue			= (void *)min_enqueue,
+	       .dispatch		= (void *)min_dispatch,
 	       .init			= (void *)min_init,
 	       .exit			= (void *)min_exit,
 	       .timeout_ms		= 5000,
