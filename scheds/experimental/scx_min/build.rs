@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// Copyright (c) 2026 Changwoo Min <changwoo@igalia.com>
+
+// This software may be used and distributed according to the terms of the
+// GNU General Public License version 2.
+
+fn main() {
+    scx_cargo::BpfBuilder::new()
+        .unwrap()
+        .enable_skel("src/bpf/main.bpf.c", "bpf")
+        .build()
+        .unwrap();
+}
