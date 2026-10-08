@@ -89,6 +89,7 @@ cargo build --profile=release-tiny -p scx_flash
 | `scx_lavd`     | `cargo build --release -p scx_lavd` |
 | `scx_layered`  | `cargo build --release -p scx_layered` |
 | `scx_mitosis`  | `cargo build --release -p scx_mitosis` |
+| `scx_min`      | `cargo build --release -p scx_min` |
 | `scx_p2dq`     | `cargo build --release -p scx_p2dq` |
 | `scx_pandemonium` | `cargo build --release -p scx_pandemonium` |
 | `scx_rlfifo`   | `cargo build --release -p scx_rlfifo` |
