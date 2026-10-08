@@ -10,6 +10,8 @@ UEI_DEFINE(uei);
 
 #define SHARED_DSQ 0
 
+s64 nr_queued;
+
 struct task_ctx {
 	u64 running_at;
 	u64 avg_runtime;
@@ -23,6 +25,7 @@ struct {
 } task_ctx_stor SEC(".maps");
 
 #define min(x, y) (((x) < (y)) ? (x) : (y))
+#define max(x, y) (((x) > (y)) ? (x) : (y))
 
 s32 BPF_STRUCT_OPS(min_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
@@ -36,6 +39,8 @@ void BPF_STRUCT_OPS(min_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *taskc;
 	u64 vtime = bpf_ktime_get_ns();
+	s64 nr;
+	u64 slice;
 
 	taskc = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 	if (taskc) {
@@ -46,8 +51,14 @@ void BPF_STRUCT_OPS(min_enqueue, struct task_struct *p, u64 enq_flags)
 		vtime = (vtime & ~0xFFF) + min(runtime / 4000, 0xFFF);
 	}
 
-	bpf_printk("%s:%d: %s[%d] -- %llu", __func__, __LINE__, p->comm, p->pid, vtime);
-	scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime, enq_flags);
+	nr = __sync_fetch_and_add(&nr_queued, 1) + 1;
+	if (nr < 1)
+		nr = 1;
+	slice = max(SCX_SLICE_DFL / nr, 1);
+
+	bpf_printk("%s:%d: %s[%d] -- %llu nr_queued=%lld slice=%llu", __func__, __LINE__,
+		   p->comm, p->pid, vtime, nr, slice);
+	scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice, vtime, enq_flags);
 }
 
 void BPF_STRUCT_OPS(min_dispatch, s32 cpu, struct task_struct *prev)
@@ -61,6 +72,8 @@ void BPF_STRUCT_OPS(min_running, struct task_struct *p)
 	struct task_ctx *taskc;
 
 	bpf_printk("%s:%d: %s[%d]", __func__, __LINE__, p->comm, p->pid);
+
+	__sync_fetch_and_sub(&nr_queued, 1);
 
 	taskc = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 	if (!taskc)
