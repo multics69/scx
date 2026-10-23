@@ -162,7 +162,7 @@ rbnode_t *rbnode_least_upper_bound(rbnode_t *subtree, uint64_t key)
 		return NULL;
 
 	while (can_loop) {
-		dir = (key <= node->key) ? 0 : 1;
+		dir = (key < node->key) ? 0 : 1;
 
 		if (!node->child[dir])
 			break;
@@ -299,8 +299,8 @@ int rb_node_insert(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 	}
 
 	node->parent = parent;
-	/* Also works if key == parent->key. */
-	if (key <= parent->key)
+	/* An equal key goes right, after the existing ones. */
+	if (key < parent->key)
 		parent->left = node;
 	else
 		parent->right = node;

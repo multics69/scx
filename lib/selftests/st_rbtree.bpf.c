@@ -698,6 +698,58 @@ __weak int scx_selftest_rbtree_least_pop(rbtree_t __arg_arena *rbtree)
 	return 0;
 }
 
+#define FIFO_NR_NODES	64
+#define FIFO_NR_KEYS	4
+
+static rbnode_t *fifo_nodes[FIFO_NR_NODES];
+
+/*
+ * Nodes with equal keys must pop in insertion order. Interleave a few keys
+ * so that the equal keys get rotated around while the tree grows.
+ */
+__weak int scx_selftest_rbtree_duplicate_fifo(rbtree_t __arg_arena *rbtree)
+{
+	const u64 per_key = FIFO_NR_NODES / FIFO_NR_KEYS;
+	u64 key, value;
+	rbnode_t *node;
+	int ret, i;
+
+	if (!rbtree)
+		return 1;
+
+	bpf_for(i, 0, FIFO_NR_NODES) {
+		node = rb_node_alloc(rbtree, i % FIFO_NR_KEYS, i);
+		if (!node)
+			return 2;
+
+		fifo_nodes[i] = node;
+
+		ret = rb_insert_node(rbtree, node);
+		if (ret)
+			return 3;
+	}
+
+	bpf_for(i, 0, FIFO_NR_NODES) {
+		ret = rb_pop(rbtree, &key, &value);
+		if (ret)
+			return 4;
+
+		/* All of key 0 in insertion order, then all of key 1, ... */
+		if (key != i / per_key)
+			return 5;
+
+		if (value != key + FIFO_NR_KEYS * (i % per_key))
+			return 6;
+
+		if (value >= FIFO_NR_NODES)
+			return 7;
+
+		rb_node_free(rbtree, fifo_nodes[value]);
+	}
+
+	return 0;
+}
+
 __weak int scx_selftest_rbtree_alloc_check(rbtree_t __arg_arena *rbtree)
 {
 	rbtree_t *alloc, *noalloc;
@@ -771,7 +823,7 @@ __weak int scx_selftest_rbtree_print(rbtree_t __arg_arena *rbtree)
 __weak
 int scx_selftest_rbtree(void)
 {
-	rbtree_t *standard, *update, *duplicate, *noalloc;
+	rbtree_t *standard, *update, *duplicate, *noalloc, *fifo;
 
 	standard = rb_create(RB_ALLOC, RB_DEFAULT);
 	if (!standard)
@@ -789,12 +841,17 @@ int scx_selftest_rbtree(void)
 	if (!standard)
 		return -ENOMEM;
 
+	fifo = rb_create(RB_NOALLOC, RB_DUPLICATE);
+	if (!fifo)
+		return -ENOMEM;
+
 	SCX_RBTREE_SELFTEST(find_nonexistent, standard);
 	SCX_RBTREE_SELFTEST(insert_one, update);
 	SCX_RBTREE_SELFTEST(print, update);
 	SCX_RBTREE_SELFTEST(insert_existing, standard);
 	SCX_RBTREE_SELFTEST(update_existing, update);
 	SCX_RBTREE_SELFTEST(duplicate, duplicate);
+	SCX_RBTREE_SELFTEST(duplicate_fifo, fifo);
 	SCX_RBTREE_SELFTEST(insert_ten, update);
 	SCX_RBTREE_SELFTEST(insert_many, update);
 	SCX_RBTREE_SELFTEST(insert_many, noalloc);
