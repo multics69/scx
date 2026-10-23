@@ -96,6 +96,7 @@ static int ctq_st_order(struct task_struct *p)
 		res = ctq_consume(q, 0);
 		if (!res || res->picked != want || res->reports[0])
 			return 6;
+		ctq_task_running(want);
 
 		if (want->ctq || ctq_nr_queued(q) != CTQ_ST_NR_NODES - 1 - i)
 			return 7;
@@ -139,6 +140,7 @@ static int ctq_st_reports(struct task_struct *p)
 	if (!res || res->picked != c || res->reports[0] != a ||
 	    res->reports[1] != b || res->reports[2])
 		return 3;
+	ctq_task_running(c);
 
 	/* Already reported: nothing to take and nothing new to report. */
 	res = ctq_consume(q, 0);
@@ -165,9 +167,11 @@ static int ctq_st_reports(struct task_struct *p)
 	res = ctq_consume(q, 1);
 	if (!res || res->picked != a || res->reports[0])
 		return 10;
+	ctq_task_running(a);
 	res = ctq_consume(q, 1);
 	if (!res || res->picked != b || res->reports[0])
 		return 11;
+	ctq_task_running(b);
 
 	/* More restricted tasks than a consume reports: the rest come next. */
 	bpf_for(i, 0, CTQ_MAX_REPORTS + 2) {
@@ -231,7 +235,9 @@ static int ctq_st_affinity(struct task_struct *p)
 		if (!res || (res->picked == n) != allowed)
 			return 3;
 
-		if (!allowed && ctq_remove(n))
+		if (allowed)
+			ctq_task_running(n);
+		else if (ctq_remove(n))
 			return 4;
 	}
 
@@ -249,6 +255,53 @@ static int ctq_st_affinity(struct task_struct *p)
 	res = ctq_consume(q, 0);
 	if (!res || res->picked != n)
 		return 7;
+	ctq_task_running(n);
+
+	return 0;
+}
+
+/*
+ * A consumed task is DISPATCHING until the consuming CPU's round ends, and an
+ * insert in between is refused, as for a dequeue and re-enqueue that race the
+ * dispatch. ops.running() ends the round too.
+ */
+static int ctq_st_dispatching(struct task_struct *p)
+{
+	const struct ctq_consume_res __arena *res;
+	struct ctq_node __arena *n = ctq_st_nodes[0];
+	struct ctq __arena *q;
+
+	q = ctq_st_alloc();
+	if (!q)
+		return 1;
+
+	if (ctq_insert(q, p, n, 0))
+		return 2;
+	ctq_st_any(n);
+
+	res = ctq_consume(q, 0);
+	if (!res || res->picked != n || !ctq_task_dispatching(n))
+		return 3;
+
+	if (ctq_remove(n))
+		return 4;
+	if (ctq_insert(q, p, n, 0) != CTQ_ERR_INSERT_BYPASS || n->ctq ||
+	    ctq_nr_queued(q))
+		return 5;
+
+	if (!ctq_task_dispatching(n))
+		return 6;
+	ctq_cpu_flushed();
+	if (ctq_task_dispatching(n) || ctq_insert(q, p, n, 0))
+		return 7;
+	ctq_st_any(n);
+
+	res = ctq_consume(q, 0);
+	if (!res || res->picked != n || !ctq_task_dispatching(n))
+		return 8;
+	ctq_task_running(n);
+	if (ctq_task_dispatching(n) || ctq_nr_queued(q))
+		return 9;
 
 	return 0;
 }
@@ -285,8 +338,14 @@ int scx_selftest_ctq(void)
 	}
 
 	ret = ctq_st_affinity(p);
-	if (ret)
+	if (ret) {
 		bpf_printk("SELFTEST ctq_st_affinity FAIL: %d", ret);
+		goto out;
+	}
+
+	ret = ctq_st_dispatching(p);
+	if (ret)
+		bpf_printk("SELFTEST ctq_st_dispatching FAIL: %d", ret);
 out:
 	bpf_task_release(p);
 	return ret;
