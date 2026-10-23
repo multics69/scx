@@ -48,6 +48,9 @@ int arena_selftest(void)
 	SELFTEST_RUN(SCX_SELFTEST_ID_TOPOLOGY,
 		     scx_selftest_topology,
 		     "scx_selftest_topology");
+	SELFTEST_RUN(SCX_SELFTEST_ID_CTQ,
+		     scx_selftest_ctq,
+		     "scx_selftest_ctq");
 
 	bpf_printk("Selftests successful.");
 

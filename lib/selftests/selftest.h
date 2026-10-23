@@ -25,6 +25,7 @@ enum scx_selftest_id {
 	SCX_SELFTEST_ID_MINHEAP			= 4,
 	SCX_SELFTEST_ID_RBTREE			= 5,
 	SCX_SELFTEST_ID_TOPOLOGY		= 6,
+	SCX_SELFTEST_ID_CTQ			= 7,
 };
 
 #define SCX_SELFTEST(func, ...)		\
@@ -52,6 +53,7 @@ int scx_selftest_atq(void);
 int scx_selftest_dhq(void);
 int scx_selftest_bitmap(void);
 int scx_selftest_btree(void);
+int scx_selftest_ctq(void);
 int scx_selftest_lvqueue(void);
 int scx_selftest_minheap(void);
 int scx_selftest_rbtree(void);
