@@ -834,9 +834,8 @@ impl<'a> Scheduler<'a> {
         }
 
         // Use ops.update_idle() instead of builtin idle tracking.
-        skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
-            | *compat::SCX_OPS_ENQ_LAST
-            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
+        skel.struct_ops.lavd_ops_mut().flags =
+            *compat::SCX_OPS_ENQ_LAST | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
 
         if opts.partial {
             skel.struct_ops.lavd_ops_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
