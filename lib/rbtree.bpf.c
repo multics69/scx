@@ -152,8 +152,14 @@ rbnode_t *rbnode_find(rbnode_t *subtree, u64 key)
 	return node;
 }
 
+/*
+ * Find the node to link @key under. Smaller keys go left and everything else
+ * right, so a new key lands after every node with an equal key and equal keys
+ * stay in insertion order. Rotations and removals preserve the in-order
+ * sequence, so they keep that order too.
+ */
 static
-rbnode_t *rbnode_least_upper_bound(rbnode_t *subtree, uint64_t key)
+rbnode_t *rbnode_insert_parent(rbnode_t *subtree, uint64_t key)
 {
 	rbnode_t *node = subtree;
 	int dir;
@@ -162,7 +168,7 @@ rbnode_t *rbnode_least_upper_bound(rbnode_t *subtree, uint64_t key)
 		return NULL;
 
 	while (can_loop) {
-		dir = (key <= node->key) ? 0 : 1;
+		dir = (key < node->key) ? 0 : 1;
 
 		if (!node->child[dir])
 			break;
@@ -274,7 +280,7 @@ int rb_node_insert(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 	if (rbtree->insert != RB_DUPLICATE)
 		parent = rbnode_find(parent, key);
 	else
-		parent = rbnode_least_upper_bound(parent, key);
+		parent = rbnode_insert_parent(parent, key);
 
 	if (key == parent->key && rbtree->insert != RB_DUPLICATE) {
 		if (rbtree->insert == RB_UPDATE) {
@@ -299,8 +305,8 @@ int rb_node_insert(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 	}
 
 	node->parent = parent;
-	/* Also works if key == parent->key. */
-	if (key <= parent->key)
+	/* An equal key goes right, after the existing ones. */
+	if (key < parent->key)
 		parent->left = node;
 	else
 		parent->right = node;
