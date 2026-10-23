@@ -90,6 +90,8 @@ int rb_insert_node(rbtree_t *rbtree, rbnode_t *node);
 int rb_remove_node(rbtree_t *rbtree, rbnode_t *node);
 u64 rb_node_alloc_internal(rbtree_t *rbtree, u64 key, u64 value);
 #define rb_node_alloc(rbtree, key, value) ((rbnode_t *)rb_node_alloc_internal((rbtree), (key), (value)))
+u64 rb_next_internal(rbnode_t *node);
+#define rb_next(node) ((rbnode_t *)rb_next_internal((node)))
 int rb_node_free(rbtree_t *rbtree, rbnode_t *rbnode);
 
 int rb_integrity_check(rbtree_t *rbtree);
