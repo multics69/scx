@@ -65,6 +65,7 @@ enum SelfTestId {
     SCX_SELFTEST_ID_MINHEAP = 4,
     SCX_SELFTEST_ID_RBTREE = 5,
     SCX_SELFTEST_ID_TOPOLOGY = 6,
+    SCX_SELFTEST_ID_CTQ = 7,
 }
 
 fn available_tests() -> String {
@@ -82,6 +83,7 @@ const TEST_CASES: &[(&str, u32)] = &[
     ("minheap", SelfTestId::SCX_SELFTEST_ID_MINHEAP as u32),
     ("rbtree", SelfTestId::SCX_SELFTEST_ID_RBTREE as u32),
     ("topology", SelfTestId::SCX_SELFTEST_ID_TOPOLOGY as u32),
+    ("ctq", SelfTestId::SCX_SELFTEST_ID_CTQ as u32),
 ];
 
 #[derive(Debug, Parser)]
