@@ -833,8 +833,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
-            | *compat::SCX_OPS_ENQ_LAST
+        skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_LAST
             | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
             | *compat::SCX_OPS_KEEP_BUILTIN_IDLE;
 
