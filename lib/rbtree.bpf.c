@@ -422,6 +422,25 @@ __weak int rb_least(rbtree_t __arg_arena *rbtree, u64 *key, u64 *value)
 	return 0;
 }
 
+/*
+ * Return the in-order successor of @node, or NULL if @node is the last one.
+ * Walking from the leftmost node with it visits the tree in key order, equal
+ * keys in insertion order. Call it under the writer's lock.
+ */
+__weak
+u64 rb_next_internal(rbnode_t __arg_arena *node)
+{
+	rbnode_t *parent;
+
+	if (node->right)
+		return (u64)rbnode_least(node->right);
+
+	/* Climb until we leave a left subtree; its parent comes next. */
+	while ((parent = node->parent) && node == parent->right && can_loop)
+		node = parent;
+
+	return (u64)parent;
+}
 
 /*
  * If we are referencing ourselves, a and b have a parent-child relation,
