@@ -30,8 +30,12 @@ int scx_rb_init(void)
 {
 	int ret;
 
-	/* Initialize slab allocators for rbtree_t and rbnode_t. */
-	ret = scx_alloc_init(&scx_rbtree_allocator, sizeof(rbtree_t), 8);
+	/*
+	 * Initialize slab allocators for rbtree_t and rbnode_t. Align trees to a
+	 * cache line so that their lockless fields get one of their own.
+	 */
+	ret = scx_alloc_init(&scx_rbtree_allocator, sizeof(rbtree_t),
+			     SCX_CACHELINE_SIZE);
 	if (ret)
 		return ret;
 
@@ -39,19 +43,40 @@ int scx_rb_init(void)
 	return scx_alloc_init(&scx_rbnode_allocator, sizeof(rbnode_t), 8);
 }
 
+__weak
+int rb_init(rbtree_t __arg_arena *rbtree, enum rbtree_alloc alloc,
+	    enum rbtree_insert_mode insert)
+{
+	WRITE_ONCE(rbtree->root, NULL);
+	WRITE_ONCE(rbtree->freelist, NULL);
+	WRITE_ONCE(rbtree->alloc, alloc);
+	WRITE_ONCE(rbtree->insert, insert);
+	WRITE_ONCE(rbtree->first, NULL);
+	WRITE_ONCE(rbtree->nr, 0);
+
+	return 0;
+}
+
 u64 rb_create_internal(enum rbtree_alloc alloc, enum rbtree_insert_mode insert)
 {
 	rbtree_t *rbtree;
 
-	/* Note that scx_alloc() returns a zero-initialized memory. */
 	rbtree = scx_alloc(&scx_rbtree_allocator);
 	if (unlikely(!rbtree))
 		return (u64)(NULL);
 
-	rbtree->alloc = alloc;
-	rbtree->insert = insert;
+	rb_init(rbtree, alloc, insert);
 
 	return (u64)rbtree;
+}
+
+/*
+ * Publish a new leftmost node with release ordering, so a lockless reader that
+ * sees it also sees the node's fields.
+ */
+static __always_inline void rb_set_first(rbtree_t *rbtree, rbnode_t *node)
+{
+	smp_store_release(&rbtree->first, node);
 }
 
 __weak
@@ -274,6 +299,8 @@ int rb_node_insert(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 
 	if (!parent) {
 		rbtree->root = node;
+		rb_set_first(rbtree, node);
+		WRITE_ONCE(rbtree->nr, 1);
 		return 0;
 	}
 
@@ -293,6 +320,10 @@ int rb_node_insert(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 			if (ret)
 				return ret;
 
+			/* Same key and place, so only the head's identity changes. */
+			if (rbtree->first == parent)
+				rb_set_first(rbtree, node);
+
 			/* Only free if called from rb_insert_node. */
 			if (rbtree->alloc == RB_ALLOC)
 				rb_node_free(rbtree, parent);
@@ -310,6 +341,14 @@ int rb_node_insert(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 		parent->left = node;
 	else
 		parent->right = node;
+
+	/*
+	 * The node is the new head only if it went left of the old one. The
+	 * rotations below never change which node is leftmost.
+	 */
+	if (parent == rbtree->first && parent->left == node)
+		rb_set_first(rbtree, node);
+	WRITE_ONCE(rbtree->nr, rbtree->nr + 1);
 
 	while (can_loop) {
 		parent = node->parent;
@@ -419,7 +458,7 @@ __weak int rb_least(rbtree_t __arg_arena *rbtree, u64 *key, u64 *value)
 	if (!rbtree->root)
 		return -ENOENT;
 
-	least = rbnode_least(rbtree->root);
+	least = rbtree->first;
 	if (key)
 		*key = least->key;
 	if (value)
@@ -578,7 +617,7 @@ static inline bool rbnode_has_red_children(rbnode_t *node)
 }
 
 static __attribute__((always_inline))
-int rb_node_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, bool free)
+int rbnode_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, bool free)
 {
 	rbnode_t *parent, *sibling, *close_nephew, *distant_nephew;
 	rbnode_t *replace, *initial;
@@ -757,6 +796,34 @@ int rb_node_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, boo
 	return 0;
 }
 
+/*
+ * Remove @node and keep the head and the node count current. The head has no
+ * left child, so if it is the node going away, its successor is the leftmost
+ * node of its right subtree, or else its parent. Take it before the tree
+ * changes; the removal and its fixups preserve the in-order sequence.
+ */
+static __attribute__((always_inline))
+int rb_node_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, bool free)
+{
+	rbnode_t *next = NULL;
+	bool was_first;
+	int ret;
+
+	was_first = node == rbtree->first;
+	if (was_first)
+		next = node->right ? rbnode_least(node->right) : node->parent;
+
+	ret = rbnode_remove(rbtree, node, free);
+	if (ret)
+		return ret;
+
+	if (was_first)
+		rb_set_first(rbtree, next);
+	WRITE_ONCE(rbtree->nr, rbtree->nr - 1);
+
+	return 0;
+}
+
 __weak
 int rb_remove_node(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 {
@@ -801,7 +868,7 @@ int rb_pop(rbtree_t __arg_arena *rbtree, u64 *key, u64 *value)
 	if (!rbtree->root)
 		return -ENOENT;
 
-	node = rbnode_least(rbtree->root);
+	node = rbtree->first;
 	if (unlikely(!node))
 		return -ENOENT;
 
