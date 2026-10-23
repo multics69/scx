@@ -39,28 +39,84 @@ int scx_rb_init(void)
 	return scx_alloc_init(&scx_rbnode_allocator, sizeof(rbnode_t), 8);
 }
 
+__weak
+int rb_init(rbtree_t __arg_arena *rbtree, enum rbtree_alloc alloc,
+	    enum rbtree_insert_mode insert)
+{
+	if (unlikely(!rbtree))
+		return -EINVAL;
+
+	/*
+	 * RB_UPDATE overwrites existing values in the nodes, but RB_NOALLOC
+	 * trees manage the tree nodes directly (including holding pointers
+	 * to them). Disallow mixing the two modes to avoid dealing with
+	 * unintuitive semantics.
+	 */
+	if (alloc == RB_NOALLOC && insert == RB_UPDATE) {
+		bpf_printk("WARNING: Cannot combine RB_NOALLOC and RB_UPDATE");
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(rbtree->root, NULL);
+	WRITE_ONCE(rbtree->freelist, NULL);
+	WRITE_ONCE(rbtree->alloc, alloc);
+	WRITE_ONCE(rbtree->insert, insert);
+	WRITE_ONCE(rbtree->first, NULL);
+	WRITE_ONCE(rbtree->nr, 0);
+
+	return 0;
+}
+
 u64 rb_create_internal(enum rbtree_alloc alloc, enum rbtree_insert_mode insert)
 {
 	rbtree_t *rbtree;
 
-	/* Note that scx_alloc() returns a zero-initialized memory. */
 	rbtree = scx_alloc(&scx_rbtree_allocator);
 	if (unlikely(!rbtree))
 		return (u64)(NULL);
 
-	rbtree->alloc = alloc;
-	rbtree->insert = insert;
+	if (rb_init(rbtree, alloc, insert)) {
+		scx_free(&scx_rbtree_allocator, rbtree);
+		return (u64)(NULL);
+	}
 
 	return (u64)rbtree;
 }
 
+static void rb_set_first(rbtree_t *rbtree, rbnode_t *node)
+{
+	/*
+	 * Publish the new leftmost node with release ordering, so a lockless
+	 * reader that sees it also sees the node's fields.
+	 */
+	smp_store_release(&rbtree->first, node);
+}
+
 __weak
-int rb_destroy(rbtree_t __arg_arena *rbtree)
+int rb_fini(rbtree_t __arg_arena *rbtree)
 {
 	rbnode_t *node, *next;
 	int ret;
 
 	scx_arena_subprog_init();
+
+	if (unlikely(!rbtree))
+		return -EINVAL;
+
+	if (rbtree->alloc == RB_NOALLOC) {
+		/*
+		 * We cannot do anything about RB_NOALLOC nodes. The whole
+		 * point of RB_NOALLOC is that the nodes are directly owned
+		 * by the caller that allocates and inserts them. We could
+		 * unilaterally grab all nodes and free them anyway, but that
+		 * would almost certainly cause UAF as the callers keep accessing
+		 * the now freed nodes. Throw an error instead.
+		 */
+		if (rbtree->root) {
+			bpf_printk("WARNING: Finalizing RB_NOALLOC tree with > 0 nodes");
+			return -EBUSY;
+		}
+	}
 
 	while (rbtree->root && can_loop) {
 		ret = rb_remove(rbtree, rbtree->root->key);
@@ -74,6 +130,19 @@ int rb_destroy(rbtree_t __arg_arena *rbtree)
 		scx_free(&scx_rbnode_allocator, node);
 		node = next;
 	}
+	WRITE_ONCE(rbtree->freelist, NULL);
+
+	return 0;
+}
+
+__weak
+int rb_destroy(rbtree_t __arg_arena *rbtree)
+{
+	int ret;
+
+	ret = rb_fini(rbtree);
+	if (ret)
+		return ret;
 
 	scx_free(&scx_rbtree_allocator, rbtree);
 	return 0;
@@ -268,6 +337,8 @@ int rb_node_insert(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 
 	if (!parent) {
 		rbtree->root = node;
+		rb_set_first(rbtree, node);
+		WRITE_ONCE(rbtree->nr, 1);
 		return 0;
 	}
 
@@ -287,6 +358,10 @@ int rb_node_insert(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 			if (ret)
 				return ret;
 
+			/* Same key and place, so only the head's identity changes. */
+			if (rbtree->first == parent)
+				rb_set_first(rbtree, node);
+
 			/* Only free if called from rb_insert_node. */
 			if (rbtree->alloc == RB_ALLOC)
 				rb_node_free(rbtree, parent);
@@ -304,6 +379,14 @@ int rb_node_insert(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node)
 		parent->left = node;
 	else
 		parent->right = node;
+
+	/*
+	 * The node is the new head only if it went left of the old one. The
+	 * rotations below never change which node is leftmost.
+	 */
+	if (parent == rbtree->first && parent->left == node)
+		rb_set_first(rbtree, node);
+	WRITE_ONCE(rbtree->nr, rbtree->nr + 1);
 
 	while (can_loop) {
 		parent = node->parent;
@@ -413,7 +496,7 @@ __weak int rb_least(rbtree_t __arg_arena *rbtree, u64 *key, u64 *value)
 	if (!rbtree->root)
 		return -ENOENT;
 
-	least = rbnode_least(rbtree->root);
+	least = rbtree->first;
 	if (key)
 		*key = least->key;
 	if (value)
@@ -597,6 +680,15 @@ int rb_node_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, boo
 	rbnode_t *replace, *initial;
 	bool is_red;
 	int dir;
+
+	/*
+	 * Hand the head to its successor before the tree changes. The removal
+	 * frees @node in an RB_ALLOC tree, so the head must not point to it
+	 * by then.
+	 */
+	if (rbtree->first == node)
+		rb_set_first(rbtree, rb_next(node));
+	WRITE_ONCE(rbtree->nr, rbtree->nr - 1);
 
 	/* Both children present, replace with next largest key. */
 	if (node->left && node->right) {
@@ -814,7 +906,7 @@ int rb_pop(rbtree_t __arg_arena *rbtree, u64 *key, u64 *value)
 	if (!rbtree->root)
 		return -ENOENT;
 
-	node = rbnode_least(rbtree->root);
+	node = rbtree->first;
 	if (unlikely(!node))
 		return -ENOENT;
 
