@@ -68,6 +68,14 @@ struct rbtree {
 	rbnode_t *freelist;
 	enum rbtree_alloc alloc;
 	enum rbtree_insert_mode insert;
+
+	/*
+	 * The leftmost node and the node count. The writer keeps them current,
+	 * and readers may read them without the writer's lock (see rb_first()
+	 * and friends).
+	 */
+	rbnode_t *first;
+	uint64_t nr;
 };
 
 typedef struct rbtree __arena rbtree_t;
@@ -77,6 +85,15 @@ int scx_rb_init(void);
 #ifdef __BPF__
 u64 rb_create_internal(enum rbtree_alloc alloc, enum rbtree_insert_mode insert);
 #define rb_create(alloc, insert) ((rbtree_t *)rb_create_internal((alloc), (insert)))
+
+/*
+ * Initialize and finalize a tree embedded in another arena object. rb_fini()
+ * frees the nodes of an RB_ALLOC tree and fails with -EBUSY on a non-empty
+ * RB_NOALLOC tree. It leaves the tree's memory to its owner.
+ */
+int rb_init(rbtree_t __arg_arena *rbtree, enum rbtree_alloc alloc,
+	    enum rbtree_insert_mode insert);
+int rb_fini(rbtree_t __arg_arena *rbtree);
 
 int rb_destroy(rbtree_t __arg_arena *rbtree);
 int rb_insert(rbtree_t *rbtree, u64 key, u64 value);
@@ -93,5 +110,35 @@ u64 rb_node_alloc_internal(rbtree_t *rbtree, u64 key, u64 value);
 int rb_node_free(rbtree_t *rbtree, rbnode_t *rbnode);
 
 int rb_integrity_check(rbtree_t *rbtree);
+
+/*
+ * Lockless reads of the head and the node count. They need not be called
+ * under the writer's lock, so they are advisory: the tree may change before
+ * the caller acts on the result. The node rb_first() returns may have
+ * left the tree, or been freed in an RB_ALLOC tree, by the time the
+ * caller reads it. The count is a separate read and need not agree
+ * with the head.
+ */
+static __always_inline rbnode_t *rb_first(rbtree_t *rbtree)
+{
+	return READ_ONCE(rbtree->first);
+}
+
+/* -ENOENT if the tree is empty, 0 with the leftmost key in @key otherwise. */
+static __always_inline int rb_first_key(rbtree_t *rbtree, u64 *key)
+{
+	rbnode_t *first = READ_ONCE(rbtree->first);
+
+	if (!first)
+		return -ENOENT;
+
+	*key = READ_ONCE(first->key);
+	return 0;
+}
+
+static __always_inline u64 rb_nr_nodes(rbtree_t *rbtree)
+{
+	return READ_ONCE(rbtree->nr);
+}
 
 #endif /* __BPF__ */
