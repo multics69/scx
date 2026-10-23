@@ -27,7 +27,6 @@ struct scx_atq {
 	rbtree_t *tree;
 	arena_spinlock_t lock;
 	u64 capacity;
-	u64 size;
 	u64 seq;
 	u64 fifo;
 };
