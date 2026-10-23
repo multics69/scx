@@ -118,6 +118,29 @@ int rb_node_free(rbtree_t *rbtree, rbnode_t *rbnode);
 int rb_integrity_check(rbtree_t *rbtree);
 
 /*
+ * Return the in-order successor of @node, or NULL if @node is the last one.
+ * Walking from rb_first() with it visits the tree in key order, equal keys in
+ * insertion order. Call it under the writer's lock.
+ */
+static __always_inline rbnode_t *rb_next(rbnode_t *node)
+{
+	rbnode_t *parent;
+
+	if (node->right) {
+		node = node->right;
+		while (node->left && can_loop)
+			node = node->left;
+		return node;
+	}
+
+	/* Climb until we leave a left subtree; its parent comes next. */
+	while ((parent = node->parent) && node == parent->right && can_loop)
+		node = parent;
+
+	return parent;
+}
+
+/*
  * Lockless reads of the head and the node count. They need not be called
  * under the writer's lock, so they are advisory: the tree may change before
  * the caller acts on the result. The node rb_first() returns may have
