@@ -841,9 +841,15 @@ impl<'a> Scheduler<'a> {
         }
 
         // Use ops.update_idle() instead of builtin idle tracking.
-        skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
-            | *compat::SCX_OPS_ENQ_LAST
-            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
+        skel.struct_ops.lavd_ops_mut().flags =
+            *compat::SCX_OPS_ENQ_LAST | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
+
+        // An exiting task's pid can be unhashed while the task is still
+        // enqueued, so only a tid lookup finds it reliably. Without
+        // SCX_OPS_TID_TO_TASK, leave exiting tasks to the kernel.
+        if *compat::SCX_OPS_TID_TO_TASK != 0 {
+            skel.struct_ops.lavd_ops_mut().flags |= *compat::SCX_OPS_ENQ_EXITING;
+        }
 
         if opts.partial {
             skel.struct_ops.lavd_ops_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
