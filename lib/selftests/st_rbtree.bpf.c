@@ -750,6 +750,223 @@ __weak int scx_selftest_rbtree_duplicate_fifo(rbtree_t __arg_arena *rbtree)
 	return 0;
 }
 
+/*
+ * Check the lockless head and count against a walk to the leftmost node,
+ * which does not use the cached head.
+ */
+static __always_inline int check_first(rbtree_t *rbtree, u64 nr)
+{
+	rbnode_t *least = rbtree->root;
+	u64 key;
+
+	while (least && least->left && can_loop)
+		least = least->left;
+
+	if (rb_first(rbtree) != least)
+		return 1;
+
+	if (rb_nr_nodes(rbtree) != nr)
+		return 2;
+
+	if (!least)
+		return rb_first_key(rbtree, &key) == -ENOENT ? 0 : 3;
+
+	if (rb_first_key(rbtree, &key) || key != least->key)
+		return 4;
+
+	return 0;
+}
+
+#define FIRST_NR_NODES	64
+
+static rbnode_t *first_nodes[FIRST_NR_NODES];
+
+/*
+ * The cached head and count must follow every insert and removal: a new
+ * head, an equal key landing after the head, removal of the head and of
+ * other nodes, and popping the tree empty.
+ */
+__weak int scx_selftest_rbtree_first(rbtree_t __arg_arena *rbtree)
+{
+	u64 seed = 12345, nr = 0;
+	rbnode_t *node;
+	int ret, i;
+
+	if (!rbtree)
+		return 1;
+
+	ret = check_first(rbtree, 0);
+	if (ret)
+		return 10 + ret;
+
+	/* Pseudo-random keys with repeats, so the head moves and gets ties. */
+	bpf_for(i, 0, FIRST_NR_NODES) {
+		seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+		node = rb_node_alloc(rbtree, (seed >> 33) % 32, i);
+		if (!node)
+			return 2;
+
+		first_nodes[i] = node;
+
+		ret = rb_insert_node(rbtree, node);
+		if (ret)
+			return 3;
+
+		ret = check_first(rbtree, ++nr);
+		if (ret)
+			return 20 + ret;
+	}
+
+	/* Remove every other node in insertion order, head or not. */
+	bpf_for(i, 0, FIRST_NR_NODES) {
+		if (i & 1)
+			continue;
+
+		ret = rb_remove_node(rbtree, first_nodes[i]);
+		if (ret)
+			return 4;
+
+		rb_node_free(rbtree, first_nodes[i]);
+
+		ret = check_first(rbtree, --nr);
+		if (ret)
+			return 30 + ret;
+	}
+
+	/* Pop the rest, which always removes the head. */
+	bpf_for(i, 0, FIRST_NR_NODES / 2) {
+		node = rb_first(rbtree);
+		if (!node)
+			return 5;
+
+		ret = rb_pop(rbtree, NULL, NULL);
+		if (ret)
+			return 6;
+
+		rb_node_free(rbtree, node);
+
+		ret = check_first(rbtree, --nr);
+		if (ret)
+			return 40 + ret;
+	}
+
+	return 0;
+}
+
+/*
+ * An RB_UPDATE insert replaces the node of an existing key in place. If that
+ * node is the head, the head must become the replacement.
+ */
+__weak int scx_selftest_rbtree_first_update(rbtree_t __arg_arena *rbtree)
+{
+	rbnode_t *node;
+	int ret;
+
+	if (!rbtree)
+		return 1;
+
+	if (rb_insert(rbtree, 5, 1))
+		return 2;
+
+	if (rb_insert(rbtree, 5, 2))
+		return 3;
+
+	node = rb_first(rbtree);
+	if (!node || node->key != 5 || node->value != 2)
+		return 4;
+
+	ret = check_first(rbtree, 1);
+	if (ret)
+		return 10 + ret;
+
+	if (rb_insert(rbtree, 3, 3))
+		return 5;
+
+	ret = check_first(rbtree, 2);
+	if (ret)
+		return 20 + ret;
+
+	if (rb_remove(rbtree, 3) || rb_remove(rbtree, 5))
+		return 6;
+
+	ret = check_first(rbtree, 0);
+	if (ret)
+		return 30 + ret;
+
+	return 0;
+}
+
+struct rb_embed {
+	u64 pad;
+	struct rbtree tree;
+};
+
+/*
+ * rb_init() must set up a tree embedded in another object, whatever the
+ * memory held before, and rb_fini() must refuse it while it holds nodes.
+ */
+__weak int scx_selftest_rbtree_embedded(void)
+{
+	struct rb_embed __arena *embed;
+	rbtree_t *rbtree;
+	rbnode_t *node;
+	int ret, i;
+
+	embed = scx_static_alloc(sizeof(*embed), SCX_CACHELINE_SIZE);
+	if (!embed)
+		return 1;
+
+	rbtree = &embed->tree;
+
+	/* Poison the fields rb_init() must set. */
+	WRITE_ONCE(rbtree->root, (rbnode_t *)~0ULL);
+	WRITE_ONCE(rbtree->first, (rbnode_t *)~0ULL);
+	WRITE_ONCE(rbtree->nr, ~0ULL);
+
+	if (rb_init(rbtree, RB_NOALLOC, RB_DUPLICATE))
+		return 2;
+
+	ret = check_first(rbtree, 0);
+	if (ret)
+		return 10 + ret;
+
+	bpf_for(i, 0, 4) {
+		node = rb_node_alloc(rbtree, 4 - i, i);
+		if (!node)
+			return 3;
+
+		if (rb_insert_node(rbtree, node))
+			return 4;
+
+		ret = check_first(rbtree, i + 1);
+		if (ret)
+			return 20 + ret;
+	}
+
+	if (rb_fini(rbtree) != -EBUSY)
+		return 7;
+
+	bpf_for(i, 0, 4) {
+		node = rb_first(rbtree);
+		if (!node || node->key != i + 1)
+			return 5;
+
+		if (rb_pop(rbtree, NULL, NULL))
+			return 6;
+
+		rb_node_free(rbtree, node);
+
+		ret = check_first(rbtree, 3 - i);
+		if (ret)
+			return 30 + ret;
+	}
+
+	if (rb_fini(rbtree))
+		return 8;
+
+	return 0;
+}
+
 __weak int scx_selftest_rbtree_alloc_check(rbtree_t __arg_arena *rbtree)
 {
 	rbtree_t *alloc, *noalloc;
@@ -823,7 +1040,8 @@ __weak int scx_selftest_rbtree_print(rbtree_t __arg_arena *rbtree)
 __weak
 int scx_selftest_rbtree(void)
 {
-	rbtree_t *standard, *update, *duplicate, *noalloc, *fifo;
+	rbtree_t *standard, *update, *duplicate, *noalloc, *fifo, *first;
+	rbtree_t *first_update;
 
 	standard = rb_create(RB_ALLOC, RB_DEFAULT);
 	if (!standard)
@@ -845,6 +1063,14 @@ int scx_selftest_rbtree(void)
 	if (!fifo)
 		return -ENOMEM;
 
+	first = rb_create(RB_NOALLOC, RB_DUPLICATE);
+	if (!first)
+		return -ENOMEM;
+
+	first_update = rb_create(RB_ALLOC, RB_UPDATE);
+	if (!first_update)
+		return -ENOMEM;
+
 	SCX_RBTREE_SELFTEST(find_nonexistent, standard);
 	SCX_RBTREE_SELFTEST(insert_one, update);
 	SCX_RBTREE_SELFTEST(print, update);
@@ -852,6 +1078,9 @@ int scx_selftest_rbtree(void)
 	SCX_RBTREE_SELFTEST(update_existing, update);
 	SCX_RBTREE_SELFTEST(duplicate, duplicate);
 	SCX_RBTREE_SELFTEST(duplicate_fifo, fifo);
+	SCX_RBTREE_SELFTEST(first, first);
+	SCX_RBTREE_SELFTEST(first_update, first_update);
+	SCX_SELFTEST(scx_selftest_rbtree_embedded);
 	SCX_RBTREE_SELFTEST(insert_ten, update);
 	SCX_RBTREE_SELFTEST(insert_many, update);
 	SCX_RBTREE_SELFTEST(insert_many, noalloc);
