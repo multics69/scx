@@ -59,7 +59,7 @@ int scx_atq_insert_vtime_unlocked(scx_atq_t __arg_arena *atq, scx_task_common __
 	scx_atq_t *old_atq;
 	int ret;
 
-	if (unlikely(atq->size == atq->capacity))
+	if (unlikely(rb_nr_nodes(atq->tree) == atq->capacity))
 		return -ENOSPC;
 
 	if ((vtime == SCX_ATQ_FIFO) != atq->fifo)
@@ -89,8 +89,6 @@ int scx_atq_insert_vtime_unlocked(scx_atq_t __arg_arena *atq, scx_task_common __
 		taskc->atq = NULL;
 		return ret;
 	}
-
-	atq->size += 1;
 
 	return 0;
 }
@@ -148,8 +146,6 @@ int scx_atq_remove_internal(scx_atq_t *atq, scx_task_common __arg_arena *taskc,
 
 	taskc->atq = dead ? (scx_atq_t *)SCX_ATQ_DEAD : NULL;
 
-	atq->size -= 1;
-
 	return 0;
 }
 
@@ -196,8 +192,6 @@ u64 scx_atq_pop(scx_atq_t *atq, bool hold)
 		return (u64)NULL;
 	}
 
-	atq->size -= 1;
-
 	taskc = (scx_task_common *)taskc_ptr;
 	if (hold)
 		scx_atq_task_hold(taskc);
@@ -231,7 +225,7 @@ u64 scx_atq_peek(scx_atq_t *atq)
 __hidden
 int scx_atq_nr_queued(scx_atq_t *atq)
 {
-	return atq->size;
+	return rb_nr_nodes(atq->tree);
 }
 
 /*
