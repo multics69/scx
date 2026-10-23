@@ -750,6 +750,69 @@ __weak int scx_selftest_rbtree_duplicate_fifo(rbtree_t __arg_arena *rbtree)
 	return 0;
 }
 
+#define NEXT_NR_NODES	64
+
+static rbnode_t *next_nodes[NEXT_NR_NODES];
+
+/*
+ * Walking from the leftmost node with rb_next() must visit every node once,
+ * in the order rb_pop() removes them.
+ */
+__weak int scx_selftest_rbtree_next(rbtree_t __arg_arena *rbtree)
+{
+	u64 seed = 54321, value;
+	rbnode_t *node;
+	int ret, i;
+
+	if (!rbtree)
+		return 1;
+
+	if (rbtree->root)
+		return 2;
+
+	/* Pseudo-random keys with repeats, so the walk crosses equal keys. */
+	bpf_for(i, 0, NEXT_NR_NODES) {
+		seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+		node = rb_node_alloc(rbtree, (seed >> 33) % 16, i);
+		if (!node)
+			return 3;
+
+		ret = rb_insert_node(rbtree, node);
+		if (ret)
+			return 4;
+	}
+
+	node = rbtree->root;
+	while (node->left && can_loop)
+		node = node->left;
+
+	bpf_for(i, 0, NEXT_NR_NODES) {
+		if (!node)
+			return 5;
+
+		next_nodes[i] = node;
+		node = rb_next(node);
+	}
+
+	if (node)
+		return 6;
+
+	bpf_for(i, 0, NEXT_NR_NODES) {
+		node = next_nodes[i];
+
+		ret = rb_pop(rbtree, NULL, &value);
+		if (ret)
+			return 7;
+
+		if (value != node->value)
+			return 8;
+
+		rb_node_free(rbtree, node);
+	}
+
+	return 0;
+}
+
 __weak int scx_selftest_rbtree_alloc_check(rbtree_t __arg_arena *rbtree)
 {
 	rbtree_t *alloc, *noalloc;
@@ -823,7 +886,7 @@ __weak int scx_selftest_rbtree_print(rbtree_t __arg_arena *rbtree)
 __weak
 int scx_selftest_rbtree(void)
 {
-	rbtree_t *standard, *update, *duplicate, *noalloc, *fifo;
+	rbtree_t *standard, *update, *duplicate, *noalloc, *fifo, *next;
 
 	standard = rb_create(RB_ALLOC, RB_DEFAULT);
 	if (!standard)
@@ -845,6 +908,10 @@ int scx_selftest_rbtree(void)
 	if (!fifo)
 		return -ENOMEM;
 
+	next = rb_create(RB_NOALLOC, RB_DUPLICATE);
+	if (!next)
+		return -ENOMEM;
+
 	SCX_RBTREE_SELFTEST(find_nonexistent, standard);
 	SCX_RBTREE_SELFTEST(insert_one, update);
 	SCX_RBTREE_SELFTEST(print, update);
@@ -852,6 +919,7 @@ int scx_selftest_rbtree(void)
 	SCX_RBTREE_SELFTEST(update_existing, update);
 	SCX_RBTREE_SELFTEST(duplicate, duplicate);
 	SCX_RBTREE_SELFTEST(duplicate_fifo, fifo);
+	SCX_RBTREE_SELFTEST(next, next);
 	SCX_RBTREE_SELFTEST(insert_ten, update);
 	SCX_RBTREE_SELFTEST(insert_many, update);
 	SCX_RBTREE_SELFTEST(insert_many, noalloc);
