@@ -272,7 +272,7 @@ static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
 	/*
 	 * Try to consume a task on the associated DSQ.
 	 */
-	ret = scx_bpf_dsq_move_to_local(dsq_id, 0);
+	ret = queue_move_to_local(dsq_id, 0);
 
 	if (is_monitored)
 		cpdomc->dsq_consume_lat = time_delta(bpf_ktime_get_ns(), before);
@@ -403,18 +403,6 @@ calc_comp_time_on_cpdom(u64 task_svc_invr, struct cpdom_ctx *cpdomc)
 			      cap_sum, nr_cpus);
 }
 
-u64 __attribute__((noinline)) dsq_peek_task_load(u64 dsq_id)
-{
-	struct task_struct *peek_p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
-
-	if (peek_p) {
-		task_ctx *peek_taskc = find_task_ctx(peek_p);
-		if (peek_taskc)
-			return task_load_metric(peek_taskc);
-	}
-	return 0;
-}
-
 u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 {
 	u64 pick_dsq_id = -ENOENT;
@@ -432,7 +420,7 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 	if (use_cpdom_dsq()) {
 		pick_dsq_id = cpdom_to_dsq(cpdomc->id);
 		if (no_fast_lb)
-			highest_load = scx_bpf_dsq_nr_queued(pick_dsq_id);
+			highest_load = queue_nr_queued(pick_dsq_id);
 		else
 			highest_load = READ_ONCE(cpdomc->qload_invr);
 	}
@@ -461,7 +449,7 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 					break;
 
 				if (no_fast_lb) {
-					load = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) +
+					load = queue_nr_queued(cpu_to_dsq(cpu)) +
 					       scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
 				} else {
 					struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
@@ -554,7 +542,7 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			 * because the next LB round recomputes budgets from
 			 * scratch.
 			 */
-			u64 task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
+			u64 task_load = no_fast_lb ? 0 : queue_peek_load(dsq_id);
 
 			/*
 			 * On success, decrement both egress and ingress
@@ -642,7 +630,7 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			 * accounting below is bypassed and the value would
 			 * be unused.
 			 */
-			u64 task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
+			u64 task_load = no_fast_lb ? 0 : queue_peek_load(dsq_id);
 
 			/*
 			 * Force steal is unconditional for work
@@ -707,15 +695,15 @@ bool consume_task(u64 cpdom_id)
 	dsqs[0] = (struct dsq_entry){
 			cpu_dsq_id,
 			use_per_cpu_dsq() ?
-				peek_dsq_vtime(cpu_dsq_id) : U64_MAX };
+				queue_peek_vtime(cpu_dsq_id) : U64_MAX };
 	dsqs[1] = (struct dsq_entry){
 			cpdom_dsq_id,
 			(use_cpdom_dsq() && can_consume_steady_dsq(cpdomc)) ?
-				peek_dsq_vtime(cpdom_dsq_id) : U64_MAX };
+				queue_peek_vtime(cpdom_dsq_id) : U64_MAX };
 	dsqs[2] = (struct dsq_entry){
 			cpdom_turb_dsq_id,
 			use_cpdom_dsq() ?
-				peek_dsq_vtime(cpdom_turb_dsq_id) : U64_MAX };
+				queue_peek_vtime(cpdom_turb_dsq_id) : U64_MAX };
 
 	sort_dsqs(&dsqs[0], &dsqs[1], &dsqs[2]);
 

@@ -1011,8 +1011,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_task_set_dsq_vtime(p, calc_when_to_run(p, taskc));
 
 		dsq_id = get_target_dsq_id(p, cpuc, taskc);
-		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
-					 p->scx.dsq_vtime, enq_flags);
+		queue_insert_vtime(p, dsq_id, p->scx.slice,
+				   p->scx.dsq_vtime, enq_flags);
 		goto kick_cpu_out;
 	}
 
@@ -1124,13 +1124,13 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		 * migrate away.
 		 */
 		reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
-		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu), p->scx.slice,
-					 p->scx.dsq_vtime, enq_flags);
+		queue_insert_vtime(p, cpu_to_dsq(cpu), p->scx.slice,
+				   p->scx.dsq_vtime, enq_flags);
 		account_queued_load_pcpu(taskc, get_primary_cpu(cpu));
 	} else {
 		dsq_id = get_target_dsq_id(p, cpuc, taskc);
-		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
-					 p->scx.dsq_vtime, enq_flags);
+		queue_insert_vtime(p, dsq_id, p->scx.slice,
+				   p->scx.dsq_vtime, enq_flags);
 		if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
 			account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
 	}
@@ -1242,7 +1242,7 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 	 * Enqueue the task to a DSQ.
 	 */
 	dsq_id = get_target_dsq_id(p, cpuc, taskc);
-	scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice, p->scx.dsq_vtime, 0);
+	queue_insert_vtime(p, dsq_id, p->scx.slice, p->scx.dsq_vtime, 0);
 	account_queued_load(taskc, cpuc->cpdom_id);
 	if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
 		account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
@@ -1507,7 +1507,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 * Since this CPU is neither active nor overflow set,
 	 * add this CPU to the overflow set.
 	 */
-	if (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu))) {
+	if (use_per_cpu_dsq() && queue_nr_queued(cpu_to_dsq(cpu))) {
 		ovrflw_test_and_set(ovrflw, cpu);
 		bpf_rcu_read_unlock();
 		goto consume_out;
@@ -2368,8 +2368,8 @@ static s32 init_cpdoms(u64 now)
 		 * Create an associated DSQ on its associated NUMA domain.
 		 */
 		if (use_cpdom_dsq()) {
-			err = scx_bpf_create_dsq(cpdom_to_dsq(cpdomc->id),
-						 cpdomc->numa_id);
+			err = queue_init(cpdom_to_dsq(cpdomc->id),
+					 cpdomc->numa_id);
 			if (err) {
 				scx_bpf_error("Failed to create a DSQ for cpdom %llu on NUMA node %d",
 					      cpdomc->id, cpdomc->numa_id);
@@ -2381,8 +2381,8 @@ static s32 init_cpdoms(u64 now)
 			 * turbulent CPUs will primarily
 			 * consume from.
 			 */
-			err = scx_bpf_create_dsq(cpdom_to_turb_dsq(cpdomc->id),
-						 cpdomc->numa_id);
+			err = queue_init(cpdom_to_turb_dsq(cpdomc->id),
+					 cpdomc->numa_id);
 			if (err) {
 				scx_bpf_error("Failed to create a turb DSQ for cpdom %llu on NUMA node %d",
 					      cpdomc->id, cpdomc->numa_id);
@@ -2670,7 +2670,7 @@ static int init_per_cpu_dsqs(void)
 		if (is_smt_active && (cpu != get_primary_cpu(cpu)))
 			continue;
 
-		err = scx_bpf_create_dsq(cpu_to_dsq(cpu), cpdomc->numa_id);
+		err = queue_init(cpu_to_dsq(cpu), cpdomc->numa_id);
 		if (err) {
 			scx_bpf_error("Failed to create a DSQ for cpu %d on NUMA node %d",
 				      cpu, cpdomc->numa_id);

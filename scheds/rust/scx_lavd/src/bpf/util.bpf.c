@@ -423,13 +423,13 @@ bool queued_on_cpu(struct cpu_ctx *cpuc)
 	if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id))
 		return true;
 
-	if (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_to_dsq(cpuc->cpu_id)))
+	if (use_per_cpu_dsq() && queue_nr_queued(cpu_to_dsq(cpuc->cpu_id)))
 		return true;
 
-	if (use_cpdom_dsq() && scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id)))
+	if (use_cpdom_dsq() && queue_nr_queued(cpdom_to_dsq(cpuc->cpdom_id)))
 		return true;
 
-	if (use_cpdom_dsq() && scx_bpf_dsq_nr_queued(cpdom_to_turb_dsq(cpuc->cpdom_id)))
+	if (use_cpdom_dsq() && queue_nr_queued(cpdom_to_turb_dsq(cpuc->cpdom_id)))
 		return true;
 
 	return false;
@@ -445,31 +445,22 @@ bool is_cpu_congested(struct cpu_ctx *cpuc)
 		return true;
 
 	if (use_cpdom_dsq()) {
-		nr += scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpuc->cpdom_id));
+		nr += queue_nr_queued(cpdom_to_dsq(cpuc->cpdom_id));
 		if (nr >= LAVD_CPU_CONGESTED_THRES)
 			return true;
 
-		nr += scx_bpf_dsq_nr_queued(cpdom_to_turb_dsq(cpuc->cpdom_id));
+		nr += queue_nr_queued(cpdom_to_turb_dsq(cpuc->cpdom_id));
 		if (nr >= LAVD_CPU_CONGESTED_THRES)
 			return true;
 	}
 
 	if (use_per_cpu_dsq()) {
-		nr += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpuc->cpu_id));
+		nr += queue_nr_queued(cpu_to_dsq(cpuc->cpu_id));
 		if (nr >= LAVD_CPU_CONGESTED_THRES)
 			return true;
 	}
 
 	return false;
-}
-
-__hidden
-u64 peek_dsq_vtime(u64 dsq_id)
-{
-	struct task_struct *p;
-
-	p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
-	return p ? p->scx.dsq_vtime : U64_MAX;
 }
 
 __hidden
