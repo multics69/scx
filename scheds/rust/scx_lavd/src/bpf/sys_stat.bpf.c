@@ -128,8 +128,8 @@ static void collect_sys_stat(void)
 		cpdomc->nr_turb_cpus = 0;
 
 		if (use_cpdom_dsq())
-			cpdomc->nr_queued_task = scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpdom_id))
-					       + scx_bpf_dsq_nr_queued(cpdom_to_turb_dsq(cpdom_id));
+			cpdomc->nr_queued_task = queue_nr_queued(cpdom_to_dsq(cpdom_id))
+					       + queue_nr_queued(cpdom_to_turb_dsq(cpdom_id));
 
 		bpf_for(i, 0, LAVD_CPU_ID_MAX/64) {
 			u64 cpumask;
@@ -146,7 +146,7 @@ static void collect_sys_stat(void)
 
 				cpdomc->nr_queued_task += scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
 				if (use_per_cpu_dsq() && cpu == get_primary_cpu(cpu))
-					cpdomc->nr_queued_task += scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
+					cpdomc->nr_queued_task += queue_nr_queued(cpu_to_dsq(cpu));
 			}
 		}
 
