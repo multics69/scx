@@ -336,20 +336,17 @@ static int calc_nr_active_cpus(void)
  * the active or overflow set. Without the kick, no CPU consumes them.
  *
  * Such a case can happen in the race below between concurrent ops.enqueue()
- * and ops.dispatch(). The key reason is that the kernel defers the actual
- * insert into the DSQ until ops.enqueue() returns. So CPU X finds the queue
- * empty and goes idle, while CPU E saw X busy and did not kick it.
+ * and ops.update_idle(). Each side writes its own state and then reads the
+ * other's, with no full barrier in between. So CPU E can read X's hint
+ * before its insert is visible to X, and X can read the queue before its
+ * hint is visible to E. Then X goes idle, and E does not kick it.
  *
  *   CPU E (enqueuer)                   CPU X (domain D, uncovered)
  *   ----------------                   ---------------------------
- *   ops.enqueue(p), targeting X        runs its last task
- *     pick D's DSQ (insert deferred)
- *     X's hint clear, no kick
- *                                      ops.dispatch(): D's DSQs empty
- *                                      ops.update_idle(true):
- *                                        set X's hint
- *                                        D's DSQs empty, no kick
- *   direct_dispatch(): p in D's DSQ
+ *   ops.enqueue(p), targeting X        ops.update_idle(true):
+ *     insert p into D's queue            set X's hint
+ *     X's hint clear (stale)             D's queues empty (stale)
+ *     no kick                            no kick
  *                                      idle with the hint set
  *
  * Nothing else kicks X afterwards. The sys_stat resync kicks only idle CPUs
@@ -443,7 +440,7 @@ int do_core_compaction(void)
 		} else {
 			bpf_cpumask_clear_cpu(cpu, active);
 
-			if (cpuc->nr_pinned_tasks ||
+			if (cpuc->nr_pinned_tasks || cpuc->nr_resv_tasks ||
 			    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) ||
 			    (use_per_cpu_dsq() &&
 			     queue_nr_queued(cpu_to_dsq(cpu)))) {
@@ -517,8 +514,8 @@ int do_core_compaction(void)
 		 */
 		if (nr_cpdoms > 1 && !cpdomc->nr_active_cpus &&
 		    !READ_ONCE(cpdomc->nr_overflow_cpus) &&
-		    (scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpdom_id)) ||
-		     scx_bpf_dsq_nr_queued(cpdom_to_turb_dsq(cpdom_id)))) {
+		    (queue_nr_queued(cpdom_to_dsq(cpdom_id)) ||
+		     queue_nr_queued(cpdom_to_turb_dsq(cpdom_id)))) {
 			kick_uncovered_cpdom(cpdom_id);
 		}
 
