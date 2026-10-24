@@ -262,8 +262,9 @@ reset_and_skip_lb:
 
 /*
  * dsq_id: candidate DSQ to consume from, can be per-cpdom or per-cpu.
+ * cpu: the CPU to dispatch the task to.
  */
-static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
+static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id, s32 cpu)
 {
 	bool ret;
 	u64 before = 0;
@@ -273,7 +274,7 @@ static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
 	/*
 	 * Try to consume a task on the associated DSQ.
 	 */
-	ret = queue_move_to_local(dsq_id, 0);
+	ret = queue_move_to_local(dsq_id, cpu, 0);
 
 	if (is_monitored)
 		cpdomc->dsq_consume_lat = time_delta(bpf_ktime_get_ns(), before);
@@ -470,7 +471,7 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 	return pick_dsq_id;
 }
 
-static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
+static bool try_to_steal_task(struct cpdom_ctx *cpdomc, s32 cpu)
 {
 	struct cpdom_ctx *cpdomc_pick;
 	s64 nr_nbr, cpdom_id;
@@ -520,10 +521,8 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 
 			/*
-			 * No DSQ in cpdomc_pick has any queued load.
-			 * Move on to the next neighbor rather than passing
-			 * -ENOENT to dsq_peek_task_load() / consume_dsq(),
-			 * which would abort the scheduler.
+			 * No queue in cpdomc_pick has queued load, so move
+			 * on to the next neighbor.
 			 */
 			if ((s64)dsq_id < 0)
 				continue;
@@ -552,7 +551,7 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			 * is_stealee/is_stealer flags via the decrement
 			 * helpers.
 			 */
-			if (consume_dsq(cpdomc_pick, dsq_id)) {
+			if (consume_dsq(cpdomc_pick, dsq_id, cpu)) {
 				if (no_fast_lb) {
 					WRITE_ONCE(cpdomc_pick->is_stealee, false);
 					WRITE_ONCE(cpdomc->is_stealer, false);
@@ -562,7 +561,7 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 				}
 				debugln("migrate: try_steal stealer=cpdom%llu stealee=cpdom%llu load=%llu cpu=%d",
 					cpdomc->id, cpdomc_pick->id, task_load,
-					bpf_get_smp_processor_id());
+					cpu);
 				return true;
 			}
 		}
@@ -583,7 +582,7 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 	return false;
 }
 
-static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
+static bool force_to_steal_task(struct cpdom_ctx *cpdomc, s32 cpu)
 {
 	struct cpdom_ctx *cpdomc_pick;
 	s64 nr_nbr, cpdom_id;
@@ -663,14 +662,14 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			 * conservation. Decrement budgets to keep
 			 * the accounting consistent.
 			 */
-			if (consume_dsq(cpdomc_pick, dsq_id)) {
+			if (consume_dsq(cpdomc_pick, dsq_id, cpu)) {
 				if (!no_fast_lb) {
 					decrement_stealee_budget(cpdomc_pick, task_load);
 					decrement_stealer_budget(cpdomc, task_load);
 				}
 				debugln("migrate: force_steal stealer=cpdom%llu stealee=cpdom%llu load=%llu cpu=%d",
 					cpdomc->id, cpdomc_pick->id, task_load,
-					bpf_get_smp_processor_id());
+					cpu);
 				/* Stealing works, so lift the rate limit. */
 				if (!no_force_steal_limit)
 					WRITE_ONCE(cpdomc->next_steal_probe_clk, 0);
@@ -682,8 +681,12 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 	return false;
 }
 
+/*
+ * Consume a task for @cpu, the CPU ops.dispatch() dispatches for. Under core
+ * scheduling, that can be an SMT sibling of the CPU running this.
+ */
 __hidden
-bool consume_task(u64 cpdom_id)
+bool consume_task(u64 cpdom_id, s32 cpu)
 {
 	struct cpdom_ctx *cpdomc;
 	struct cpu_ctx *cpuc;
@@ -697,7 +700,7 @@ bool consume_task(u64 cpdom_id)
 		return false;
 	}
 
-	cpuc = get_cpu_ctx();
+	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		return false;
 	}
@@ -711,7 +714,7 @@ bool consume_task(u64 cpdom_id)
 	 * a task from any of stealee domains probabilistically.
 	 */
 	if (nr_cpdoms > 1 && READ_ONCE(cpdomc->is_stealer) &&
-	    try_to_steal_task(cpdomc))
+	    try_to_steal_task(cpdomc, cpu))
 		goto x_domain_migration_out;
 
 	/*
@@ -727,7 +730,7 @@ bool consume_task(u64 cpdom_id)
 				queue_peek_vtime(cpu_dsq_id) : U64_MAX };
 	dsqs[1] = (struct dsq_entry){
 			cpdom_dsq_id,
-			(use_cpdom_dsq() && can_consume_steady_dsq(cpdomc)) ?
+			(use_cpdom_dsq() && can_consume_steady_dsq(cpuc, cpdomc)) ?
 				queue_peek_vtime(cpdom_dsq_id) : U64_MAX };
 	dsqs[2] = (struct dsq_entry){
 			cpdom_turb_dsq_id,
@@ -739,7 +742,7 @@ bool consume_task(u64 cpdom_id)
 	/* Consume in lowest-vtime-first order; U64_MAX vtime marks skip. */
 	for (i = 0; i < 3; i++) {
 		if (dsqs[i].vtime != U64_MAX &&
-		    consume_dsq(cpdomc, dsqs[i].dsq_id)) {
+		    consume_dsq(cpdomc, dsqs[i].dsq_id, cpu)) {
 			return true;
 		}
 	}
@@ -750,7 +753,8 @@ bool consume_task(u64 cpdom_id)
 	 * Skip force stealing when mig_delta_pct is set (> 0) to rely
 	 * only on the is_stealer/is_stealee thresholds.
 	 */
-	if (nr_cpdoms > 1 && mig_delta_pct == 0 && force_to_steal_task(cpdomc))
+	if (nr_cpdoms > 1 && mig_delta_pct == 0 &&
+	    force_to_steal_task(cpdomc, cpu))
 		goto x_domain_migration_out;
 
 	return false;
