@@ -12,6 +12,7 @@
 #include <lib/sdt_task.h>
 #include <lib/atq.h>
 #include <lib/cgroup.h>
+#include "queue.bpf.h"
 
 /*
  * common macros
@@ -752,8 +753,8 @@ can_consume_steady_dsq(struct cpdom_ctx *cpdomc)
 	 * CPU is available to drain it.
 	 */
 	return !turbulent ||
-	       scx_bpf_dsq_nr_queued(cpdom_to_dsq(cpdomc->id)) >
-		       scx_bpf_dsq_nr_queued(cpdom_to_turb_dsq(cpdomc->id)) ||
+	       queue_nr_queued(cpdom_to_dsq(cpdomc->id)) >
+		       queue_nr_queued(cpdom_to_turb_dsq(cpdomc->id)) ||
 	       cpdomc->nr_steady_cpus == 0;
 }
 
@@ -851,7 +852,7 @@ bool warm_cpu_wait_ok(task_ctx *taskc, s32 cpu, u64 now)
 	 * system-average slice. A per-core qload_invr would sharpen the latter;
 	 * revisit once per-core queued load is tracked.
 	 */
-	wait += (u64)scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)) * sys_stat.slice_wall;
+	wait += (u64)queue_nr_queued(cpu_to_dsq(cpu)) * sys_stat.slice_wall;
 
 	return wait <= budget;
 }
@@ -886,7 +887,6 @@ struct dsq_entry {
 /* A cpuperf_cur no target can equal, so the next commit always sends. */
 #define LAVD_CPUPERF_UNSET	((u32)-1)
 
-u64 peek_dsq_vtime(u64 dsq_id);
 void sort_dsqs(struct dsq_entry *a, struct dsq_entry *b, struct dsq_entry *c);
 
 /* Overflow-set bookkeeping helpers. */
