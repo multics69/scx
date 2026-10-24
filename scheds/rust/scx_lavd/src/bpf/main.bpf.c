@@ -833,6 +833,7 @@ static int cgroup_throttled(struct task_struct *p, task_ctx *taskc, bool put_asi
 	ret = scx_cgroup_bw_throttled(p, (u64)taskc);
 	if ((ret == -EAGAIN) && put_aside &&
 	    !scx_cgroup_bw_is_task_throttled((u64)taskc)) {
+		queue_task_park(taskc);
 		ret2 = scx_cgroup_bw_put_aside(p, (u64)taskc, p->scx.dsq_vtime);
 		if (ret2)
 			return ret2;
@@ -941,7 +942,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc, *cpuc_cur;
 	s32 task_cpu, cpu = -ENOENT;
-	bool is_idle = false;
+	bool is_idle = false, in_flight;
 	task_ctx *taskc;
 	u64 dsq_id;
 
@@ -954,12 +955,23 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	task_cpu = scx_bpf_task_cpu(p);
 
 	/*
+	 * Another CPU may still place the task. A consume's insert stays
+	 * pending until the consuming CPU's dispatch round ends, and a cpu.max
+	 * drain holds a task it has popped from a BTQ until it has moved it
+	 * into a queue. Queueing or parking the task as well could make it
+	 * run twice, so it takes the direct dispatch below, even when its
+	 * cgroup is throttled. ops.running() then preempts it, and its next
+	 * enqueue, no longer in flight, puts it aside.
+	 */
+	in_flight = queue_task_in_flight(taskc);
+
+	/*
 	 * A reenqueue (SCX_ENQ_REENQ) means the task was already placed once
 	 * but bounced -- a higher-priority class (RT/DL) took the CPU and the
 	 * local DSQ was drained via scx_bpf_reenqueue_local() (from the
 	 * sched_switch hook, or ops.cpu_release on older kernels).
 	 */
-	if (unlikely(enq_flags & SCX_ENQ_REENQ)) {
+	if (unlikely(enq_flags & SCX_ENQ_REENQ) && !in_flight) {
 		/*
 		 * If the task’s cgroup is throttled, the task should be
 		 * backlogged, and its accounted load should be reverted since
@@ -975,7 +987,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		}
 
 		/*
-		 * The task has not run since, so its slice, CPU choice, and
+		 * The task has not run since, so its CPU choice and
 		 * queued-load accounting are still valid -- reuse the cached
 		 * suggested_cpu_id and reinsert into the previously chosen
 		 * cpdom DSQ, never the local DSQ it was just drained from.
@@ -1016,9 +1028,14 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		 */
 		scx_bpf_task_set_dsq_vtime(p, calc_when_to_run(p, taskc));
 
+		/*
+		 * Start from the default slice, as a fresh enqueue does.
+		 * ops.running() sets the slice the task runs with.
+		 */
+		scx_bpf_task_set_slice(p, LAVD_SLICE_MIN_NS_DFL);
+
 		dsq_id = get_target_dsq_id(p, cpuc, taskc);
-		queue_insert_vtime(p, dsq_id, p->scx.slice,
-				   p->scx.dsq_vtime, enq_flags);
+		queue_insert_vtime(p, taskc, dsq_id, p->scx.dsq_vtime);
 		goto kick_cpu_out;
 	}
 
@@ -1094,7 +1111,8 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * cgroup, as we need the deadline to put aside the task when the
 	 * cgroup is throttled.
 	 */
-	if (enable_cpu_bw && (cgroup_throttled(p, taskc, true) == -EAGAIN)) {
+	if (enable_cpu_bw && !in_flight &&
+	    (cgroup_throttled(p, taskc, true) == -EAGAIN)) {
 		debugln("Task %s[pid%d/cgid%llu] is throttled.",
 			p->comm, p->pid, taskc->cgrp_id);
 		return;
@@ -1119,7 +1137,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * When pinned_slice_ns is enabled, pinned tasks always use per-CPU DSQ
 	 * to enable vtime comparison across DSQs during dispatch.
 	 */
-	if (can_direct_dispatch(cpuc, is_idle)) {
+	if (unlikely(in_flight) || can_direct_dispatch(cpuc, is_idle)) {
 		reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, p->scx.slice,
 				   enq_flags);
@@ -1130,13 +1148,11 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		 * migrate away.
 		 */
 		reset_task_flag(taskc, LAVD_FLAG_WARM_CPU);
-		queue_insert_vtime(p, cpu_to_dsq(cpu), p->scx.slice,
-				   p->scx.dsq_vtime, enq_flags);
+		queue_insert_vtime(p, taskc, cpu_to_dsq(cpu), p->scx.dsq_vtime);
 		account_queued_load_pcpu(taskc, get_primary_cpu(cpu));
 	} else {
 		dsq_id = get_target_dsq_id(p, cpuc, taskc);
-		queue_insert_vtime(p, dsq_id, p->scx.slice,
-				   p->scx.dsq_vtime, enq_flags);
+		queue_insert_vtime(p, taskc, dsq_id, p->scx.dsq_vtime);
 		if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
 			account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
 	}
@@ -1165,6 +1181,7 @@ static
 int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 {
 	struct cpu_ctx *cpuc;
+	bool pinned = false;
 	u64 dsq_id;
 	s32 cpu;
 
@@ -1237,6 +1254,7 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 	if (is_effectively_pinned(taskc) && (taskc->pinned_cpu_id == -ENOENT)) {
 		taskc->pinned_cpu_id = cpu;
 		__sync_fetch_and_add(&cpuc->nr_pinned_tasks, 1);
+		pinned = true;
 	}
 
 	/*
@@ -1252,7 +1270,18 @@ int enqueue_cb(struct task_struct __arg_trusted *p, task_ctx *taskc)
 	 * change its vtime, and moving the task to another cgroup keeps it.
 	 */
 	dsq_id = get_target_dsq_id(p, cpuc, taskc);
-	queue_insert_vtime_parked(p, dsq_id, p->scx.slice, p->scx.dsq_vtime, 0);
+	if (queue_insert_vtime_parked(p, taskc, dsq_id, p->scx.dsq_vtime)) {
+		/*
+		 * The task's dequeue cancelled the move, and its quiescent may
+		 * have run before the increment above and skipped the
+		 * decrement. Undo the increment unless that quiescent has
+		 * already taken it back.
+		 */
+		if (pinned &&
+		    cmpxchg(&taskc->pinned_cpu_id, cpu, -ENOENT) == cpu)
+			__sync_fetch_and_sub(&cpuc->nr_pinned_tasks, 1);
+		return 0;
+	}
 	account_queued_load(taskc, cpuc->cpdom_id);
 	if (dsq_type(dsq_id) == LAVD_DSQ_TYPE_CPU)
 		account_queued_load_pcpu(taskc, dsq_to_cpu(dsq_id));
@@ -1285,6 +1314,8 @@ void BPF_STRUCT_OPS(lavd_dequeue, struct task_struct *p, u64 deq_flags)
 		unaccount_queued_load(taskc);
 		unaccount_queued_load_pcpu(taskc);
 	}
+
+	queue_task_dequeue(taskc);
 
 	if (!enable_cpu_bw)
 		return;
@@ -1339,114 +1370,16 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx
 	cpuc->flags = taskc_prev->flags;
 }
 
-__hidden __attribute__ ((noinline))
-bool scan_dsq_for_ovflw_ext(u64 dsq_id, s32 cpu,
-			    struct cpu_ctx *cpuc,
-			    struct bpf_cpumask *active,
-			    struct bpf_cpumask *ovrflw)
-{
-	struct task_struct *p;
-	s32 new_cpu;
-
-	/*
-	 * Scan @dsq_id for a task that needs this CPU (permanently
-	 * pinned, migrate_disabled, or affinitized only to CPUs outside
-	 * the active+overflow set) and, as a side effect, extend the
-	 * overflow set so such a task can be serviced.
-	 *
-	 *   - When the task's target CPU is @cpu, add @cpu to the
-	 *     overflow set and return true so the caller drains a task
-	 *     locally via consume_task().
-	 *   - When the target is remote, extend the overflow set on
-	 *     that CPU (when not already a member) and kick it.
-	 *
-	 * Returns true if a locally-runnable match was found; false if
-	 * the scan completed without one. Callers may invoke this
-	 * against more than one DSQ to cover both the non-turbulent
-	 * and the turbulent cpdom DSQs (see get_target_dsq_id()).
-	 *
-	 * Must be called with bpf_rcu_read_lock() held; @active and
-	 * @ovrflw are borrowed under that critical section.
-	 */
-	bpf_for_each(scx_dsq, p, dsq_id, 0) {
-		/*
-		 * note that this is a hack to bypass the restriction of the
-		 * current bpf not trusting the pointer p. once the bpf
-		 * verifier gets smarter, we can remove bpf_task_from_pid().
-		 */
-		p = bpf_task_from_pid(p->pid);
-		if (!p)
-			continue; /* ignore the lookup error */
-
-		/*
-		 * If the task is permanently pinned to its CPU, extend the
-		 * overflow set (and kick if it's a remote CPU). Same
-		 * rationale as the prev-task branch in lavd_dispatch():
-		 * migrate_disable is transient, so its handling is split
-		 * into the else-if below.
-		 */
-		if (is_permanently_pinned(p)) {
-			new_cpu = scx_bpf_task_cpu(p);
-			if (new_cpu == cpu) {
-				ovrflw_test_and_set(ovrflw, new_cpu);
-				bpf_task_release(p);
-				return true;
-			}
-			if (!ovrflw_test_and_set(ovrflw, new_cpu))
-				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
-			bpf_task_release(p);
-			continue;
-		} else if (is_migration_disabled(p)) {
-			new_cpu = scx_bpf_task_cpu(p);
-			if (new_cpu == cpu) {
-				bpf_task_release(p);
-				return true;
-			}
-			scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
-			bpf_task_release(p);
-			continue;
-		}
-
-		/*
-		 * if the task can run on either active or overflow set,
-		 * try another task.
-		 */
-		if (!is_affinitized(p) ||
-		    bpf_cpumask_intersects(cast_mask(active), p->cpus_ptr) ||
-		    bpf_cpumask_intersects(cast_mask(ovrflw), p->cpus_ptr)) {
-			bpf_task_release(p);
-			continue;
-		}
-
-		/*
-		 * now, we know that the task cannot run on either active
-		 * or overflow set. then, let's consider to extend the
-		 * overflow set.
-		 */
-		new_cpu = find_cpu_in(p->cpus_ptr, cpuc);
-		if (new_cpu >= 0) {
-			if (new_cpu == cpu) {
-				ovrflw_test_and_set(ovrflw, new_cpu);
-				bpf_task_release(p);
-				return true;
-			}
-			else if (!ovrflw_test_and_set(ovrflw, new_cpu))
-				scx_bpf_kick_cpu(new_cpu, SCX_KICK_IDLE);
-		}
-		bpf_task_release(p);
-	}
-
-	return false;
-}
-
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct bpf_cpumask *active, *ovrflw;
 	task_ctx *taskc_prev = NULL;
-	bool try_consume = false;
 	struct cpdom_ctx *cpdomc;
 	struct cpu_ctx *cpuc;
 	int ret;
+
+	/* The kernel has flushed this CPU's earlier ops.dispatch() calls. */
+	queue_cpu_flushed();
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
@@ -1552,37 +1485,13 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
-	 * If there is nothing to run on per-CPU DSQ and we do not use
-	 * per-domain DSQ, there is nothing to do. So, stop here.
+	 * A CPU reserved for a queued task stays in the overflow set until
+	 * the task runs (see queue_reserve_cpu()).
 	 */
-	if (!use_cpdom_dsq()) {
+	if (READ_ONCE(cpuc->nr_resv_tasks)) {
+		ovrflw_test_and_set(ovrflw, cpu);
 		bpf_rcu_read_unlock();
-		goto reassert_idle;
-	}
-
-	/* NOTE: We use per-domain DSQ. */
-
-	/*
-	 * If this CPU is neither in active nor overflow CPUs, try to
-	 * find a task affinitized on this CPU from the per-domain DSQs.
-	 *
-	 * Scan both the non-turbulent and the turbulent cpdom DSQs:
-	 * get_target_dsq_id() routes pinned / affinitized tasks to
-	 * either one depending on their preemption_vulnerability, so
-	 * the turbulent DSQ can hold tasks that only this CPU can run.
-	 * Skipping it would leave them stalled when this CPU is the
-	 * only legal target and the regular cpdom DSQ happens to be
-	 * empty.
-	 *
-	 * We don't need to traverse the per-CPU DSQ; it is already
-	 * handled by the fast path above.
-	 */
-	try_consume = scan_dsq_for_ovflw_ext(cpdom_to_dsq(cpuc->cpdom_id),
-					     cpu, cpuc, active, ovrflw);
-	if (!try_consume) {
-		try_consume = scan_dsq_for_ovflw_ext(
-				cpdom_to_turb_dsq(cpuc->cpdom_id),
-				cpu, cpuc, active, ovrflw);
+		goto consume_out;
 	}
 
 	/*
@@ -1590,34 +1499,30 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	 * domains steal from its steady queue only while one of their CPUs
 	 * dispatches. So when none of this domain's CPUs is in either set,
 	 * tasks queued in it wait for nobody. Extend the overflow set with
-	 * this CPU to drain them.
+	 * this CPU to drain them. Otherwise, go idle.
 	 *
 	 * A single domain needs no check: core compaction keeps the active
 	 * set non-empty, and all of it lies in that domain.
 	 */
-	if (!try_consume && nr_cpdoms > 1 &&
+	if (nr_cpdoms > 1 && use_cpdom_dsq() &&
 	    (cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id])) &&
 	    !READ_ONCE(cpdomc->nr_active_cpus) &&
 	    !READ_ONCE(cpdomc->nr_overflow_cpus) &&
 	    (queue_nr_queued(cpdom_to_dsq(cpuc->cpdom_id)) ||
 	     queue_nr_queued(cpdom_to_turb_dsq(cpuc->cpdom_id)))) {
 		ovrflw_test_and_set(ovrflw, cpu);
-		try_consume = true;
+		bpf_rcu_read_unlock();
+		goto consume_out;
 	}
 
 	bpf_rcu_read_unlock();
-
-	/*
-	 * If this CPU should go idle, do nothing.
-	 */
-	if (!try_consume)
-		goto reassert_idle;
+	goto reassert_idle;
 
 consume_out:
 	/*
 	 * Otherwise, consume a task.
 	 */
-	if (consume_task(cpuc->cpdom_id))
+	if (consume_task(cpuc->cpdom_id, cpu))
 		return;
 
 	/*
@@ -1784,11 +1689,23 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	unaccount_queued_load(taskc);
 	unaccount_queued_load_pcpu(taskc);
 
+	queue_task_running(taskc);
+
 	/*
 	 * Calculate the task's time slice here,
 	 * as it depends on the system load.
 	 */
 	scx_bpf_task_set_slice(p, calc_time_slice(taskc, cpuc));
+
+	/*
+	 * A task released from a cpu.max backlog can still be waiting in a
+	 * queue when its cgroup is throttled again, and nothing stops it
+	 * before its first tick, and a task in flight is dispatched directly
+	 * whether its cgroup is throttled or not. Preempt either now, so that
+	 * it goes back through ops.enqueue() and is put aside.
+	 */
+	if (enable_cpu_bw && cgroup_throttled(p, taskc, false) == -EAGAIN)
+		scx_bpf_kick_cpu(cpuc->cpu_id, SCX_KICK_PREEMPT);
 
 	/*
 	 * Update the current logical clock.
@@ -1936,12 +1853,17 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	 * pinned_cpu_id keeps the per-CPU nr_pinned_tasks exact.
 	 */
 	if (is_effectively_pinned(taskc) && (taskc->pinned_cpu_id != -ENOENT)) {
-		struct cpu_ctx *cpuc_pinned =
-			get_cpu_ctx_id(taskc->pinned_cpu_id);
+		/*
+		 * Take the marker atomically: enqueue_cb() on another CPU may
+		 * be undoing the same increment after a cancelled move.
+		 */
+		s32 pinned_cpu = __sync_lock_test_and_set(&taskc->pinned_cpu_id,
+							  -ENOENT);
+		struct cpu_ctx *cpuc_pinned;
 
-		if (cpuc_pinned)
+		if (pinned_cpu != -ENOENT &&
+		    (cpuc_pinned = get_cpu_ctx_id(pinned_cpu)))
 			__sync_fetch_and_sub(&cpuc_pinned->nr_pinned_tasks, 1);
-		taskc->pinned_cpu_id = -ENOENT;
 	}
 
 	/*
@@ -2091,6 +2013,7 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
 	}
 
 	cpu_ctx_init_offline(cpuc, cpu);
+	queue_cpu_offline(cpu);
 
 	__sync_fetch_and_sub(&nr_cpus_onln, 1);
 	__sync_fetch_and_sub(&total_max_capacity, cpuc->max_capacity);
@@ -2224,7 +2147,11 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 	 * context and cannot be called from a tracepoint hook. Rust nulls
 	 * this slot out on newer kernels (>= 6.19) where the v2 kfunc lifts
 	 * the restriction and the sched_switch hook takes over.
+	 *
+	 * The tasks on the local DSQ have been flushed there, so end their
+	 * DISPATCHING state first. Their enqueues then queue them as usual.
 	 */
+	queue_cpu_flushed();
 	scx_bpf_reenqueue_local();
 }
 
@@ -2257,7 +2184,11 @@ int BPF_PROG(lavd_sched_switch, bool preempt,
 			WRITE_ONCE(cpuc->cpuperf_cur, LAVD_CPUPERF_UNSET);
 		}
 
-		/* Reenqueue any SCX tasks stranded on the local DSQ. */
+		/*
+		 * Reenqueue any SCX tasks stranded on the local DSQ, after
+		 * ending their DISPATCHING state, see lavd_cpu_release().
+		 */
+		queue_cpu_flushed();
 		scx_bpf_reenqueue_local_from_anywhere();
 	}
 	return 0;
@@ -2382,6 +2313,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 
 	taskc->suggested_cpu_id = scx_bpf_task_cpu(p);
 	taskc->pinned_cpu_id = -ENOENT;
+	queue_task_init(taskc);
 	WRITE_ONCE(taskc->queued_in_cpdom_id, LAVD_CPDOM_MAX_NR);
 	WRITE_ONCE(taskc->queued_on_cpu_id, -1);
 	taskc->pid = p->pid;
@@ -2435,6 +2367,9 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
 	 */
 	if (enable_cpu_bw && taskc)
 		scx_cgroup_bw_cancel((u64)taskc, SCX_CGROUP_BW_CANCEL_DROP);
+
+	if (taskc)
+		queue_task_fini(taskc);
 
 	scx_task_free_rcu(p);
 	return 0;
@@ -2499,7 +2434,6 @@ void BPF_STRUCT_OPS(lavd_dump_task, struct scx_dump_ctx *dctx,
 static s32 init_cpdoms(u64 now)
 {
 	struct cpdom_ctx *cpdomc;
-	int err;
 
 	for (int i = 0; i < LAVD_CPDOM_MAX_NR; i++) {
 		/*
@@ -2514,32 +2448,6 @@ static s32 init_cpdoms(u64 now)
 			continue;
 
 		cpdomc->vuln_thresh = LAVD_VULN_THRESH_INIT;
-
-		/*
-		 * Create an associated DSQ on its associated NUMA domain.
-		 */
-		if (use_cpdom_dsq()) {
-			err = queue_init(cpdom_to_dsq(cpdomc->id),
-					 cpdomc->numa_id);
-			if (err) {
-				scx_bpf_error("Failed to create a DSQ for cpdom %llu on NUMA node %d",
-					      cpdomc->id, cpdomc->numa_id);
-				return err;
-			}
-
-			/*
-			 * Create a turbulent DSQ for tasks that
-			 * turbulent CPUs will primarily
-			 * consume from.
-			 */
-			err = queue_init(cpdom_to_turb_dsq(cpdomc->id),
-					 cpdomc->numa_id);
-			if (err) {
-				scx_bpf_error("Failed to create a turb DSQ for cpdom %llu on NUMA node %d",
-					      cpdomc->id, cpdomc->numa_id);
-				return err;
-			}
-		}
 
 		/*
 		 * Update the number of compute domains.
@@ -2791,43 +2699,6 @@ unlock_out:
 	return err;
 }
 
-
-static int init_per_cpu_dsqs(void)
-{
-	struct cpdom_ctx *cpdomc;
-	struct cpu_ctx *cpuc;
-	int cpu, err = 0;
-
-	bpf_for(cpu, 0, nr_cpu_ids) {
-		/*
-		 * Create Per-CPU DSQs on its associated NUMA domain.
-		 */
-		cpuc = get_cpu_ctx_id(cpu);
-		if (!cpuc) {
-			scx_bpf_error("Failed to lookup cpu_ctx: %d", cpu);
-			return -ESRCH;
-		}
-
-		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
-		if (!cpdomc) {
-			scx_bpf_error("Failed to lookup cpdom_ctx for %hhu", cpuc->cpdom_id);
-			return -ESRCH;
-		}
-
-		if (is_smt_active && (cpu != get_primary_cpu(cpu)))
-			continue;
-
-		err = queue_init(cpu_to_dsq(cpu), cpdomc->numa_id);
-		if (err) {
-			scx_bpf_error("Failed to create a DSQ for cpu %d on NUMA node %d",
-				      cpu, cpdomc->numa_id);
-			return err;
-		}
-	}
-
-	return 0;
-}
-
 s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_cgroup_init, struct cgroup *cgrp,
 			     struct scx_cgroup_init_args *args)
 {
@@ -2917,6 +2788,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 		return err;
 
 	/*
+	 * Create the queues, sized by the number of compute domains.
+	 */
+	err = queue_lib_init();
+	if (err)
+		return err;
+
+	/*
 	 * Allocate cpumask for core compaction.
 	 *  - active CPUs: a group of CPUs will be used for now.
 	 *  - overflow CPUs: a pair of hyper-twin which will be used when there
@@ -2933,17 +2811,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 	if (err)
 		return err;
 	warn_cpufreq_rate_limit_err();
-
-	/*
-	 * Initialize per-CPU DSQs.
-	 * Per-CPU DSQs are created when per_cpu_dsq is enabled OR when
-	 * pinned_slice_ns is enabled (for pinned task handling).
-	 */
-	if (use_per_cpu_dsq()) {
-		err = init_per_cpu_dsqs();
-		if (err)
-			return err;
-	}
 
 	/*
 	 * Initialize the last update clock and the update timer to track
