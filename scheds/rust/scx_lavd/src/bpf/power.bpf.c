@@ -402,7 +402,7 @@ int do_core_compaction(void)
 		} else {
 			bpf_cpumask_clear_cpu(cpu, active);
 
-			if (cpuc->nr_pinned_tasks ||
+			if (cpuc->nr_pinned_tasks || cpuc->nr_resv_tasks ||
 			    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) ||
 			    (use_per_cpu_dsq() &&
 			     queue_nr_queued(cpu_to_dsq(cpu)))) {

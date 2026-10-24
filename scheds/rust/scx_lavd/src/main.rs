@@ -834,8 +834,10 @@ impl<'a> Scheduler<'a> {
         }
 
         // Use ops.update_idle() instead of builtin idle tracking.
-        skel.struct_ops.lavd_ops_mut().flags =
-            *compat::SCX_OPS_ENQ_LAST | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
+        skel.struct_ops.lavd_ops_mut().flags = *compat::SCX_OPS_ENQ_LAST
+            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
+            | *compat::SCX_OPS_TID_TO_TASK;
+        skel.maps.rodata_data.as_mut().unwrap().ctq_tid_to_task = *compat::SCX_OPS_TID_TO_TASK != 0;
 
         if opts.partial {
             skel.struct_ops.lavd_ops_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
