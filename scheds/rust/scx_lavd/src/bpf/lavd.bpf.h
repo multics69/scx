@@ -229,7 +229,7 @@ struct task_ctx {
 	volatile u32	cpdom_id;		/* chosen compute domain id at ops.enqueue() */
 	volatile u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
-	u32	__pad0;
+	volatile s32	resv_cpu_id;		/* CPU reserved for the queued task, -ENOENT if none */
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
@@ -271,6 +271,9 @@ struct task_ctx {
 	/* --- per-CPU warmth (cache/TLB state) --- */
 	u64	last_stopping_clk;	/* when cpu_heat was last integrated (task stopped) */
 	u16	cpu_heat;		/* residence-integrated heat for cpu_id [0, LAVD_SCALE] */
+
+	/* --- the node in lavd's queues (queue.bpf.c) --- */
+	struct ctq_node	ctq;
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 /*
@@ -538,7 +541,7 @@ struct cpu_ctx {
 	u32		avg_perf_factor;
 	volatile u32	max_freq_observed; /* maximum CPU frequency observed within an interval scaled to 1024 */
 	volatile u32	max_freq;	/* maximum CPU frequency averaged across multiple intervals */
-	u32		__pad2;
+	volatile u32	nr_resv_tasks;	/* the number of queued tasks that reserved this CPU */
 	/*
 	 * Snapshot of scx_clock_task() taken at the end of the last
 	 * collect_sys_stat() interval. scx_clock_task() advances during tasks
@@ -743,20 +746,19 @@ static __always_inline bool is_steady_cpu(struct cpu_ctx *cpuc)
 }
 
 static __always_inline bool
-can_consume_steady_dsq(struct cpdom_ctx *cpdomc)
+can_consume_steady_dsq(struct cpu_ctx *cpuc, struct cpdom_ctx *cpdomc)
 {
-	struct cpu_ctx *cpuc = get_cpu_ctx();
-	bool turbulent = cpuc && is_turbulent_cpu(cpuc);
-
 	/*
-	 * Whether the current CPU should consume or steal from a cpdom's
+	 * Whether @cpuc should consume or steal from a cpdom's
 	 * steady (non-turbulent) DSQ. A steady CPU always can. A turbulent
 	 * CPU -- a poor home for the latency-critical tasks that live on
 	 * the steady DSQ -- can do so only to prevent starvation: when the
 	 * steady DSQ is more backed up than the turbulent DSQ, or no steady
-	 * CPU is available to drain it.
+	 * CPU is available to drain it, or when it is reserved for a queued
+	 * task that a walk found only it may run (see queue_reserve_cpu()).
 	 */
-	return !turbulent ||
+	return !is_turbulent_cpu(cpuc) ||
+	       READ_ONCE(cpuc->nr_resv_tasks) ||
 	       queue_nr_queued(cpdom_to_dsq(cpdomc->id)) >
 		       queue_nr_queued(cpdom_to_turb_dsq(cpdomc->id)) ||
 	       cpdomc->nr_steady_cpus == 0;
@@ -1016,7 +1018,7 @@ bool clear_cpu_idle_state(struct cpu_ctx *cpuc, s32 cpu);
 bool claim_idle_cpu(s32 cpu);
 bool is_cpu_hinted_idle(struct cpu_ctx *cpuc);
 
-bool consume_task(u64 cpdom_id);
+bool consume_task(u64 cpdom_id, s32 cpu);
 
 extern u64 cur_logical_clk;
 u64 calc_when_to_run(struct task_struct *p, task_ctx *taskc);
