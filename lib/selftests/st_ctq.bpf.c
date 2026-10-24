@@ -306,6 +306,42 @@ static int ctq_st_dispatching(struct task_struct *p)
 	return 0;
 }
 
+/*
+ * A parked node moves in unless its dequeue cancelled the move, and an insert
+ * after a cancelled move starts afresh.
+ */
+static int ctq_st_park(struct task_struct *p)
+{
+	struct ctq_node __arena *n = ctq_st_nodes[0];
+	struct ctq __arena *q;
+
+	q = ctq_st_alloc();
+	if (!q)
+		return 1;
+
+	ctq_task_park(n);
+	if (ctq_insert_parked(q, p, n, 0) || n->ctq != q ||
+	    n->park != CTQ_PARK_NONE || ctq_nr_queued(q) != 1)
+		return 2;
+	if (ctq_remove(n) || n->ctq || ctq_nr_queued(q))
+		return 3;
+
+	ctq_task_park(n);
+	if (ctq_remove(n) || n->park != CTQ_PARK_CANCELLED)
+		return 4;
+	if (ctq_insert_parked(q, p, n, 0) != CTQ_ERR_PARK_CANCELLED ||
+	    n->ctq || ctq_nr_queued(q))
+		return 5;
+
+	if (ctq_insert(q, p, n, 0) || n->park != CTQ_PARK_NONE ||
+	    ctq_nr_queued(q) != 1)
+		return 6;
+	if (ctq_remove(n) || ctq_nr_queued(q))
+		return 7;
+
+	return 0;
+}
+
 __weak
 int scx_selftest_ctq(void)
 {
@@ -344,8 +380,14 @@ int scx_selftest_ctq(void)
 	}
 
 	ret = ctq_st_dispatching(p);
-	if (ret)
+	if (ret) {
 		bpf_printk("SELFTEST ctq_st_dispatching FAIL: %d", ret);
+		goto out;
+	}
+
+	ret = ctq_st_park(p);
+	if (ret)
+		bpf_printk("SELFTEST ctq_st_park FAIL: %d", ret);
 out:
 	bpf_task_release(p);
 	return ret;

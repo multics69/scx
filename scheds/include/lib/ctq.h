@@ -31,6 +31,10 @@
  * The kernel then discards the consuming CPU's insert. ctq.bpf.c explains why
  * the window lasts until the round ends rather than until the insert.
  *
+ * A task parked in another queue can be moved into a CTQ by another CPU with
+ * ctq_insert_parked(). The task's dequeue can cancel such a move, and the
+ * move commits only if it was not cancelled. ctq.bpf.c explains why.
+ *
  * What a user must provide:
  *
  * - Embed struct ctq_node in a task context that is freed only after an RCU
@@ -45,6 +49,10 @@
  *   local DSQ of a CPU it may run on (SCX_DSQ_LOCAL_ON | cpu) instead.
  * - Call ctq_task_running() from ops.running(), and ctq_move_to_local() only
  *   from ops.dispatch().
+ * - Call ctq_task_park() before parking a task in another queue that may hand
+ *   it to ctq_insert_parked(). While such a hand-off is in flight, the task's
+ *   ops.enqueue() must neither park nor insert it, and dispatches it directly
+ *   instead, as for ctq_task_dispatching().
  * - Set ctq_tid_to_task when SCX_OPS_TID_TO_TASK is enabled, which needs
  *   v7.2 or later. Without it, leave SCX_OPS_ENQ_EXITING clear, since the
  *   pid of an exiting task can be unhashed while the task is still enqueued.
@@ -72,6 +80,17 @@ enum ctq_node_flags {
 enum ctq_err {
 	/* ctq_insert() of a DISPATCHING node; dispatch the task directly instead */
 	CTQ_ERR_INSERT_BYPASS	= 1,
+	/* ctq_insert_parked() of a node whose dequeue cancelled the move */
+	CTQ_ERR_PARK_CANCELLED	= 2,
+};
+
+/* the state of a node's move from another queue, see ctq_insert_parked() */
+enum ctq_park {
+	CTQ_PARK_NONE		= 0,
+	/* parked in another queue, to be moved here */
+	CTQ_PARK_PARKED		= 1,
+	/* the task was dequeued while parked; the move must not commit */
+	CTQ_PARK_CANCELLED	= 2,
 };
 
 struct ctq;
@@ -82,6 +101,8 @@ struct ctq_node {
 	/* the queue the node is in, NULL if none; written under its lock */
 	struct ctq __arena	*ctq;
 	u32			flags;
+	/* enum ctq_park, changed by cmpxchg once the task is parked */
+	u32			park;
 	/* the CPU the task must run on (pinned or migration-disabled), or -1 */
 	s32			forced_id;
 	/* the CPU that consumed the node last */
@@ -117,7 +138,14 @@ int ctq_task_fini(struct ctq_node __arena *n);
 
 int ctq_insert(struct ctq __arena *q, struct task_struct *p,
 	       struct ctq_node __arena *n, u64 key);
+int ctq_insert_parked(struct ctq __arena *q, struct task_struct *p,
+		      struct ctq_node __arena *n, u64 key);
 int ctq_remove(struct ctq_node __arena *n);
+
+static __always_inline void ctq_task_park(struct ctq_node __arena *n)
+{
+	WRITE_ONCE(n->park, CTQ_PARK_PARKED);
+}
 
 int ctq_cpu_flushed(void);
 int ctq_task_dispatching(struct ctq_node __arena *n);

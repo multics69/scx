@@ -48,6 +48,7 @@ int ctq_task_init(struct ctq_node __arena *n __arg_arena)
 {
 	WRITE_ONCE(n->ctq, NULL);
 	WRITE_ONCE(n->flags, 0);
+	WRITE_ONCE(n->park, CTQ_PARK_NONE);
 	WRITE_ONCE(n->forced_id, -1);
 	WRITE_ONCE(n->pop_cpu, -1);
 	WRITE_ONCE(n->task, 0);
@@ -198,9 +199,9 @@ bool ctq_task_allowed(struct ctq_node __arena *n, s32 cpu)
 	return (bpf_core_cast((void *)word, struct cpumask)->bits[0] >> (cpu % 64)) & 1;
 }
 
-__weak
-int ctq_insert(struct ctq __arena *q __arg_arena, struct task_struct *p __arg_trusted,
-	       struct ctq_node __arena *n __arg_arena, u64 key)
+static __always_inline
+int ctq_link(struct ctq __arena *q, struct task_struct *p,
+	     struct ctq_node __arena *n, u64 key, bool parked)
 {
 	s32 forced_id = -1;
 	u64 tid = 0;
@@ -208,8 +209,9 @@ int ctq_insert(struct ctq __arena *q __arg_arena, struct task_struct *p __arg_tr
 	int ret;
 
 	/*
-	 * The task's enqueue is serialized against its dequeue and other
-	 * enqueues, so a node being inserted is in no queue.
+	 * A node being inserted is in no queue. The task's enqueue is serialized
+	 * against its dequeue and other enqueues, and no enqueue inserts the
+	 * task while a move of it is in flight.
 	 */
 	if (unlikely(READ_ONCE(n->ctq))) {
 		scx_bpf_error("ctq: pid %d inserted twice", p->pid);
@@ -237,6 +239,37 @@ int ctq_insert(struct ctq __arena *q __arg_arena, struct task_struct *p __arg_tr
 
 	scx_spin_lock(&q->lock);
 
+	/*
+	 * A parked task is moved here by another CPU without the task's rq
+	 * lock, e.g., when cgroup_bw drains a throttled task from its queue
+	 * after the cgroup gets its budget back. After the task leaves the
+	 * parking queue and before it is linked into this CTQ, its dequeue
+	 * finds it in neither and its next enqueue places it anew. A late link
+	 * would then put the task here as well as where that enqueue placed
+	 * it.
+	 *
+	 * To close the race between the move (parking queue -> CTQ) and the
+	 * task's dequeue and enqueue, the node has a park word, so exactly one
+	 * of them owns the task. The dequeue changes PARKED to CANCELLED and
+	 * the mover changes PARKED to NONE, both by cmpxchg. The mover
+	 * publishes n->ctq first, so a dequeue that loses finds the link and
+	 * removes it under the lock. A mover that loses drops the task. The
+	 * task's enqueue neither parks nor inserts it while a move is in
+	 * flight, which it can tell from the hold the parking queue takes on
+	 * the task, so the word cannot become PARKED again.
+	 */
+	if (parked) {
+		WRITE_ONCE(n->ctq, q);
+		if (cmpxchg(&n->park, CTQ_PARK_PARKED, CTQ_PARK_NONE) !=
+		    CTQ_PARK_PARKED) {
+			WRITE_ONCE(n->ctq, NULL);
+			scx_spin_unlock(&q->lock);
+			return CTQ_ERR_PARK_CANCELLED;
+		}
+	} else {
+		WRITE_ONCE(n->park, CTQ_PARK_NONE);
+	}
+
 	flags = n->flags & ~(CTQ_NODE_REPORTED | CTQ_NODE_ALL_CPUS);
 	if (forced_id < 0 && p->nr_cpus_allowed == nr_cpu_ids)
 		flags |= CTQ_NODE_ALL_CPUS;
@@ -248,8 +281,7 @@ int ctq_insert(struct ctq __arena *q __arg_arena, struct task_struct *p __arg_tr
 	n->rb.key = key;
 
 	ret = rb_insert_node(&q->tree, &n->rb);
-	if (!ret)
-		WRITE_ONCE(n->ctq, q);
+	WRITE_ONCE(n->ctq, ret ? NULL : q);
 
 	scx_spin_unlock(&q->lock);
 
@@ -257,10 +289,31 @@ int ctq_insert(struct ctq __arena *q __arg_arena, struct task_struct *p __arg_tr
 }
 
 __weak
+int ctq_insert(struct ctq __arena *q __arg_arena, struct task_struct *p __arg_trusted,
+	       struct ctq_node __arena *n __arg_arena, u64 key)
+{
+	return ctq_link(q, p, n, key, false);
+}
+
+__weak
+int ctq_insert_parked(struct ctq __arena *q __arg_arena,
+		      struct task_struct *p __arg_trusted,
+		      struct ctq_node __arena *n __arg_arena, u64 key)
+{
+	return ctq_link(q, p, n, key, true);
+}
+
+__weak
 int ctq_remove(struct ctq_node __arena *n __arg_arena)
 {
-	struct ctq __arena *q = smp_load_acquire(&n->ctq);
+	struct ctq __arena *q;
 	int ret = 0;
+
+	/* Cancel a move from another queue before it can commit. */
+	if (smp_load_acquire(&n->park) == CTQ_PARK_PARKED)
+		cmpxchg(&n->park, CTQ_PARK_PARKED, CTQ_PARK_CANCELLED);
+
+	q = smp_load_acquire(&n->ctq);
 
 	if (!q)
 		return 0;
