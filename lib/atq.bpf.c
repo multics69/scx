@@ -193,10 +193,17 @@ u64 scx_atq_pop(scx_atq_t *atq, bool hold)
 	}
 
 	taskc = (scx_task_common *)taskc_ptr;
-	if (hold)
+	if (hold) {
 		scx_atq_task_hold(taskc);
-
-	taskc->atq = NULL;
+		/*
+		 * A reader that finds ->atq cleared without taking the lock
+		 * must also see the hold, which tells it the task is still in
+		 * the hands of this popper.
+		 */
+		smp_store_release(&taskc->atq, NULL);
+	} else {
+		taskc->atq = NULL;
+	}
 
 	scx_spin_unlock(&atq->lock);
 
