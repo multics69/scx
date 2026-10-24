@@ -3749,7 +3749,11 @@ int scx_cgroup_bw_is_task_throttled(u64 taskc)
 	if (!ctx)
 		return false;
 
-	atq = READ_ONCE(ctx->atq);
+	/*
+	 * Acquire, paired with the release in scx_atq_pop(): a caller that
+	 * finds ->atq cleared and then tests the task's hold must see it.
+	 */
+	atq = smp_load_acquire(&ctx->atq);
 	return atq != NULL && atq != (scx_atq_t *)SCX_ATQ_DEAD;
 }
 
