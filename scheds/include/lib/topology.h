@@ -51,6 +51,7 @@ extern u32 topo_max_children[TOPO_MAX_LEVEL];
 int topo_init(scx_bitmap_t __arg_arena mask, u64 data_size, s16 id);
 int topo_contains(topo_ptr topo, u32 cpu);
 int topo_cpu_to_llc_id(u32 cpu);
+int topo_cpu_to_numa_id(u32 cpu);
 
 u64 topo_mask_level_internal(topo_ptr topo, enum topo_level level);
 #define topo_mask_level(topo, level) ((scx_bitmap_t) topo_mask_level_internal((topo), (level)))
