@@ -431,6 +431,26 @@ topo_cpu_to_llc_id(u32 cpu)
 	return topo->level_ids[TOPO_LLC];
 }
 
+/*
+ * The NUMA node of @cpu, or NUMA_NO_NODE if the topology does not place it.
+ * The id is the kernel's, so it can be passed to bpf_arena_alloc_pages().
+ */
+__weak int
+topo_cpu_to_numa_id(u32 cpu)
+{
+	topo_ptr topo;
+
+	/* See topo_cpu_to_llc_id() for the bound against NR_CPUS. */
+	if (cpu >= nr_cpu_ids || cpu >= NR_CPUS)
+		return NUMA_NO_NODE;
+
+	topo = (topo_ptr)topo_nodes[TOPO_CPU][cpu];
+	if (!topo || topo->level_ids[TOPO_NODE] < 0)
+		return NUMA_NO_NODE;
+
+	return topo->level_ids[TOPO_NODE];
+}
+
 volatile u64 a;
 
 __weak __maybe_unused
