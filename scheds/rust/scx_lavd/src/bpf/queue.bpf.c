@@ -585,3 +585,67 @@ void queue_task_dequeue(task_ctx __arg_arena *taskc)
 	ctq_remove(&taskc->ctq);
 	queue_release_cpu(taskc);
 }
+
+/*
+ * Name the queue @q in @type and @id: "cpu", "cpdom" or "turb", or "?" if it
+ * is none of lavd's.
+ */
+static void queue_name(struct ctq __arena *q, const char **type, s32 *id)
+{
+	s32 i;
+
+	*type = "?";
+	*id = -1;
+	bpf_for(i, 0, nr_cpdoms) {
+		if (queue_cpdom_ctqs && queue_cpdom_ctqs[i] == q) {
+			*type = "cpdom";
+			*id = i;
+			return;
+		}
+		if (queue_turb_ctqs && queue_turb_ctqs[i] == q) {
+			*type = "turb";
+			*id = i;
+			return;
+		}
+	}
+	bpf_for(i, 0, nr_cpu_ids) {
+		if (queue_cpu_ctqs && queue_cpu_ctqs[i] == q) {
+			*type = "cpu";
+			*id = i;
+			return;
+		}
+	}
+}
+
+/*
+ * Where @taskc's task is in lavd's queues. A QUEUED task in no queue whose
+ * node is not DISPATCHING is in BPF custody but nowhere a CPU can find it.
+ */
+__hidden
+void queue_dump_task(task_ctx __arg_arena *taskc)
+{
+	struct ctq_node __arena *n = &taskc->ctq;
+	struct ctq __arena *q = READ_ONCE(n->ctq);
+	const char *type = "none";
+	s32 id = -1, pop_cpu = n->pop_cpu;
+
+	scx_arena_subprog_init();
+
+	if (q)
+		queue_name(q, &type, &id);
+
+	scx_bpf_dump("  \\_ queue: %s[%d]   node flags: 0x%x   park: %u   forced: %d   resv_cpu: %d\n",
+		     type, id, n->flags, n->park, n->forced_id,
+		     READ_ONCE(taskc->resv_cpu_id));
+	scx_bpf_dump("  \\_ pop_cpu: %d   pop_round: %llu   pop_cpu round now: 0x%llx\n",
+		     pop_cpu, n->pop_round, ctq_cpu_round(pop_cpu));
+}
+
+/* How many tasks each queue of compute domain @cpdom_id holds. */
+__hidden
+void queue_dump_cpdom(u64 cpdom_id)
+{
+	scx_bpf_dump("  steady: %d   turb: %d\n",
+		     queue_nr_queued(cpdom_to_dsq(cpdom_id)),
+		     queue_nr_queued(cpdom_to_turb_dsq(cpdom_id)));
+}

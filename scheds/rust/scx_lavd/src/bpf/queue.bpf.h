@@ -32,3 +32,7 @@ bool queue_task_in_flight(struct task_ctx __arena *taskc);
 void queue_task_park(struct task_ctx __arena *taskc);
 void queue_task_running(struct task_ctx __arena *taskc);
 void queue_task_dequeue(struct task_ctx __arena *taskc);
+
+/* Exit dumps (queue.bpf.c). */
+void queue_dump_task(struct task_ctx __arena *taskc);
+void queue_dump_cpdom(u64 cpdom_id);

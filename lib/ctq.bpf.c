@@ -484,6 +484,17 @@ int ctq_cpu_offline(s32 cpu)
 }
 
 __weak
+u64 ctq_cpu_round(s32 cpu)
+{
+	/* Callers such as ops.dump_cpu() may touch no arena memory themselves. */
+	scx_arena_subprog_init();
+
+	if (!ctq_cpus || cpu < 0 || cpu >= nr_cpu_ids)
+		return 0;
+	return READ_ONCE(ctq_cpus[cpu]->round);
+}
+
+__weak
 u64 ctq_consume_internal(struct ctq __arena *q __arg_arena, s32 cpu)
 {
 	struct ctq_node __arena *n, *picked = NULL;

@@ -2355,12 +2355,64 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
 
 void BPF_STRUCT_OPS(lavd_dump, struct scx_dump_ctx *dctx)
 {
+	struct cpdom_ctx *cpdomc;
+	u64 i;
+
+	/*
+	 * Dump each compute domain's queues and how many of its CPUs are
+	 * active or in the overflow set.
+	 */
+	bpf_for(i, 0, nr_cpdoms) {
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [i]);
+		if (!cpdomc || !cpdomc->is_valid)
+			continue;
+		scx_bpf_dump("cpdom %llu: nr_active_cpus: %u   nr_overflow_cpus: %u   is_stealer: %u   is_stealee: %u\n",
+			     i, cpdomc->nr_active_cpus, cpdomc->nr_overflow_cpus,
+			     cpdomc->is_stealer, cpdomc->is_stealee);
+		queue_dump_cpdom(i);
+	}
+
 	/*
 	 * Dump the cpu.max status of the entire cgroup hierarchy.
 	 */
 	if (enable_cpu_bw) {
 		scx_cgroup_bw_dump(0, true, true, true);
 	}
+}
+
+/*
+ * Dump whether @cpu may dispatch: its sets, reservations and pinned tasks. An
+ * idle CPU outside both sets that nothing holds is left out.
+ */
+void BPF_STRUCT_OPS(lavd_dump_cpu, struct scx_dump_ctx *dctx, s32 cpu,
+		    bool idle)
+{
+	struct bpf_cpumask *active, *ovrflw;
+	bool in_active = false, in_ovrflw = false;
+	struct cpu_ctx *cpuc;
+	u32 nr_resv, nr_pinned;
+
+	cpuc = get_cpu_ctx_id(cpu);
+	if (!cpuc)
+		return;
+
+	bpf_rcu_read_lock();
+	active = active_cpumask;
+	ovrflw = ovrflw_cpumask;
+	if (active)
+		in_active = bpf_cpumask_test_cpu(cpu, cast_mask(active));
+	if (ovrflw)
+		in_ovrflw = bpf_cpumask_test_cpu(cpu, cast_mask(ovrflw));
+	bpf_rcu_read_unlock();
+
+	nr_resv = READ_ONCE(cpuc->nr_resv_tasks);
+	nr_pinned = READ_ONCE(cpuc->nr_pinned_tasks);
+	if (idle && !in_active && !in_ovrflw && !nr_resv && !nr_pinned)
+		return;
+
+	scx_bpf_dump("  lavd: cpdom: %u   active: %d   ovrflw: %d   online: %u   resv: %u   pinned: %u   round: 0x%llx\n",
+		     cpuc->cpdom_id, in_active, in_ovrflw, cpuc->is_online,
+		     nr_resv, nr_pinned, ctq_cpu_round(cpu));
 }
 
 void BPF_STRUCT_OPS(lavd_dump_task, struct scx_dump_ctx *dctx,
@@ -2407,6 +2459,8 @@ void BPF_STRUCT_OPS(lavd_dump_task, struct scx_dump_ctx *dctx,
 	 */
 	scx_bpf_dump("  \\_ ddsp_dsq_id: 0x%llx   ddsp_enq_flags: 0x%llx\n",
 		     p->scx.ddsp_dsq_id, p->scx.ddsp_enq_flags);
+
+	queue_dump_task(taskc);
 }
 
 static s32 init_cpdoms(u64 now)
@@ -2900,6 +2954,7 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .init_task		= (void *)lavd_init_task,
 	       .exit_task		= (void *)lavd_exit_task,
 	       .dump			= (void *)lavd_dump,
+	       .dump_cpu		= (void *)lavd_dump_cpu,
 	       .dump_task		= (void *)lavd_dump_task,
 	       .cgroup_init		= (void *)lavd_cgroup_init,
 	       .cgroup_exit		= (void *)lavd_cgroup_exit,
