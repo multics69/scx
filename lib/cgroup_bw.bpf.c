@@ -2645,8 +2645,11 @@ int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 ctx, u64 vt
 {
 	cbw_dbg(" [%s/%d]", p->comm, p->pid);
 
-	if (ctx)
+	if (ctx) {
 		cbw_sync_bill_gen((scx_task_cgroup_bw_t *)ctx);
+		/* For the BTQ drain to find @p; see the enqueue callback. */
+		WRITE_ONCE(((scx_task_cgroup_bw_t *)ctx)->task, (u64)p);
+	}
 	/* Park @p under its own billing cgroup (resolved from @p, cache-hot). */
 	return cbw_put_aside(ctx, vtime,
 			     cbw_bill_task((scx_task_cgroup_bw_t *)ctx, p));
@@ -3563,6 +3566,8 @@ int scx_cgroup_bw_move(struct task_struct *p __arg_trusted, u64 task_ptr,
 		__sync_lock_test_and_set(&tc->bill_cgrp_id, 0);
 		__sync_lock_test_and_set(&tc->cgx_raw, 0);
 		__sync_lock_test_and_set(&tc->llcx_raw, 0);
+		/* Re-parked below, possibly; see the enqueue callback. */
+		WRITE_ONCE(tc->task, (u64)p);
 	}
 
 	/*
