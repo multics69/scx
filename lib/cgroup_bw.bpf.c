@@ -2135,6 +2135,12 @@ s64 tree_absorb_deeper(u32 level)
 	return sum;
 }
 
+/*
+ * Set when an accounting pass throttles a cgroup that was not throttled, so
+ * that the accounting timer preempts the CPUs running its tasks.
+ */
+static bool cbw_newly_throttled;
+
 static
 int cbw_update_runtime_total_sloppy(struct cgroup *cgrp)
 {
@@ -2238,8 +2244,11 @@ int cbw_update_runtime_total_sloppy(struct cgroup *cgrp)
 		 * reflects any debt carried from the previous period, so the
 		 * comparison enforces long-run average convergence.
 		 */
-		if (rts >= cur_cgx->period_budget)
+		if (rts >= cur_cgx->period_budget &&
+		    !READ_ONCE(cur_cgx->is_throttled)) {
 			WRITE_ONCE(cur_cgx->is_throttled, true);
+			cbw_newly_throttled = true;
+		}
 
 		cbw_dbg("cgid%llu -- rt_llcx: %lld -- runtime_total_sloppy: %lld",
 			cur_cgx->id, rt_llcx, rts);
@@ -2335,6 +2344,7 @@ u64 cbw_throttle_cgroups(struct cgroup *cgrp)
 			cur_anc_cgx = cbw_get_cgroup_ctx(cur_anc_cgrp);
 			if (cur_anc_cgx && READ_ONCE(cur_anc_cgx->is_throttled)) {
 				WRITE_ONCE(cur_cgx->is_throttled, true);
+				cbw_newly_throttled = true;
 				break;
 			}
 			anc_css = anc_css->parent;
@@ -3127,6 +3137,50 @@ int scx_cgroup_bw_pressure(struct task_struct *p __arg_trusted __arg_nullable,
 
 
 /*
+ * Preempt the CPUs whose current task bills to a throttled cgroup.
+ *
+ * A throttle reaches a task only when the scheduler next handles it: at its
+ * enqueue, or at its next tick if it is running, which can be 10ms away with
+ * HZ=100. Until then, every running task of a newly throttled cgroup keeps
+ * running, and its time becomes debt that the cgroup repays before it runs
+ * again. Kicking the CPUs stops the tasks now, and they are put aside on
+ * their way back through ops.enqueue().
+ *
+ * The current task is read without its rq lock, so its cgroup can change
+ * under us. RCU keeps the task and its cgroup valid while we read them, and
+ * a wrong guess costs one needless reschedule or one tick of overrun. An
+ * exiting task is never throttled, so it is left running.
+ */
+static void cbw_preempt_throttled(void)
+{
+	struct task_struct *curr;
+	scx_cgroup_ctx_t *cgx;
+	struct cgroup *cgrp;
+	u32 nr_cpus = scx_bpf_nr_cpu_ids();
+	u64 bill;
+	s32 cpu;
+
+	bpf_rcu_read_lock();
+	bpf_for(cpu, 0, nr_cpus) {
+		curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+		/* An offline CPU runs its idle task, which has pid 0. */
+		if (!curr || !BPF_CORE_READ(curr, pid) ||
+		    (BPF_CORE_READ(curr, flags) & PF_EXITING))
+			continue;
+
+		cgrp = cbw_task_cgroup(curr);
+		bill = cgrp ? cbw_resolve_bill_cgid(cgrp) : cbw_root_cgid;
+		if (bill == cbw_root_cgid)
+			continue;
+
+		cgx = cbw_get_cgroup_ctx_with_id(bill);
+		if (cgx && READ_ONCE(cgx->is_throttled))
+			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+	}
+	bpf_rcu_read_unlock();
+}
+
+/*
  * A handler function for the accounting timer.
  */
 static
@@ -3156,6 +3210,11 @@ int accounting_timerfn(void *map, int *key, struct bpf_timer *timer)
 	cbw_update_runtime_total_sloppy(root_cgrp);
 	next_interval = cbw_throttle_cgroups(root_cgrp);
 	smp_mb();
+
+	if (cbw_newly_throttled) {
+		cbw_newly_throttled = false;
+		cbw_preempt_throttled();
+	}
 
 release_out:
 	bpf_cgroup_release(root_cgrp);
