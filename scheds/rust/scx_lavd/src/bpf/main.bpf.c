@@ -560,8 +560,7 @@ static void update_stat_for_running(struct task_struct *p,
 static void account_task_runtime(struct task_struct *p,
 				 task_ctx *taskc,
 				 struct cpu_ctx *cpuc,
-				 u64 now,
-				 bool may_resolve)
+				 u64 now)
 {
 	u64 task_time_wall, task_time_iwgt, task_time_invr, exec_now, exec_delta;
 	u64 now_task, now_pelt;
@@ -605,14 +604,11 @@ static void account_task_runtime(struct task_struct *p,
 	task_time_iwgt = task_time_invr / p->scx.weight;
 
 	/*
-	 * Under cpu.max, report the consumed time. A cache-only call (NULL @p,
-	 * @may_resolve == false) bills only an already-resolved cgroup; the
-	 * library carries any interval it cannot yet attribute and bills it once
-	 * @p's billing cgroup resolves on a resolving call.
+	 * Under cpu.max, report the consumed time. The library resolves @p's
+	 * billing cgroup from @p itself, so this bills it now from any op.
 	 */
 	if (enable_cpu_bw && (p->pid != lavd_pid))
-		scx_cgroup_bw_consume(may_resolve ? p : NULL, (u64)taskc,
-				      task_time_wall);
+		scx_cgroup_bw_consume(p, (u64)taskc, task_time_wall);
 
 	WRITE_ONCE(cpuc->tot_task_time_wall, cpuc->tot_task_time_wall + task_time_wall);
 	WRITE_ONCE(cpuc->tot_task_time_iwgt, cpuc->tot_task_time_iwgt + task_time_iwgt);
@@ -643,7 +639,7 @@ static void update_stat_for_stopping(struct task_struct *p,
 	/*
 	 * Account task runtime statistics first.
 	 */
-	account_task_runtime(p, taskc, cpuc, now, true);
+	account_task_runtime(p, taskc, cpuc, now);
 
 	taskc->avg_runtime_wall = calc_avg(taskc->avg_runtime_wall,
 					   taskc->acc_runtime_wall);
@@ -686,13 +682,9 @@ static void update_stat_for_refill(struct task_struct *p,
 	u64 now = scx_bpf_now();
 
 	/*
-	 * ops.dispatch() operates on the CPU, not on @p, so account cache-only
-	 * (may_resolve = false): scx_bpf_task_cgroup() must not run on a
-	 * non-subject task. When @p's billing cgroup is unresolved (cache cold,
-	 * just after the managed set changed), the library carries the interval
-	 * and bills it on @p's next subject op.
+	 * Account task runtime statistics first.
 	 */
-	account_task_runtime(p, taskc, cpuc, now, false);
+	account_task_runtime(p, taskc, cpuc, now);
 
 	/*
 	 * We update avg_runtime_wall/invr here
@@ -1327,14 +1319,11 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx
 
 	/*
 	 * Update stats, then recheck the cpu.max throttle before recalculating
-	 * the time slice. Both run cache-only: ops.dispatch() operates on the
-	 * CPU, not on @prev, so scx_bpf_task_cgroup() must not run here. A cold
-	 * billing cache resolves to "not throttled" here; @prev's billing is
-	 * resolved on its next subject op.
+	 * the time slice.
 	 */
 	update_stat_for_refill(prev, taskc_prev, cpuc);
 	if (enable_cpu_bw &&
-	    scx_cgroup_bw_throttled(NULL, (u64)taskc_prev) == -EAGAIN)
+	    cgroup_throttled(prev, taskc_prev, false) == -EAGAIN)
 		return;
 
 	/*
@@ -1866,7 +1855,7 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	 */
 	refresh_cpuperf_target(cpuc, now);
 
-	account_task_runtime(p, taskc, cpuc, now, true);
+	account_task_runtime(p, taskc, cpuc, now);
 
 	/*
 	 * Under the CPU bandwidth control with cpu.max, check if the cgroup
