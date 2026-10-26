@@ -162,6 +162,8 @@ int ctq_insert_parked(struct ctq __arena *q, struct task_struct *p,
 		      struct ctq_node __arena *n, u64 key);
 int ctq_remove(struct ctq_node __arena *n);
 int ctq_cpu_offline(s32 cpu);
+/* @cpu's dispatch round with CTQ_ROUND_CONSUMED, for dumps */
+u64 ctq_cpu_round(s32 cpu);
 
 static __always_inline void ctq_task_park(struct ctq_node __arena *n)
 {
