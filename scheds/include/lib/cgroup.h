@@ -96,16 +96,13 @@ int scx_cgroup_bw_throttled(struct task_struct *p __arg_trusted __arg_nullable, 
 
 /**
  * scx_cgroup_bw_consume - Consume the time actually used after the task execution.
- * @p: the task being accounted; the current op's subject task, or NULL for a
- *     cache-only call (a non-subject op such as ops.dispatch()).
+ * @p: the task being accounted, or NULL to bill only through the billing
+ *     cgroup cached in @taskc_raw.
  * @taskc_raw: per-task context (scx_task_cgroup_bw *) cast to u64 for caching.
  * @consumed_ns: amount of time actually used.
  *
- * Return 0 on success -- billed now, nothing to bill (root/unlimited), or
- * deferred: a cache-only caller (@p == NULL) whose billing cgroup is not yet
- * resolved has this interval carried in the task and billed on the next
- * resolved call, so the caller never has to defer its own accounting. Returns
- * -errno only on a hard failure.
+ * Return 0 on success -- billed, or nothing to bill (root/unlimited, or a NULL
+ * @p with no cached billing cgroup). Returns -errno only on a hard failure.
  */
 int scx_cgroup_bw_consume(struct task_struct *p __arg_trusted __arg_nullable, u64 taskc,
 			  u64 consumed_ns);
@@ -309,9 +306,6 @@ int scx_cgroup_bw_dump(u64 cgrp_id, bool descendent, bool accurate, bool indent)
  * @bill_gen:     Generation id (cbw_bill_gen) the cached billing state above
  *                was resolved against; when it lags, the cache is dropped and
  *                re-resolved.
- * @pending_ns:   Consumed time a cache-only call could not yet attribute to a
- *                billing cgroup; carried here and billed on the next resolved
- *                call so no accounting is lost.
  * @task:         The task_struct of a parked task, recorded when it is put
  *                aside, for the BTQ drain to find it again.
  * @last_llc_id:  LLC id for which @llcx_raw was cached.
@@ -322,7 +316,6 @@ struct scx_task_cgroup_bw {
 	u64			cgx_raw;	/* 0 = not cached */
 	u64			llcx_raw;	/* 0 = not cached */
 	u64			bill_gen;	/* cbw_bill_gen the cache was resolved against */
-	u64			pending_ns;	/* deferred consumed time, billed once resolved */
 	u64			task;		/* task_struct of a parked task */
 	int			last_llc_id;
 };
