@@ -1783,6 +1783,15 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	scx_bpf_task_set_slice(p, calc_time_slice(p, taskc, cpuc));
 
 	/*
+	 * A task released from a cpu.max backlog can still be waiting in a
+	 * queue when its cgroup is throttled again, and nothing stops it
+	 * before its first tick. Preempt it now, so that it goes back through
+	 * ops.enqueue() and is put aside.
+	 */
+	if (enable_cpu_bw && cgroup_throttled(p, taskc, false) == -EAGAIN)
+		scx_bpf_kick_cpu(cpuc->cpu_id, SCX_KICK_PREEMPT);
+
+	/*
 	 * Update the current logical clock.
 	 */
 	advance_cur_logical_clk(p);
