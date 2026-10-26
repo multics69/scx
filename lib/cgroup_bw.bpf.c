@@ -2476,16 +2476,13 @@ int scx_cgroup_bw_throttled(struct task_struct *p __arg_trusted __arg_nullable, 
 
 /**
  * scx_cgroup_bw_consume - Consume the time actually used after the task execution.
- * @p: the task being accounted; the current op's subject task, or NULL for a
- *     cache-only call (a non-subject op such as ops.dispatch()).
+ * @p: the task being accounted, or NULL to bill only through the billing
+ *     cgroup cached in @taskc_raw.
  * @taskc_raw: per-task context (scx_task_cgroup_bw *) cast to u64 for caching.
  * @consumed_ns: amount of time actually used.
  *
- * Return 0 on success -- billed now, nothing to bill (root/unlimited), or
- * deferred: a cache-only caller (@p == NULL) whose billing cgroup is not yet
- * resolved has this interval carried in the task and billed on the next
- * resolved call, so the caller never has to defer its own accounting. Returns
- * -errno only on a hard failure.
+ * Return 0 on success -- billed, or nothing to bill (root/unlimited, or a NULL
+ * @p with no cached billing cgroup). Returns -errno only on a hard failure.
  */
 __hidden
 int scx_cgroup_bw_consume(struct task_struct *p __arg_trusted __arg_nullable, u64 taskc_raw,
@@ -2494,24 +2491,13 @@ int scx_cgroup_bw_consume(struct task_struct *p __arg_trusted __arg_nullable, u6
 	scx_task_cgroup_bw_t *taskc = (scx_task_cgroup_bw_t *)taskc_raw;
 	scx_cgroup_llc_ctx_t *llcx;
 	scx_cgroup_ctx_t *cgx;
-	u64 cgx_raw, llcx_raw, carry = 0;
+	u64 cgx_raw, llcx_raw;
 	int llc_id;
 
 	if (!taskc)
 		return 0;
 
 	cbw_sync_bill_gen(taskc);
-
-	/*
-	 * Absorb any interval an earlier cache-only call could not attribute to a
-	 * billing cgroup (see the deferral below) and bill it together with this
-	 * one. The carry shares this interval's fate: billed at the accounting
-	 * site, re-deferred if this call also cannot resolve, or dropped if the
-	 * billing cgroup is root/unlimited or gone -- exactly what would have
-	 * happened had the carried time been measured now.
-	 */
-	if (taskc->pending_ns)
-		carry = __sync_lock_test_and_set(&taskc->pending_ns, 0);
 
 	/*
 	 * Fast path for the common case: a task in the root or a fully-unlimited
@@ -2530,17 +2516,8 @@ int scx_cgroup_bw_consume(struct task_struct *p __arg_trusted __arg_nullable, u6
 	} else {
 		u64 bill_id = cbw_bill_task(taskc, p);
 
-		/*
-		 * Cache-only caller (@p == NULL) with a cold cache: the billing
-		 * cgroup is unknown here. Defer -- carry this interval (plus any
-		 * already carried) and bill it on the next call that resolves,
-		 * which lands on @p's current billing cgroup.
-		 */
-		if (bill_id == 0) {
-			__sync_fetch_and_add(&taskc->pending_ns, carry + consumed_ns);
-			return 0;
-		}
-		if (bill_id == cbw_root_cgid)
+		/* A NULL @p with a cold cache: the billing cgroup is unknown. */
+		if (bill_id == 0 || bill_id == cbw_root_cgid)
 			return 0;
 		cgx_raw = cbw_get_cgroup_ctx_raw(bill_id);
 		if (!cgx_raw)
@@ -2595,7 +2572,7 @@ int scx_cgroup_bw_consume(struct task_struct *p __arg_trusted __arg_nullable, u6
 	 * is subtracted from the next period's budget, keeping long-term CPU
 	 * bandwidth correct.
 	 */
-	__sync_fetch_and_add(&llcx->runtime_total, consumed_ns + carry);
+	__sync_fetch_and_add(&llcx->runtime_total, consumed_ns);
 
 	cbw_dbg("  bill cgid%llu -- llc_id: %d -- consumed_ns: %llu -- llcx:runtime_total: %lld",
 		cgx->id, llc_id, consumed_ns, READ_ONCE(llcx->runtime_total));
@@ -3789,12 +3766,7 @@ int scx_cgroup_bw_move(struct task_struct *p __arg_trusted, u64 task_ptr,
 
 	scx_arena_subprog_init();
 	/*
-	 * Drain any time an earlier cache-only call deferred (pending_ns) and
-	 * charge it to @from below, before repointing @p -- otherwise it would be
-	 * billed to @to. The atomic drain is race-safe against a concurrent
-	 * consume: only one side sees the value.
-	 *
-	 * Then invalidate the per-task cache: bill_cgrp_id, cgx_raw and llcx_raw
+	 * Invalidate the per-task cache: bill_cgrp_id, cgx_raw and llcx_raw
 	 * belong to the old cgroup. They are re-resolved from @p's new cgroup on
 	 * the next throttle/consume call.
 	 *
@@ -3805,37 +3777,6 @@ int scx_cgroup_bw_move(struct task_struct *p __arg_trusted, u64 task_ptr,
 	 */
 	tc = (scx_task_cgroup_bw_t *)taskc;
 	if (tc) {
-		u64 carry = __sync_lock_test_and_set(&tc->pending_ns, 0);
-
-		/*
-		 * Charge the deferred time to @from's billing cgroup, where it was
-		 * consumed. Prefer @p's cached contexts -- read before the
-		 * invalidation below, they still point at the old cgroup: the
-		 * cached LLC ctx charges with no lookup; a cached cgroup ctx (e.g.
-		 * warmed by a throttle check, which caches no LLC ctx) needs only
-		 * an LLC lookup. Fall back to resolving @from when the cache is
-		 * fully cold. Any LLC works; runtime_total rolls up to the cgroup.
-		 */
-		if (carry) {
-			u64 llcx_raw = tc->llcx_raw;
-			u64 cgx_raw = tc->cgx_raw;
-
-			if (!llcx_raw) {
-				int llc_id = cbw_get_current_llc_id();
-
-				if (!cgx_raw)
-					cgx_raw = cbw_get_cgroup_ctx_raw(
-							cbw_resolve_bill_cgid(from));
-				if (cgx_raw && llc_id >= 0)
-					llcx_raw = cbw_get_llc_ctx_raw_with_id(
-						((scx_cgroup_ctx_t *)cgx_raw)->id,
-						llc_id);
-			}
-			if (llcx_raw)
-				__sync_fetch_and_add(&((scx_cgroup_llc_ctx_t *)
-						     llcx_raw)->runtime_total, carry);
-		}
-
 		__sync_lock_test_and_set(&tc->bill_cgrp_id, 0);
 		__sync_lock_test_and_set(&tc->cgx_raw, 0);
 		__sync_lock_test_and_set(&tc->llcx_raw, 0);
