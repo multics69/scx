@@ -1303,6 +1303,15 @@ int cbw_update_nquota_ub(u64 cgx_raw)
 	if (eff_parentx)
 		ub = min(ub, READ_ONCE(eff_parentx->nquota_ub));
 	WRITE_ONCE(cgx->nquota_ub, ub);
+
+	/*
+	 * An unlimited cgroup has no budget to exhaust. Replenishment skips it
+	 * and never recomputes period_budget, so lift the budget as well, or
+	 * the one it had while limited would keep throttling it and its
+	 * subtree.
+	 */
+	if (ub == CBW_RUNTUME_INF)
+		WRITE_ONCE(cgx->period_budget, CBW_RUNTUME_INF);
 	return 0;
 }
 
