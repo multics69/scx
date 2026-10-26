@@ -1602,9 +1602,6 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 	bool is_root;
 	int ret;
 
-	cbw_dbg_cgrp(" level: %d -- period_us: %llu -- quota_us: %llu -- burst_us: %llu ",
-		     cgrp->level, args->bw_period_us, args->bw_quota_us, args->bw_burst_us);
-
 	cgrp_id = cgroup_get_id(cgrp);
 
 	/*
@@ -1797,8 +1794,6 @@ __hidden
 int scx_cgroup_bw_exit(struct cgroup *cgrp __arg_trusted)
 {
 	u64 cgrp_id;
-
-	cbw_dbg_cgrp();
 
 	/*
 	 * A cgroup can exit when there are exiting tasks (TASK_DEAD) under it,
@@ -2011,8 +2006,6 @@ int scx_cgroup_bw_set(struct cgroup *cgrp __arg_trusted, u64 period_us, u64 quot
 	u64 cgx_raw, cur_cgx_raw;
 	struct cgroup_subsys_state *start_css, *pos;
 	int ret = 0;
-
-	cbw_dbg_cgrp();
 
 	/* the root's own cpu.max is not ours to enforce */
 	if (cgroup_get_id(cgrp) == cbw_root_cgid)
@@ -2249,9 +2242,6 @@ int cbw_update_runtime_total_sloppy(struct cgroup *cgrp)
 			WRITE_ONCE(cur_cgx->is_throttled, true);
 			cbw_newly_throttled = true;
 		}
-
-		cbw_dbg("cgid%llu -- rt_llcx: %lld -- runtime_total_sloppy: %lld",
-			cur_cgx->id, rt_llcx, rts);
 	}
 	bpf_rcu_read_unlock();
 
@@ -2413,7 +2403,6 @@ int cbw_billed_throttled(u64 bill_id, scx_task_cgroup_bw_t *taskc)
 		cgx_raw = cbw_get_cgroup_ctx_raw(bill_id);
 		if (!cgx_raw) {
 			/* The billing cgroup has no context (e.g. it exited). */
-			cbw_dbg("Failed to lookup a cgroup ctx: %llu", bill_id);
 			return -ESRCH;
 		}
 		if (taskc)
@@ -2574,8 +2563,6 @@ int scx_cgroup_bw_consume(struct task_struct *p __arg_trusted __arg_nullable, u6
 	 */
 	__sync_fetch_and_add(&llcx->runtime_total, consumed_ns);
 
-	cbw_dbg("  bill cgid%llu -- llc_id: %d -- consumed_ns: %llu -- llcx:runtime_total: %lld",
-		cgx->id, llc_id, consumed_ns, READ_ONCE(llcx->runtime_total));
 	return 0;
 }
 
@@ -2693,8 +2680,6 @@ int cbw_put_aside(u64 ctx, u64 vtime, u64 bill_id)
 __hidden
 int scx_cgroup_bw_put_aside(struct task_struct *p __arg_trusted, u64 ctx, u64 vtime)
 {
-	cbw_dbg(" [%s/%d]", p->comm, p->pid);
-
 	if (ctx) {
 		cbw_sync_bill_gen((scx_task_cgroup_bw_t *)ctx);
 		/* For the BTQ drain to find @p; see the enqueue callback. */
@@ -3164,7 +3149,7 @@ static
 int accounting_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
 	struct cgroup *root_cgrp;
-	u64 now, next_interval = CBW_ACCOUNTING_PERIOD_MAX;
+	u64 next_interval = CBW_ACCOUNTING_PERIOD_MAX;
 	int ret;
 
 	/*
@@ -3180,9 +3165,6 @@ int accounting_timerfn(void *map, int *key, struct bpf_timer *timer)
 
 	if (unlikely(cbw_top_half_running()))
 		goto release_out;
-
-	now = scx_bpf_now();
-	cbw_dbg("at %llu", now);
 
 	cbw_update_runtime_total_sloppy(root_cgrp);
 	next_interval = cbw_throttle_cgroups(root_cgrp);
@@ -3236,7 +3218,6 @@ int replenish_timerfn(void *map, int *key, struct bpf_timer *timer)
 	 */
 	now = scx_bpf_now();
 	cbw_top_half_begin();
-	cbw_dbg("at %llu", now);
 
 	/*
 	 * Update the runtime total before replenishing budgets.
@@ -3328,7 +3309,6 @@ int replenish_timerfn(void *map, int *key, struct bpf_timer *timer)
 	 * the burst time. However, relaxing some accuracy in burst time
 	 * calculation has more benefits than drawbacks.
 	 */
-	cbw_dbg("Start replenish %llu cgroups.", cbw_nr_cgroups);
 	nr_throttled = 0;
 	bpf_for(i, 0, cbw_nr_cgroups) {
 		slot = i;
@@ -3505,7 +3485,6 @@ int cbw_drain_btq_batch(scx_cgroup_ctx_t *cgx,
 
 		scx_cgroup_bw_enqueue_cb((u64)taskc);
 		scx_atq_task_drop(taskc);
-		cbw_dbg("cgid%llu", cgx->id);
 	}
 
 	return i;
@@ -3524,7 +3503,6 @@ int cbw_reenqueue_cgroup(scx_cgroup_ctx_t *cgx, u64 cgrp_id, u64 nuance)
 	 * Note that we start with a random LLC to give each LLC a fair
 	 * chance to be reenqueued.
 	 */
-	cbw_dbg("cgid%llu", cgrp_id);
 
 	bpf_for(i, 0, TOPO_NR(LLC)) {
 		idx = (nuance + i) % TOPO_NR(LLC);
@@ -3613,7 +3591,6 @@ int scx_cgroup_bw_reenqueue(void)
 	 * Note that we intentionally ignore the error to reenqueue all the
 	 * tasks, ensuring it always returns 0.
 	 */
-	cbw_dbg();
 	nuance = bpf_get_prandom_u32();
 	nr_tcgs = backlog_stat.nr_throttled_cgroups;
 	bpf_for(i, 0, nr_tcgs) {
