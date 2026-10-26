@@ -191,21 +191,36 @@ int scx_cgroup_bw_cancel(u64 taskc, u64 flags);
  * again or when the cgroup is exiting for some reason.
  * @eqcb MUST enqueue the task; otherwise, the task will be lost and
  * never be scheduled.
+ *
+ * The task is found through the task_struct recorded when it was parked,
+ * not through a pid saved earlier. An exec from a non-leader thread gives
+ * the thread its leader's pid, so a saved pid can be gone or belong to
+ * another task. A parked task does not run and cannot exit before
+ * ops.exit_task detaches it, so the recorded task is live and its current
+ * pid finds it. The pointer check rejects any other task the lookup finds.
  */
 #define REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(eqcb)					\
 	__hidden int scx_cgroup_bw_enqueue_cb(u64 ctx)				\
 	{									\
 		extern int eqcb(struct task_struct * __arg_trusted, u64);	\
-		task_ctx *taskc = (task_ctx *)ctx;				\
-		struct task_struct *p = bpf_task_from_pid(taskc->pid);		\
+		scx_task_cgroup_bw_t *tc = (scx_task_cgroup_bw_t *)ctx;		\
+		struct task_struct *q, *p;					\
+		u64 task = tc->task;						\
+										\
+		if (!task)							\
+			return 0;						\
+		q = bpf_core_cast((void *)task, struct task_struct);		\
+		p = bpf_task_from_pid(q->pid);					\
 		if (p) {							\
-			eqcb(p, (u64)taskc);					\
+			if ((u64)p == task)					\
+				eqcb(p, ctx);					\
 			bpf_task_release(p);					\
 		}								\
 		/*								\
-		 * If bpf_task_from_pid() fails the task already exited; a	\
-		 * dying task is not lost by skipping reenqueue. This races	\
-		 * a drain against ops.exit_task, which is expected.		\
+		 * A failed or mismatched lookup means the task already	\
+		 * exited; a dying task is not lost by skipping reenqueue.	\
+		 * This races a drain against ops.exit_task, which is		\
+		 * expected.							\
 		 */								\
 		return 0;							\
 	}
@@ -278,6 +293,8 @@ int scx_cgroup_bw_dump(u64 cgrp_id, bool descendent, bool accurate, bool indent)
  * @pending_ns:   Consumed time a cache-only call could not yet attribute to a
  *                billing cgroup; carried here and billed on the next resolved
  *                call so no accounting is lost.
+ * @task:         The task_struct of a parked task, recorded when it is put
+ *                aside, for the BTQ drain to find it again.
  * @last_llc_id:  LLC id for which @llcx_raw was cached.
  */
 struct scx_task_cgroup_bw {
@@ -287,6 +304,7 @@ struct scx_task_cgroup_bw {
 	u64			llcx_raw;	/* 0 = not cached */
 	u64			bill_gen;	/* cbw_bill_gen the cache was resolved against */
 	u64			pending_ns;	/* deferred consumed time, billed once resolved */
+	u64			task;		/* task_struct of a parked task */
 	int			last_llc_id;
 };
 
