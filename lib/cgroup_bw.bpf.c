@@ -3237,15 +3237,17 @@ int replenish_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
 	static int nr_throttled; /* Add `static` to work around the verifier error (-E2BIG) */
 	struct cgroup *root_cgrp, *cur_cgrp;
+	struct bpf_timer *ac_timer;
 	u64 *ids, now;
 	struct cgroup_subsys_state *root_css, *pos;
 	scx_cgroup_ctx_t *cur_cgx;
 	scx_cgroup_llc_ctx_t *cur_llcx;
 	const struct cpumask *online_mask;
 	s64 interval, jitter, period;
+	u64 ac_interval;
 	int i, ret;
 	s32 idle_cpu;
-	u32 slot;
+	u32 slot, ac_key = 0;
 	bool is_throttled;
 
 	/* Attach the timer function to the BPF area context. */
@@ -3426,11 +3428,23 @@ int replenish_timerfn(void *map, int *key, struct bpf_timer *timer)
 		 * may also call cbw_throttle_cgroups() concurrently, is benign:
 		 * cbw_throttle_cgroups() only sets is_throttled (never clears
 		 * it), so two concurrent calls are idempotent.
+		 *
+		 * Re-arm the accounting timer with the interval it returns.
+		 * While every limited cgroup was throttled, the timer was armed
+		 * for CBW_ACCOUNTING_PERIOD_MAX, since no cgroup had a time to
+		 * throttle. Now that the replenishment has released cgroups,
+		 * all their backlogged tasks start running at once, and they
+		 * would overrun the new budget until that late expiry noticed.
 		 */
 		root_cgrp = cbw_get_root_cgrp();
 		if (root_cgrp) {
-			cbw_throttle_cgroups(root_cgrp);
+			ac_interval = cbw_throttle_cgroups(root_cgrp);
 			bpf_cgroup_release(root_cgrp);
+
+			ac_timer = bpf_map_lookup_elem(&accounting_timer, &ac_key);
+			if (ac_timer &&
+			    (ret = bpf_timer_start(ac_timer, ac_interval, 0)))
+				cbw_err("Failed to re-arm accounting timer: %d", ret);
 		}
 
 		/*
