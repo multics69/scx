@@ -544,9 +544,10 @@ static __always_inline const struct cpumask *cast_mask(struct bpf_cpumask *mask)
  * scx_lib_init_probe, an fentry program that fires during the natural
  * scheduler-attach call chain (auto-attached by scx_ops_attach!).
  *
- * Defaults to false (conservative). Over-reporting in is_migration_disabled()
- * causes local-only dispatch, which is safe. Under-reporting can crash the
- * scheduler, so we err high if the probe somehow fails to run.
+ * is_migration_disabled() reads p->migration_disabled only when this is
+ * false, since the prolog then leaves the counter alone. Defaults to false:
+ * if the probe fails to run on a kernel whose prolog does raise the counter,
+ * the helper over-reports for the current task, which only keeps it local.
  */
 bool __scx_prolog_disables_migration __weak = false;
 
@@ -593,57 +594,55 @@ int scx_lib_init_probe(void *ctx)
 }
 
 /*
- * Return true if task @p cannot migrate to a different CPU, false
- * otherwise.
+ * Return true if task @p is migration-disabled by migrate_disable(), false
+ * otherwise. A task pinned by its affinity is not reported; test
+ * p->nr_cpus_allowed for that.
  *
- * IMPORTANT: designed for NON-SLEEPABLE BPF contexts only. Sleepable
- * contexts (BPF_STRUCT_OPS_SLEEPABLE, SEC("syscall"),
- * SEC("fentry.s/...")) enter via __bpf_prog_enter_sleepable() or
- * __bpf_prog_enter_sleepable_recur(), both of which unconditionally
- * call migrate_disable(); this helper can yield a false negative for
- * p == current there, which can crash the scheduler.
+ * A migration-disabled task's p->cpus_ptr is narrowed to its CPU when it
+ * schedules out (migrate_disable_switch() at __schedule() entry), and
+ * nothing else points p->cpus_ptr away from &p->cpus_mask. So the pointer
+ * is exact for a task that is off its CPU, being switched out, or waking,
+ * which covers every task the scheduler places.
+ *
+ * p->migration_disabled is not reliable in BPF. With CONFIG_PREEMPT_RCU,
+ * and before v6.18 unless scx_lib_init_probe found otherwise, the BPF
+ * prolog (__bpf_prog_enter) calls migrate_disable() on the current task.
+ * Prologs nest, e.g. ops.enqueue() under scx_bpf_reenqueue_local() in
+ * ops.cpu_release(), and run on @p's CPU while another CPU reads @p. No
+ * count can then be told apart from a real migrate_disable(), so read the
+ * counter only where the prolog leaves it alone. There it also catches a
+ * running task that has not scheduled out since it disabled migration.
+ * Elsewhere such a task reads as migratable, but it cannot be placed
+ * before it schedules out, when the pointer narrows. So do not keep the
+ * result from a callback that runs while @p is running, such as
+ * ops.tick(); test again when placing @p.
+ *
+ * Sleepable programs (BPF_STRUCT_OPS_SLEEPABLE, SEC("syscall"),
+ * SEC("fentry.s/...")) and programs run by bpf_prog_run_pin_on_cpu()
+ * always disable migration for the current task while they run. Whether
+ * that is reported depends on the kernel: it is where the counter is read,
+ * and not otherwise. The disable ends with the program either way.
  */
 static inline bool is_migration_disabled(const struct task_struct *p)
 {
-	/*
-	 * Testing p->migration_disabled in BPF is tricky because the BPF prolog
-	 * (__bpf_prog_enter) may call migrate_disable() for the current task,
-	 * making migration_disabled == 1 even for tasks that are not truly
-	 * migration-disabled.
-	 *
-	 * Since commit 8e4f0b1ebcf2 ("bpf: use rcu_read_lock_dont_migrate() for
-	 * trampoline.c"), the BPF prolog calls migrate_disable() only when
-	 * CONFIG_PREEMPT_RCU is enabled. Two fast paths cover the common cases:
-	 *
-	 *   1) CONFIG_PREEMPT_RCU: prolog always calls migrate_disable(), so
-	 *      migration_disabled == 1 for the current task is ambiguous.
-	 *      Disambiguate by checking p == current.
-	 *
-	 *   2) v6.18+ without CONFIG_PREEMPT_RCU: prolog never calls
-	 *      migrate_disable(), so migration_disabled == 1 is unambiguously
-	 *      a real migrate_disable() call.
-	 *
-	 * A slow path handles pre-v6.18 kernels without CONFIG_PREEMPT_RCU,
-	 * where the prolog historically called migrate_disable() unconditionally
-	 * but a cherry-picked downstream kernel may not. The runtime-probed flag
-	 * __scx_prolog_disables_migration (set by scx_lib_init_probe) distinguishes
-	 * the two cases without relying on the kernel version alone.
-	 */
-	if (bpf_core_field_exists(p->migration_disabled)) {
-		if (p->migration_disabled == 1) {
-			/* Fast path: prolog always disables migration */
-			if (CONFIG_PREEMPT_RCU)
-				return bpf_get_current_task_btf() != p;
-			/* Fast path: prolog never disables migration */
-			if (LINUX_KERNEL_VERSION >= KERNEL_VERSION(6, 18, 0))
-				return true;
-			/* Slow path: pre-v6.18, !PREEMPT_RCU - use runtime flag */
-			return __scx_prolog_disables_migration ?
-			       bpf_get_current_task_btf() != p : true;
-		}
-		return p->migration_disabled;
+	if (p->cpus_ptr != &p->cpus_mask) {
+		return true;
 	}
-	return false;
+
+	if (!bpf_core_field_exists(p->migration_disabled)) {
+		return false;
+	}
+
+	/* The prolog may raise the counter; see above. */
+	if (CONFIG_PREEMPT_RCU) {
+		return false;
+	}
+	if (LINUX_KERNEL_VERSION < KERNEL_VERSION(6, 18, 0) &&
+	    __scx_prolog_disables_migration) {
+		return false;
+	}
+
+	return p->migration_disabled;
 }
 
 /* rcu */
