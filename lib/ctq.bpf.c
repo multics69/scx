@@ -23,16 +23,42 @@ const volatile bool ctq_tid_to_task;
  */
 #define CTQ_ROUND_CONSUMED	(1ULL << 63)
 
-/* the state of each CPU, one cache line each */
+/*
+ * Maximum batch size of a combiner. A combiner applies other CPUs' requests
+ * with interrupts off, so the bound caps how long a request can take and how
+ * long interrupts stay off. A larger batch gives more throughput only under
+ * contention, which is rare.
+ */
+#define CTQ_COMBINE_MAX		8
+
+enum ctq_op {
+	CTQ_OP_INSERT = 0,
+	CTQ_OP_INSERT_PARKED,
+	CTQ_OP_REMOVE,
+	CTQ_OP_CONSUME,
+};
+
+enum ctq_req_state {
+	/* posted, and its poster waits */
+	CTQ_REQ_WAIT = 0,
+	/* applied by a combiner, and the result is in the node */
+	CTQ_REQ_DONE,
+	/* not applied, and its poster is the next combiner */
+	CTQ_REQ_COMBINE,
+};
+
+/* the state of each CPU, two cache lines each */
 struct ctq_cpu {
 	/* the dispatch round and CTQ_ROUND_CONSUMED, see ctq_cpu_flushed() */
 	u64			round;
-	/* the result of the CPU's last consume */
-	struct ctq_consume_res	res;
+	/* set while the CPU has a request out, to catch a nested one */
+	u32			in_flight;
+	/* the CPU's request node, which holds its last result */
+	struct ctq_req		node;
 } __attribute__((aligned(SCX_CACHELINE_SIZE)));
 
-_Static_assert(sizeof(struct ctq_cpu) == SCX_CACHELINE_SIZE,
-	       "ctq_cpu must be one cache line");
+_Static_assert(sizeof(struct ctq_cpu) == 2 * SCX_CACHELINE_SIZE,
+	       "ctq_cpu must be two cache lines");
 
 /* each CPU's state by CPU id, see ctq_lib_init() */
 static struct ctq_cpu __arena * __arena *ctq_cpus;
@@ -57,6 +83,7 @@ u32 ctq_place_numa(s32 numa, struct ctq_cpu __arena *cpus __arg_arena)
 		if (cpus) {
 			/* Fresh arena pages are not reliably zeroed. */
 			WRITE_ONCE(cpus[nr].round, 0);
+			WRITE_ONCE(cpus[nr].in_flight, 0);
 			/*
 			 * Publish the state once it is zeroed. A tracepoint can
 			 * reach ctq_cpu_flushed() before ctq_lib_init() ends.
@@ -113,7 +140,11 @@ int ctq_lib_init(void)
 __weak
 int ctq_init(struct ctq __arena *q __arg_arena)
 {
+#ifdef CTQ_SYNC_LOCK
 	WRITE_ONCE(q->lock.val.counter, 0);
+#else
+	WRITE_ONCE(q->tail, NULL);
+#endif
 
 	return rb_init(&q->tree, RB_NOALLOC, RB_DUPLICATE);
 }
@@ -354,18 +385,445 @@ bool ctq_task_allowed(struct ctq_node __arena *n, s32 cpu)
 	return ctq_task_cpu_allowed(n->task, cpu);
 }
 
+/*
+ * Link the node of an insert request into @q. Called by the queue's writer.
+ */
+static __always_inline
+int ctq_op_insert(struct ctq __arena *q, struct ctq_req __arena *r)
+{
+	struct ctq_node __arena *n = r->link.node;
+	u32 flags;
+	int ret;
+
+	/*
+	 * A parked task is moved here by another CPU without the task's rq
+	 * lock, e.g., when cgroup_bw drains a throttled task from its queue
+	 * after the cgroup gets its budget back. After the task leaves the
+	 * parking queue and before it is linked into this CTQ, its dequeue
+	 * finds it in neither and its next enqueue places it anew. A late link
+	 * would then put the task here as well as where that enqueue placed
+	 * it.
+	 *
+	 * To close the race between the move (parking queue -> CTQ) and the
+	 * task's dequeue and enqueue, the node has a park word, so exactly one
+	 * of them owns the task. The dequeue changes PARKED to CANCELLED and
+	 * the mover changes PARKED to NONE, both by cmpxchg. The mover
+	 * publishes n->ctq first, so a dequeue that loses finds the link and
+	 * removes it as the writer. A mover that loses drops the task. The
+	 * task's enqueue neither parks nor inserts it while a move is in
+	 * flight, which it can tell from the hold the parking queue takes on
+	 * the task, so the word cannot become PARKED again.
+	 */
+	if (r->hdr.op == CTQ_OP_INSERT_PARKED) {
+		/*
+		 * A node already in a queue was linked by its task's own
+		 * enqueue after a dequeue cancelled the move. Keep that link.
+		 */
+		if (READ_ONCE(n->ctq))
+			return CTQ_ERR_PARK_CANCELLED;
+		WRITE_ONCE(n->ctq, q);
+		if (cmpxchg(&n->park, CTQ_PARK_PARKED, CTQ_PARK_NONE) !=
+		    CTQ_PARK_PARKED) {
+			WRITE_ONCE(n->ctq, NULL);
+			return CTQ_ERR_PARK_CANCELLED;
+		}
+	} else {
+		WRITE_ONCE(n->park, CTQ_PARK_NONE);
+	}
+
+	flags = n->flags & ~(CTQ_NODE_REPORTED | CTQ_NODE_ALL_CPUS |
+			     CTQ_NODE_ON_CPU);
+
+	n->forced_id = r->link.forced_id;
+	n->task = r->link.task;
+	n->tid = r->link.tid;
+	n->flags = flags | r->link.flags;
+	n->rb.key = r->link.key;
+
+	ret = rb_insert_node(&q->tree, &n->rb);
+	WRITE_ONCE(n->ctq, ret ? NULL : q);
+
+	return ret;
+}
+
+/* Unlink the node of a remove request if it is still in @q. */
+static __always_inline
+int ctq_op_remove(struct ctq __arena *q, struct ctq_req __arena *r)
+{
+	struct ctq_node __arena *n = r->link.node;
+	int ret;
+
+	if (n->ctq != q)
+		return 0;
+
+	ret = rb_remove_node(&q->tree, &n->rb);
+	if (!ret) {
+		/*
+		 * A plain store will do, unlike in ctq_op_consume(). The clear
+		 * publishes nothing else, and the task's dequeue, which posted
+		 * this request, sees it once its request returns.
+		 */
+		WRITE_ONCE(n->ctq, NULL);
+	}
+
+	return ret;
+}
+
+/*
+ * Find the first task the CPU of consume request @r may run in @q, leaving any
+ * still on its CPU, and write it and the tasks to report into @r's result.
+ * Report the ones the CPU may not run that nobody has been told about since
+ * they were inserted, or since a CPU went offline. Returns 1 if a task was
+ * left on its CPU and none was found, 0 otherwise.
+ *
+ * Global, so that the verifier checks the walk once on its own. Inlined into
+ * the combine loop, its states multiply with the loop's, and older verifiers,
+ * such as v6.13's, run out of their instruction budget.
+ */
+__weak
+int ctq_walk(struct ctq __arena *q __arg_arena, struct ctq_req __arena *r __arg_arena)
+{
+	struct ctq_consume_res __arena *res = &r->res;
+	struct ctq_node __arena *n, *picked = NULL;
+	u32 gen = READ_ONCE(ctq_report_gen);
+	s32 cpu = READ_ONCE(r->hdr.arg);
+	u32 nr_reports = 0;
+	bool skipped = false;
+	rbnode_t *rbn;
+
+	for (rbn = q->tree.first; rbn && can_loop; rbn = rb_next(rbn)) {
+		n = (struct ctq_node __arena *)rbn;
+
+		if (ctq_task_allowed(n, cpu)) {
+			if (likely(!ctq_node_on_cpu(n))) {
+				picked = n;
+				break;
+			}
+			skipped = true;
+			continue;
+		}
+
+		if ((!(n->flags & CTQ_NODE_REPORTED) || n->report_gen != gen) &&
+		    nr_reports < CTQ_MAX_REPORTS) {
+			n->flags |= CTQ_NODE_REPORTED;
+			n->report_gen = gen;
+			res->reports[nr_reports++] = n;
+		}
+	}
+
+	WRITE_ONCE(res->picked, picked);
+	if (nr_reports < CTQ_MAX_REPORTS)
+		WRITE_ONCE(res->reports[nr_reports], NULL);
+
+	return skipped && !picked;
+}
+
+/*
+ * Take the task ctq_walk() picks off @q. Returns ctq_walk()'s value.
+ */
+static __always_inline
+int ctq_op_consume(struct ctq __arena *q, struct ctq_req __arena *r)
+{
+	struct ctq_node __arena *picked;
+	s32 pop_cpu;
+	u64 pop_round;
+	int ret;
+
+	/* The result overwrites the request, so read the request first. */
+	pop_cpu = READ_ONCE(r->consume.cpu);
+	pop_round = READ_ONCE(r->consume.round);
+
+	ret = ctq_walk(q, r);
+
+	picked = READ_ONCE(r->res.picked);
+	if (picked) {
+		if (unlikely(rb_remove_node(&q->tree, &picked->rb)))
+			scx_bpf_error("ctq: failed to remove a picked node");
+		/*
+		 * A dequeue that finds the node off the queue skips the writer,
+		 * and the enqueue after it must see DISPATCHING and the round.
+		 */
+		picked->flags |= CTQ_NODE_DISPATCHING;
+		picked->pop_cpu = pop_cpu;
+		picked->pop_round = pop_round;
+		smp_store_release(&picked->ctq, NULL);
+	}
+
+	return ret;
+}
+
+/*
+ * Apply request @r to @q and leave the return value in its arg. Inlined, see
+ * ctq_combine().
+ */
+static __always_inline
+int ctq_do_op(struct ctq __arena *q, struct ctq_req __arena *r)
+{
+	int ret;
+
+	switch (r->hdr.op) {
+	case CTQ_OP_INSERT:
+	case CTQ_OP_INSERT_PARKED:
+		ret = ctq_op_insert(q, r);
+		break;
+	case CTQ_OP_REMOVE:
+		ret = ctq_op_remove(q, r);
+		break;
+	case CTQ_OP_CONSUME:
+		ret = ctq_op_consume(q, r);
+		break;
+	default:
+		scx_bpf_error("ctq: unknown request %u", r->hdr.op);
+		ret = -EINVAL;
+		break;
+	}
+
+	r->hdr.arg = ret;
+
+	return 0;
+}
+
+#ifdef CTQ_SYNC_LOCK
+
+/* Apply @r under the queue's lock. Interrupts stay as the caller has them. */
+static __always_inline
+int ctq_run(struct ctq __arena *q, struct ctq_cpu __arena *c,
+	    struct ctq_req __arena *r, unsigned long *irq_flags)
+{
+	scx_spin_lock(&q->lock);
+	ctq_do_op(q, r);
+	scx_spin_unlock(&q->lock);
+
+	return 0;
+}
+
+#else /* CTQ_SYNC_LOCK */
+
+/*
+ * Combining, after DSM-Synch (Fatourou and Kallimanis, "Revisiting the
+ * Combining Synchronization Technique", PPoPP'12).
+ *
+ * A queue keeps a list of request nodes, empty when no request is out. A CPU
+ * writes its request into its own node and swaps the node in as the list's
+ * tail. A CPU that finds the list empty is the combiner and applies its
+ * request at once, so an uncontended request costs about what a lock does.
+ * Otherwise it links the old tail to its node and waits on its node.
+ *
+ * The combiner applies the requests in list order and marks each done, its
+ * own first. After CTQ_COMBINE_MAX requests, it hands the combiner role to
+ * the next node's poster. At the end of the list, it takes the tail back to
+ * empty, or waits for the link of a CPU that swapped its node in meanwhile.
+ *
+ * A node is marked done only once it is no longer the tail and the node after
+ * it, if any, has been found. Nothing refers to it then, so its CPU may reuse
+ * it for its next request at once. Each CPU thus has one node, which stays on
+ * the CPU's NUMA node.
+ *
+ * Interrupts are off from the swap to the link and while combining, see
+ * ctq_run().
+ */
+
+/*
+ * Keep interrupts off where a request must not be interrupted, see ctq_run(),
+ * also where the caller already does. The kfuncs exist from v6.14, and libbpf
+ * resolves the test at load, so the verifier sees both calls or neither.
+ */
+#define ctq_irq_save(flags)						\
+	do {								\
+		if (bpf_ksym_exists(bpf_local_irq_save))		\
+			bpf_local_irq_save(flags);			\
+	} while (0)
+
+#define ctq_irq_restore(flags)						\
+	do {								\
+		if (bpf_ksym_exists(bpf_local_irq_restore))		\
+			bpf_local_irq_restore(flags);			\
+	} while (0)
+
+/*
+ * The node after @r in @q's list, or NULL once @r was the tail and the list is
+ * empty. A CPU that swapped its node in after @r links it shortly, since it
+ * has interrupts off from the swap to the link.
+ */
+static __always_inline
+struct ctq_req __arena *ctq_next(struct ctq __arena *q, struct ctq_req __arena *r)
+{
+	struct ctq_req __arena *next;
+
+	/* A node is linked only after its request is written. */
+	next = smp_load_acquire(&r->hdr.next);
+	if (next)
+		return next;
+
+	if (cmpxchg(&q->tail, r, NULL) == r)
+		return NULL;
+
+	while (can_loop) {
+		next = smp_load_acquire(&r->hdr.next);
+		if (next)
+			return next;
+	}
+
+	scx_bpf_error("ctq: request not linked");
+	return NULL;
+}
+
+/*
+ * Apply the requests from @r on, as the combiner of @q. Inlined with the
+ * operations, so that a request spends no call frame on them: before v7.1, the
+ * verifier counts every frame against its limit of 8, global ones included.
+ */
+static __always_inline
+int ctq_combine(struct ctq __arena *q, struct ctq_req __arena *r)
+{
+	struct ctq_req __arena *next;
+	u32 i;
+
+	bpf_for(i, 0, CTQ_COMBINE_MAX) {
+		ctq_do_op(q, r);
+		next = ctq_next(q, r);
+
+		/* The poster may reuse @r once it sees DONE, so leave it. */
+		smp_store_release(&r->hdr.state, CTQ_REQ_DONE);
+		if (!next)
+			return 0;
+		r = next;
+	}
+
+	/* @r is not applied yet, and its poster combines next. */
+	smp_store_release(&r->hdr.state, CTQ_REQ_COMBINE);
+
+	return 0;
+}
+
+/*
+ * Swap request @r, the CPU's node, in as @q's tail and wait until a combiner
+ * has applied it, or apply it as the combiner.
+ *
+ * An interrupt between the swap and the link, or while combining, would stall
+ * every CPU behind this one, since a combiner cannot pass an unlinked node.
+ * A CPU waits with interrupts on. Its request is linked, so an interrupt
+ * delays only its own, unless a combiner hands it the role meanwhile.
+ */
+static __always_inline
+int ctq_run(struct ctq __arena *q, struct ctq_cpu __arena *c,
+	    struct ctq_req __arena *r, unsigned long *irq_flags)
+{
+	struct ctq_req __arena *prev;
+	u32 state = CTQ_REQ_WAIT;
+	int ret = 0;
+
+	WRITE_ONCE(r->hdr.next, NULL);
+	WRITE_ONCE(r->hdr.state, CTQ_REQ_WAIT);
+
+	ctq_irq_save(irq_flags);
+
+	/* BPF_XCHG is fully ordered, so the request comes before the swap. */
+	prev = __sync_lock_test_and_set(&q->tail, r);
+	if (prev) {
+		smp_store_release(&prev->hdr.next, r);
+		ctq_irq_restore(irq_flags);
+
+		/*
+		 * A poster cannot give up: its request stays in the list and
+		 * would be applied anyway, and the task a consume picked would
+		 * be lost.
+		 */
+		while (can_loop) {
+			state = smp_load_acquire(&r->hdr.state);
+			if (state != CTQ_REQ_WAIT)
+				break;
+		}
+
+		if (likely(state == CTQ_REQ_DONE))
+			return 0;
+
+		if (unlikely(state != CTQ_REQ_COMBINE)) {
+			scx_bpf_error("ctq: request not served");
+			return -ETIMEDOUT;
+		}
+
+		ctq_irq_save(irq_flags);
+	}
+
+	/* An uncontended CPU finds the list empty and combines at once. */
+	ret = ctq_combine(q, r);
+
+	ctq_irq_restore(irq_flags);
+
+	return ret;
+}
+
+#endif /* CTQ_SYNC_LOCK */
+
+/* This CPU's state, or NULL after failing the scheduler. */
+static __always_inline
+struct ctq_cpu __arena *ctq_this_cpu(void)
+{
+	u32 cpu = bpf_get_smp_processor_id();
+	struct ctq_cpu __arena *c = NULL;
+
+	if (likely(cpu < nr_cpu_ids && ctq_cpus))
+		c = ctq_cpus[cpu];
+	if (unlikely(!c))
+		scx_bpf_error("ctq: no state for CPU %u", cpu);
+
+	return c;
+}
+
+/*
+ * Start a request on this CPU, with preemption off until ctq_leave(). The CPU
+ * has one request node, so no other request may run on it meanwhile. Interrupts
+ * can be on during a request, so a request from an interrupt handler would nest
+ * in it. ctq.h forbids that, and this catches it.
+ */
+static __always_inline
+struct ctq_cpu __arena *ctq_enter(void)
+{
+	struct ctq_cpu __arena *c;
+
+	bpf_preempt_disable();
+
+	c = ctq_this_cpu();
+	if (unlikely(!c))
+		goto fail;
+
+	if (unlikely(READ_ONCE(c->in_flight))) {
+		scx_bpf_error("ctq: nested request");
+		goto fail;
+	}
+	WRITE_ONCE(c->in_flight, 1);
+
+	return c;
+
+fail:
+	bpf_preempt_enable();
+	return NULL;
+}
+
+static __always_inline
+void ctq_leave(struct ctq_cpu __arena *c)
+{
+	WRITE_ONCE(c->in_flight, 0);
+	bpf_preempt_enable();
+}
+
 static __always_inline
 int ctq_link(struct ctq __arena *q, struct task_struct *p,
 	     struct ctq_node __arena *n, u64 key, bool parked)
 {
-	u32 flags, on_cpu_flag = 0;
+	u32 flags = 0;
 	s32 forced_id = -1;
+	struct ctq_req __arena *r;
+	struct ctq_cpu __arena *c;
+	unsigned long irq_flags;
 	u64 tid = 0;
 	int ret;
 
 	/*
 	 * A move whose task was dequeued meanwhile is dropped, wherever the
-	 * task is now. The cmpxchg below decides, so this only spares the lock.
+	 * task is now. The writer decides by cmpxchg, so this only spares the
+	 * request.
 	 */
 	if (parked && READ_ONCE(n->park) != CTQ_PARK_PARKED)
 		return CTQ_ERR_PARK_CANCELLED;
@@ -403,70 +861,35 @@ int ctq_link(struct ctq __arena *q, struct task_struct *p,
 		forced_id = bpf_cpumask_first(&p->cpus_mask);
 	}
 
+	if (forced_id < 0 && p->nr_cpus_allowed == nr_cpu_ids)
+		flags |= CTQ_NODE_ALL_CPUS;
+
 	if (bpf_core_field_exists(p->scx.tid))
 		tid = p->scx.tid;
 
 	/* See ctq_node_on_cpu(). */
 	if (LINUX_KERNEL_VERSION < KERNEL_VERSION(7, 2, 0) && ctq_task_on_cpu(p))
-		on_cpu_flag = CTQ_NODE_ON_CPU;
+		flags |= CTQ_NODE_ON_CPU;
 
-	scx_spin_lock(&q->lock);
+	c = ctq_enter();
+	if (unlikely(!c))
+		return -EINVAL;
 
-	/*
-	 * A parked task is moved here by another CPU without the task's rq
-	 * lock, e.g., when cgroup_bw drains a throttled task from its queue
-	 * after the cgroup gets its budget back. After the task leaves the
-	 * parking queue and before it is linked into this CTQ, its dequeue
-	 * finds it in neither and its next enqueue places it anew. A late link
-	 * would then put the task here as well as where that enqueue placed
-	 * it.
-	 *
-	 * To close the race between the move (parking queue -> CTQ) and the
-	 * task's dequeue and enqueue, the node has a park word, so exactly one
-	 * of them owns the task. The dequeue changes PARKED to CANCELLED and
-	 * the mover changes PARKED to NONE, both by cmpxchg. The mover
-	 * publishes n->ctq first, so a dequeue that loses finds the link and
-	 * removes it under the lock. A mover that loses drops the task. The
-	 * task's enqueue neither parks nor inserts it while a move is in
-	 * flight, which it can tell from the hold the parking queue takes on
-	 * the task, so the word cannot become PARKED again.
-	 */
-	if (parked) {
-		/*
-		 * A node already in a queue was linked by its task's own
-		 * enqueue after a dequeue cancelled the move. Keep that link.
-		 */
-		if (READ_ONCE(n->ctq)) {
-			scx_spin_unlock(&q->lock);
-			return CTQ_ERR_PARK_CANCELLED;
-		}
-		WRITE_ONCE(n->ctq, q);
-		if (cmpxchg(&n->park, CTQ_PARK_PARKED, CTQ_PARK_NONE) !=
-		    CTQ_PARK_PARKED) {
-			WRITE_ONCE(n->ctq, NULL);
-			scx_spin_unlock(&q->lock);
-			return CTQ_ERR_PARK_CANCELLED;
-		}
-	} else {
-		WRITE_ONCE(n->park, CTQ_PARK_NONE);
-	}
+	r = &c->node;
 
-	flags = n->flags & ~(CTQ_NODE_REPORTED | CTQ_NODE_ALL_CPUS |
-			     CTQ_NODE_ON_CPU);
-	if (forced_id < 0 && p->nr_cpus_allowed == nr_cpu_ids)
-		flags |= CTQ_NODE_ALL_CPUS;
-	flags |= on_cpu_flag;
+	WRITE_ONCE(r->hdr.op, parked ? CTQ_OP_INSERT_PARKED : CTQ_OP_INSERT);
+	r->link.node = n;
+	r->link.key = key;
+	r->link.task = (u64)p;
+	r->link.tid = tid;
+	r->link.forced_id = forced_id;
+	r->link.flags = flags;
 
-	n->forced_id = forced_id;
-	n->task = (u64)p;
-	n->tid = tid;
-	n->flags = flags;
-	n->rb.key = key;
+	ret = ctq_run(q, c, r, &irq_flags);
+	if (likely(!ret))
+		ret = r->hdr.arg;
 
-	ret = rb_insert_node(&q->tree, &n->rb);
-	WRITE_ONCE(n->ctq, ret ? NULL : q);
-
-	scx_spin_unlock(&q->lock);
+	ctq_leave(c);
 
 	return ret;
 }
@@ -489,8 +912,11 @@ int ctq_insert_parked(struct ctq __arena *q __arg_arena,
 __weak
 int ctq_remove(struct ctq_node __arena *n __arg_arena)
 {
+	struct ctq_req __arena *r;
+	struct ctq_cpu __arena *c;
+	unsigned long irq_flags;
 	struct ctq __arena *q;
-	int ret = 0;
+	int ret;
 
 	/* Cancel a move from another queue before it can commit. */
 	if (smp_load_acquire(&n->park) == CTQ_PARK_PARKED)
@@ -501,15 +927,20 @@ int ctq_remove(struct ctq_node __arena *n __arg_arena)
 	if (!q)
 		return 0;
 
-	scx_spin_lock(&q->lock);
+	c = ctq_enter();
+	if (unlikely(!c))
+		return -EINVAL;
 
-	if (n->ctq == q) {
-		ret = rb_remove_node(&q->tree, &n->rb);
-		if (!ret)
-			WRITE_ONCE(n->ctq, NULL);
-	}
+	r = &c->node;
 
-	scx_spin_unlock(&q->lock);
+	WRITE_ONCE(r->hdr.op, CTQ_OP_REMOVE);
+	r->link.node = n;
+
+	ret = ctq_run(q, c, r, &irq_flags);
+	if (likely(!ret))
+		ret = r->hdr.arg;
+
+	ctq_leave(c);
 
 	return ret;
 }
@@ -538,91 +969,68 @@ u64 ctq_cpu_round(s32 cpu)
 	return READ_ONCE(ctq_cpus[cpu]->round);
 }
 
-__weak
-u64 ctq_consume_internal(struct ctq __arena *q __arg_arena, s32 cpu)
+/*
+ * The body of ctq_consume(), inlined into ctq_move_to_local() as well, so that
+ * a dispatch spends no call frame on it, see ctq_combine().
+ */
+static __always_inline
+u64 ctq_do_consume(struct ctq __arena *q, s32 cpu)
 {
-	struct ctq_node __arena *n, *picked = NULL;
-	struct ctq_consume_res __arena *res;
-	u32 gen = READ_ONCE(ctq_report_gen);
+	/* the result of every consume of an empty queue, never written */
+	static struct ctq_consume_res __arena_global empty_res;
+	struct ctq_req __arena *r = NULL;
 	struct ctq_cpu __arena *c;
-	u32 this_cpu, nr_reports = 0;
+	unsigned long irq_flags;
+	bool kick = false;
 	u64 round;
-	bool skipped = false;
-	rbnode_t *rbn;
-
-	this_cpu = bpf_get_smp_processor_id();
-	if (unlikely(this_cpu >= nr_cpu_ids)) {
-		scx_bpf_error("ctq: invalid CPU %u", this_cpu);
-		return (u64)NULL;
-	}
-	c = ctq_cpus[this_cpu];
-	res = &c->res;
 
 	/*
-	 * Skip an empty queue without the lock, as the kernel does for a DSQ.
+	 * Skip an empty queue without a request, as the kernel does for a DSQ.
 	 * A consume cannot count on an insert it races with: the inserting
 	 * side kicks a CPU for its task, so no task waits on this consume.
 	 */
-	if (!ctq_peek(q)) {
-		WRITE_ONCE(res->picked, NULL);
-		WRITE_ONCE(res->reports[0], NULL);
-		return (u64)res;
-	}
+	if (!ctq_peek(q))
+		return (u64)&empty_res;
 
-	scx_spin_lock(&q->lock);
+	c = ctq_enter();
+	if (unlikely(!c))
+		return (u64)NULL;
 
-	/*
-	 * Take the first task @cpu may run, leaving any still on its CPU.
-	 * Report the ones @cpu may not run that nobody has been told about
-	 * since they were inserted, or since a CPU went offline.
-	 */
-	for (rbn = q->tree.first; rbn && can_loop; rbn = rb_next(rbn)) {
-		n = (struct ctq_node __arena *)rbn;
+	round = c->round;
 
-		if (ctq_task_allowed(n, cpu)) {
-			if (likely(!ctq_node_on_cpu(n))) {
-				picked = n;
-				break;
-			}
-			skipped = true;
-			continue;
-		}
+	r = &c->node;
 
-		if ((!(n->flags & CTQ_NODE_REPORTED) || n->report_gen != gen) &&
-		    nr_reports < CTQ_MAX_REPORTS) {
-			n->flags |= CTQ_NODE_REPORTED;
-			n->report_gen = gen;
-			res->reports[nr_reports++] = n;
-		}
-	}
+	WRITE_ONCE(r->hdr.op, CTQ_OP_CONSUME);
+	r->hdr.arg = cpu;
+	r->consume.cpu = bpf_get_smp_processor_id();
+	r->consume.round = round & ~CTQ_ROUND_CONSUMED;
 
-	if (picked) {
-		if (unlikely(rb_remove_node(&q->tree, &picked->rb)))
-			scx_bpf_error("ctq: failed to remove a picked node");
+	if (unlikely(ctq_run(q, c, r, &irq_flags))) {
+		r = NULL;
+	} else if (r->res.picked) {
 		/*
-		 * A dequeue that finds the node off the queue skips the lock,
-		 * and the enqueue after it must see DISPATCHING and the round.
+		 * Only this CPU writes its round, and it moves on only at this
+		 * CPU's next flushed point, after this.
 		 */
-		picked->flags |= CTQ_NODE_DISPATCHING;
-		picked->pop_cpu = this_cpu;
-		round = c->round;
-		picked->pop_round = round & ~CTQ_ROUND_CONSUMED;
 		if (!(round & CTQ_ROUND_CONSUMED))
 			WRITE_ONCE(c->round, round | CTQ_ROUND_CONSUMED);
-		smp_store_release(&picked->ctq, NULL);
+	} else {
+		kick = r->hdr.arg;
 	}
 
-	scx_spin_unlock(&q->lock);
+	ctq_leave(c);
 
 	/* Have @cpu look again once the task left behind is off its CPU. */
-	if (unlikely(skipped && !picked))
+	if (unlikely(kick))
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
-	WRITE_ONCE(res->picked, picked);
-	if (nr_reports < CTQ_MAX_REPORTS)
-		WRITE_ONCE(res->reports[nr_reports], NULL);
+	return r ? (u64)&r->res : (u64)NULL;
+}
 
-	return (u64)res;
+__weak
+u64 ctq_consume_internal(struct ctq __arena *q __arg_arena, s32 cpu)
+{
+	return ctq_do_consume(q, cpu);
 }
 
 /*
@@ -674,7 +1082,7 @@ u64 ctq_move_to_local_internal(struct ctq __arena *q __arg_arena, s32 cpu,
 	const struct ctq_consume_res __arena *res;
 	struct ctq_node __arena *n;
 
-	res = ctq_consume(q, cpu);
+	res = (const struct ctq_consume_res __arena *)ctq_do_consume(q, cpu);
 	if (!res)
 		return (u64)NULL;
 

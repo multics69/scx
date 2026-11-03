@@ -8,9 +8,15 @@
  * CTQ: an arena task queue ordered by a vtime key.
  *
  * A CTQ is one rbtree of queued tasks, ordered by key with equal keys in
- * insertion order, written by one writer at a time under the queue's lock.
- * Other CPUs read its head and length without the lock, as they do with a
- * kernel DSQ through scx_bpf_dsq_peek() and scx_bpf_dsq_nr_queued().
+ * insertion order, written by one writer at a time. Other CPUs read its head
+ * and length without the writer's lock, as they do with a kernel DSQ through
+ * scx_bpf_dsq_peek() and scx_bpf_dsq_nr_queued().
+ *
+ * Writers combine their operations (DSM-Synch, see ctq.bpf.c): each CPU posts
+ * its insert, remove or consume as a request. A CPU that finds no other
+ * request out applies its own at once, and otherwise one of the posting CPUs
+ * applies the waiting requests in a batch. Building with -DCTQ_SYNC_LOCK has
+ * each CPU take the queue's lock and apply its own instead.
  *
  * A consume walks the tree from the head and takes the first task the
  * consuming CPU may run. The tasks it walks past are reported to the caller,
@@ -48,6 +54,11 @@
  *   not hold the queue's lock.
  * - Call ctq_remove() from ops.dequeue() and ctq_task_fini() before freeing
  *   the task context.
+ * - Never call ctq_insert(), ctq_insert_parked(), ctq_remove(), ctq_consume()
+ *   or ctq_move_to_local() from interrupt context, such as a tracing program
+ *   that runs in an interrupt handler. Each CPU has one request node, and a
+ *   request from an interrupt would reuse it while the interrupted request
+ *   still holds it.
  * - At the top of ops.enqueue(), before any path that keeps the task in BPF
  *   custody, check ctq_task_dispatching(). When it is true, or when
  *   ctq_insert() returns CTQ_ERR_INSERT_BYPASS, insert the task into the
@@ -134,15 +145,23 @@ struct ctq_node {
 	u64			pop_round;
 };
 
-struct ctq {
-	/* shares a cache line with the tree it guards */
-	arena_spinlock_t	lock;
-	struct rbtree		tree;
-} __attribute__((aligned(SCX_CACHELINE_SIZE)));
+struct ctq_req;
 
-/* the picked task and the reports fill one cache line with the CPU's round */
+struct ctq_req_hdr {
+	/* the next request in the queue's list, NULL until its poster links it */
+	struct ctq_req __arena	*next;
+	/* enum ctq_req_state, the only word a combiner hands back */
+	u32			state;
+	/* enum ctq_op */
+	u16			op;
+	/* the CPU a consume is for going in, the return value coming out */
+	s16			arg;
+};
+
+/* the picked task and the reports fill a request node after its header */
 #define CTQ_MAX_REPORTS							\
-	(SCX_CACHELINE_SIZE / sizeof(struct ctq_node __arena *) - 2)
+	((SCX_CACHELINE_SIZE - sizeof(struct ctq_req_hdr)) /		\
+	 sizeof(struct ctq_node __arena *) - 1)
 
 struct ctq_consume_res {
 	/* the task taken off the queue, or NULL if none may run */
@@ -150,6 +169,50 @@ struct ctq_consume_res {
 	/* tasks walked past, NULL-terminated when fewer than CTQ_MAX_REPORTS */
 	struct ctq_node __arena *reports[CTQ_MAX_REPORTS];
 };
+
+/*
+ * A request node, one cache line. A request and its result share the line,
+ * since a combiner reads the request before it writes the result. Each CPU
+ * has one, see ctq.bpf.c.
+ */
+struct ctq_req {
+	struct ctq_req_hdr	hdr;
+	union {
+		/* CTQ_OP_INSERT, CTQ_OP_INSERT_PARKED and CTQ_OP_REMOVE */
+		struct {
+			struct ctq_node __arena	*node;
+			u64			key;
+			u64			task;
+			u64			tid;
+			s32			forced_id;
+			u32			flags;
+		} link;
+		/* CTQ_OP_CONSUME, the consuming CPU and its round */
+		struct {
+			u64			round;
+			s32			cpu;
+		} consume;
+		/* CTQ_OP_CONSUME, the result */
+		struct ctq_consume_res	res;
+	};
+} __attribute__((aligned(SCX_CACHELINE_SIZE)));
+
+_Static_assert(sizeof(struct ctq_req) == SCX_CACHELINE_SIZE,
+	       "ctq_req must be one cache line");
+_Static_assert(__builtin_offsetof(struct ctq_req, res) ==
+	       sizeof(struct ctq_req_hdr),
+	       "no padding between header and payload");
+
+/* The lock or the list tail shares a cache line with the tree. */
+struct ctq {
+#ifdef CTQ_SYNC_LOCK
+	arena_spinlock_t	lock;
+#else
+	/* the last request node in the list, NULL when no request is out */
+	struct ctq_req __arena	*tail;
+#endif
+	struct rbtree		tree;
+} __attribute__((aligned(SCX_CACHELINE_SIZE)));
 
 int ctq_lib_init(void);
 int ctq_init(struct ctq __arena *q);
@@ -176,8 +239,8 @@ int ctq_task_running(struct ctq_node __arena *n);
 
 /*
  * Take the first task @cpu may run off @q and report the tasks walked past.
- * The result lives in a per-CPU slot and stays valid until this CPU's next
- * consume.
+ * The result lives in this CPU's request node and stays valid until this CPU's
+ * next insert, remove or consume on any queue.
  */
 u64 ctq_consume_internal(struct ctq __arena *q, s32 cpu);
 #define ctq_consume(q, cpu)						\
