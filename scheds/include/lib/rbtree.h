@@ -71,8 +71,8 @@ struct rbtree {
 
 	/*
 	 * The leftmost node and the node count. The writer keeps them current,
-	 * and readers may read them without the writer's lock (see rb_first()
-	 * and friends).
+	 * and readers may read them without the writer's lock (see
+	 * rb_first_lockless() and friends).
 	 */
 	rbnode_t *first;
 	uint64_t nr;
@@ -113,8 +113,8 @@ int rb_integrity_check(rbtree_t *rbtree);
 
 /*
  * Return the in-order successor of @node, or NULL if @node is the last one.
- * Walking from rb_first() with it visits the tree in key order, equal keys in
- * insertion order. Call it under the writer's lock.
+ * Walking from the leftmost node with it visits the tree in key order, equal
+ * keys in insertion order. Call it under the writer's lock.
  */
 static __always_inline rbnode_t *rb_next(rbnode_t *node)
 {
@@ -137,18 +137,18 @@ static __always_inline rbnode_t *rb_next(rbnode_t *node)
 /*
  * Lockless reads of the head and the node count. They need not be called
  * under the writer's lock, so they are advisory: the tree may change before
- * the caller acts on the result. The node rb_first() returns may have
- * left the tree, or been freed in an RB_ALLOC tree, by the time the
- * caller reads it. The count is a separate read and need not agree
- * with the head.
+ * the caller acts on the result. The node rb_first_lockless() returns may
+ * have left the tree, or been freed in an RB_ALLOC tree, by the time the
+ * caller reads it. The count is a separate read and need not agree with the
+ * head.
  */
-static __always_inline rbnode_t *rb_first(rbtree_t *rbtree)
+static __always_inline rbnode_t *rb_first_lockless(rbtree_t *rbtree)
 {
 	return READ_ONCE(rbtree->first);
 }
 
 /* -ENOENT if the tree is empty, 0 with the leftmost key in @key otherwise. */
-static __always_inline int rb_first_key(rbtree_t *rbtree, u64 *key)
+static __always_inline int rb_first_key_lockless(rbtree_t *rbtree, u64 *key)
 {
 	rbnode_t *first = READ_ONCE(rbtree->first);
 
@@ -159,7 +159,7 @@ static __always_inline int rb_first_key(rbtree_t *rbtree, u64 *key)
 	return 0;
 }
 
-static __always_inline u64 rb_nr_nodes(rbtree_t *rbtree)
+static __always_inline u64 rb_nr_nodes_lockless(rbtree_t *rbtree)
 {
 	return READ_ONCE(rbtree->nr);
 }

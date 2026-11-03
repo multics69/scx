@@ -83,8 +83,7 @@ u64 rb_create_internal(enum rbtree_alloc alloc, enum rbtree_insert_mode insert)
 	return (u64)rbtree;
 }
 
-static __always_inline void rb_set_first(rbtree_t *rbtree,
-					 rbnode_t *node)
+static void rb_set_first(rbtree_t *rbtree, rbnode_t *node)
 {
 	/*
 	 * Publish the new leftmost node with release ordering, so a lockless
@@ -662,12 +661,21 @@ static inline bool rbnode_has_red_children(rbnode_t *node)
 }
 
 static __attribute__((always_inline))
-int rbnode_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, bool free)
+int rb_node_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, bool free)
 {
 	rbnode_t *parent, *sibling, *close_nephew, *distant_nephew;
 	rbnode_t *replace, *initial;
 	bool is_red;
 	int dir;
+
+	/*
+	 * Hand the head to its successor before the tree changes. The removal
+	 * frees @node in an RB_ALLOC tree, so the head must not point to it
+	 * by then.
+	 */
+	if (rbtree->first == node)
+		rb_set_first(rbtree, rb_next(node));
+	WRITE_ONCE(rbtree->nr, rbtree->nr - 1);
 
 	/* Both children present, replace with next largest key. */
 	if (node->left && node->right) {
@@ -837,34 +845,6 @@ int rbnode_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, bool
 	sibling->is_red = parent->is_red;
 	parent->is_red = false;
 	distant_nephew->is_red = false;
-
-	return 0;
-}
-
-/*
- * Remove @node and keep the head and the node count current. The head has no
- * left child, so if it is the node going away, its successor is the leftmost
- * node of its right subtree, or else its parent. Take it before the tree
- * changes; the removal and its fixups preserve the in-order sequence.
- */
-static __attribute__((always_inline))
-int rb_node_remove(rbtree_t __arg_arena *rbtree, rbnode_t __arg_arena *node, bool free)
-{
-	rbnode_t *next = NULL;
-	bool was_first;
-	int ret;
-
-	was_first = node == rbtree->first;
-	if (was_first)
-		next = node->right ? rbnode_least(node->right) : node->parent;
-
-	ret = rbnode_remove(rbtree, node, free);
-	if (ret)
-		return ret;
-
-	if (was_first)
-		rb_set_first(rbtree, next);
-	WRITE_ONCE(rbtree->nr, rbtree->nr - 1);
 
 	return 0;
 }

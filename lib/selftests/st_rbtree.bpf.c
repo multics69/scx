@@ -762,16 +762,16 @@ static __always_inline int check_first(rbtree_t *rbtree, u64 nr)
 	while (least && least->left && can_loop)
 		least = least->left;
 
-	if (rb_first(rbtree) != least)
+	if (rb_first_lockless(rbtree) != least)
 		return 1;
 
-	if (rb_nr_nodes(rbtree) != nr)
+	if (rb_nr_nodes_lockless(rbtree) != nr)
 		return 2;
 
 	if (!least)
-		return rb_first_key(rbtree, &key) == -ENOENT ? 0 : 3;
+		return rb_first_key_lockless(rbtree, &key) == -ENOENT ? 0 : 3;
 
-	if (rb_first_key(rbtree, &key) || key != least->key)
+	if (rb_first_key_lockless(rbtree, &key) || key != least->key)
 		return 4;
 
 	return 0;
@@ -835,7 +835,7 @@ __weak int scx_selftest_rbtree_first(rbtree_t __arg_arena *rbtree)
 
 	/* Pop the rest, which always removes the head. */
 	bpf_for(i, 0, FIRST_NR_NODES / 2) {
-		node = rb_first(rbtree);
+		node = rb_first_lockless(rbtree);
 		if (!node)
 			return 5;
 
@@ -858,8 +858,8 @@ __weak int scx_selftest_rbtree_first(rbtree_t __arg_arena *rbtree)
 static rbnode_t *next_nodes[NEXT_NR_NODES];
 
 /*
- * Walking from the head with rb_next() must visit every node once, in the
- * order rb_pop() removes them.
+ * Walking from the leftmost node with rb_next() must visit every node once,
+ * in the order rb_pop() removes them.
  */
 __weak int scx_selftest_rbtree_next(rbtree_t __arg_arena *rbtree)
 {
@@ -870,7 +870,7 @@ __weak int scx_selftest_rbtree_next(rbtree_t __arg_arena *rbtree)
 	if (!rbtree)
 		return 1;
 
-	if (rb_first(rbtree))
+	if (rbtree->root)
 		return 2;
 
 	/* Pseudo-random keys with repeats, so the walk crosses equal keys. */
@@ -885,7 +885,10 @@ __weak int scx_selftest_rbtree_next(rbtree_t __arg_arena *rbtree)
 			return 4;
 	}
 
-	node = rb_first(rbtree);
+	node = rbtree->root;
+	while (node->left && can_loop)
+		node = node->left;
+
 	bpf_for(i, 0, NEXT_NR_NODES) {
 		if (!node)
 			return 5;
@@ -931,7 +934,7 @@ __weak int scx_selftest_rbtree_first_update(rbtree_t __arg_arena *rbtree)
 	if (rb_insert(rbtree, 5, 2))
 		return 3;
 
-	node = rb_first(rbtree);
+	node = rb_first_lockless(rbtree);
 	if (!node || node->key != 5 || node->value != 2)
 		return 4;
 
@@ -1007,7 +1010,7 @@ __weak int scx_selftest_rbtree_embedded(void)
 		return 7;
 
 	bpf_for(i, 0, 4) {
-		node = rb_first(rbtree);
+		node = rb_first_lockless(rbtree);
 		if (!node || node->key != i + 1)
 			return 5;
 
