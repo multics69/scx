@@ -3209,7 +3209,8 @@ rearm_out:
 	return 0;
 }
 
-static
+/* Inlined, see cbw_reenqueue_cgroup(). */
+static __always_inline
 int cbw_drain_btq_batch(scx_cgroup_ctx_t *cgx,
 			scx_cgroup_llc_ctx_t *llcx)
 {
@@ -3249,7 +3250,13 @@ int cbw_drain_btq_batch(scx_cgroup_ctx_t *cgx,
 	return i;
 }
 
-static
+/*
+ * Inlined with cbw_drain_btq_batch(), so that the reenqueue path spends no call
+ * frame on either: it runs from ops.dispatch() into the scheduler's enqueue,
+ * and before v7.1 the verifier counts every frame against its limit of 8,
+ * global ones included.
+ */
+static __always_inline
 int cbw_reenqueue_cgroup(scx_cgroup_ctx_t *cgx, u64 cgrp_id, u64 nuance)
 {
 	scx_cgroup_llc_ctx_t *llcx;
