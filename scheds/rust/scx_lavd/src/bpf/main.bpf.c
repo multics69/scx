@@ -318,7 +318,7 @@ static u32 get_cgroup_pressure(struct task_struct *p, task_ctx *taskc)
 }
 
 static u64 calc_time_slice(struct task_struct *p, task_ctx *taskc,
-			   struct cpu_ctx *cpuc)
+			   struct cpu_ctx *cpuc, u64 now)
 {
 	u64 slice_wall;
 	u32 pressure;
@@ -356,16 +356,16 @@ static u64 calc_time_slice(struct task_struct *p, task_ctx *taskc,
 	 * slices are wall-clock durations -- they represent how long the CPU
 	 * is physically occupied, regardless of CPU frequency or capacity.
 	 *
-	 * However, if there are pinned tasks waiting to run on this CPU,
-	 * we do not boost the task's time slice to avoid delaying the pinned
-	 * task that cannot be run on another CPU.
+	 * However, if the boost would delay a waiting task, such as a pinned
+	 * task that cannot run on another CPU, we do not boost the task's
+	 * time slice.
 	 *
 	 * Also, if a cgroup is under pressure (e.g., throttled), do not boost
 	 * time slice.
 	 */
 	if (!no_slice_boost && pressure <= LAVD_SCALE &&
-	    !cpuc->nr_pinned_tasks &&
-	    (taskc->avg_runtime_wall >= sys_stat.slice_wall)) {
+	    (taskc->avg_runtime_wall >= sys_stat.slice_wall) &&
+	    !boost_delays_waiter(cpuc, now)) {
 		/*
 		 * When the system is not heavily loaded, so it can serve all
 		 * tasks within the targeted latency (slice_max_ns <=
@@ -971,6 +971,14 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	task_cpu = scx_bpf_task_cpu(p);
 
 	/*
+	 * Record when @p starts waiting, for boost_delays_waiter(). A
+	 * reenqueued task has been waiting since its first enqueue.
+	 */
+	if (!(enq_flags & SCX_ENQ_REENQ)) {
+		taskc->last_enqueue_clk = scx_bpf_now();
+	}
+
+	/*
 	 * Another CPU may still place the task. A consume's insert stays
 	 * pending until the consuming CPU's dispatch round ends, and a cpu.max
 	 * drain holds a task it has popped from a BTQ until it has moved it
@@ -1388,7 +1396,8 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx
 	/*
 	 * Refill the time slice.
 	 */
-	scx_bpf_task_set_slice(prev, calc_time_slice(prev, taskc_prev, cpuc));
+	scx_bpf_task_set_slice(prev, calc_time_slice(prev, taskc_prev, cpuc,
+						     scx_bpf_now()));
 
 	/*
 	 * Reset prev task's lock and futex boost count
@@ -1751,7 +1760,7 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	 * Calculate the task's time slice here,
 	 * as it depends on the system load.
 	 */
-	scx_bpf_task_set_slice(p, calc_time_slice(p, taskc, cpuc));
+	scx_bpf_task_set_slice(p, calc_time_slice(p, taskc, cpuc, now));
 
 	/*
 	 * A task released from a cpu.max backlog can still be waiting in a
@@ -1862,10 +1871,14 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	}
 
 	/*
-	 * If there is a pinned task on this CPU, shrink its time slice.
+	 * Shrink the time slice if there is a pinned task on this CPU, or if
+	 * the boost delays a waiting task.
 	 */
-	if (cpuc->nr_pinned_tasks)
+	if (cpuc->nr_pinned_tasks ||
+	    (test_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST) &&
+	     boost_delays_waiter(cpuc, now))) {
 		shrink_slice_at_tick(p, cpuc, now);
+	}
 }
 
 void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
@@ -2267,6 +2280,9 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
 	}
 
 	taskc->svc_time_iwgt = READ_ONCE(cur_svc_time_iwgt);
+
+	/* Start @p's wait clock when it enters this scheduler. */
+	taskc->last_enqueue_clk = scx_bpf_now();
 
 	/*
 	 * Overwrite the task's vtime with the current logical clock, so that

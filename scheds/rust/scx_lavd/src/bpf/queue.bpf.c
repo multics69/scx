@@ -518,6 +518,27 @@ u64 queue_peek_vtime(u64 dsq_id)
 	return vtime;
 }
 
+/*
+ * How long the head task, the one due to run next, has waited since its
+ * enqueue, or 0 if the queue is empty.
+ */
+__hidden
+u64 queue_peek_wait(u64 dsq_id, u64 now)
+{
+	struct ctq __arena *q = queue_ctq(dsq_id);
+	struct ctq_node __arena *n;
+	u64 wait = 0;
+
+	bpf_rcu_read_lock();
+	if (q && (n = ctq_peek(q))) {
+		wait = time_delta(now,
+				  READ_ONCE(queue_node_task_ctx(n)->last_enqueue_clk));
+	}
+	bpf_rcu_read_unlock();
+
+	return wait;
+}
+
 /* The head task's load, or 0 if the queue is empty. */
 u64 __attribute__((noinline)) queue_peek_load(u64 dsq_id)
 {
