@@ -22,6 +22,7 @@ bool queue_move_to_local(u64 dsq_id, s32 cpu, u64 enq_flags);
 s32 queue_nr_queued(u64 dsq_id);
 u64 queue_peek_vtime(u64 dsq_id);
 u64 queue_peek_load(u64 dsq_id);
+u64 queue_peek_wait(u64 dsq_id, u64 now);
 void queue_cpu_offline(s32 cpu);
 void queue_cpu_flushed(void);
 

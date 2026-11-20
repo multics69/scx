@@ -356,16 +356,16 @@ static u64 calc_time_slice(struct task_struct *p, task_ctx *taskc,
 	 * slices are wall-clock durations -- they represent how long the CPU
 	 * is physically occupied, regardless of CPU frequency or capacity.
 	 *
-	 * However, if there are pinned tasks waiting to run on this CPU,
-	 * we do not boost the task's time slice to avoid delaying the pinned
-	 * task that cannot be run on another CPU.
+	 * However, if the boost would delay a waiting task, such as a pinned
+	 * task that cannot run on another CPU, we do not boost the task's
+	 * time slice.
 	 *
 	 * Also, if a cgroup is under pressure (e.g., throttled), do not boost
 	 * time slice.
 	 */
 	if (!no_slice_boost && pressure <= LAVD_SCALE &&
-	    !cpuc->nr_pinned_tasks &&
-	    (taskc->avg_runtime_wall >= sys_stat.slice_wall)) {
+	    (taskc->avg_runtime_wall >= sys_stat.slice_wall) &&
+	    !boost_delays_waiter(cpuc, scx_bpf_now())) {
 		/*
 		 * When the system is not heavily loaded, so it can serve all
 		 * tasks within the targeted latency (slice_max_ns <=
@@ -969,6 +969,14 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 	task_cpu = scx_bpf_task_cpu(p);
+
+	/*
+	 * Record when @p starts waiting, for boost_delays_waiter(). A
+	 * reenqueued task has been waiting since its first enqueue.
+	 */
+	if (!(enq_flags & SCX_ENQ_REENQ)) {
+		taskc->last_enqueue_clk = scx_bpf_now();
+	}
 
 	/*
 	 * Another CPU may still place the task. A consume's insert stays
@@ -1862,10 +1870,14 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p)
 	}
 
 	/*
-	 * If there is a pinned task on this CPU, shrink its time slice.
+	 * Shrink the time slice if there is a pinned task on this CPU, or if
+	 * the boost delays a waiting task.
 	 */
-	if (cpuc->nr_pinned_tasks)
+	if (cpuc->nr_pinned_tasks ||
+	    (test_cpu_flag(cpuc, LAVD_FLAG_SLICE_BOOST) &&
+	     boost_delays_waiter(cpuc, now))) {
 		shrink_slice_at_tick(p, cpuc, now);
+	}
 }
 
 void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
@@ -2267,6 +2279,14 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
 	}
 
 	taskc->svc_time_iwgt = READ_ONCE(cur_svc_time_iwgt);
+
+	/*
+	 * Start @p's wait clock when it enters this scheduler. init_task()
+	 * may have copied the parent's last_enqueue_clk, and a task handed
+	 * over from another (sub-)scheduler can have a reenqueue
+	 * (SCX_ENQ_REENQ) as its first enqueue here, which keeps the clock.
+	 */
+	taskc->last_enqueue_clk = scx_bpf_now();
 
 	/*
 	 * Overwrite the task's vtime with the current logical clock, so that

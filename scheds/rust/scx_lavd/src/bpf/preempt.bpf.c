@@ -301,7 +301,7 @@ void shrink_slice_at_tick(struct task_struct *p, struct cpu_ctx *cpuc, u64 now)
 	 * Calculate the upper bound of running this task
 	 * since it is scheduled this time.
 	 */
-	if (pinned_slice_ns)
+	if (pinned_slice_ns && cpuc->nr_pinned_tasks)
 		ub_wall = min(pinned_slice_ns, sys_stat.slice_wall);
 	else
 		ub_wall = sys_stat.slice_wall;

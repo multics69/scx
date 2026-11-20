@@ -254,6 +254,42 @@ bool can_boost_slice(void)
 	       (sys_stat.nr_queued_task <= sys_stat.nr_active);
 }
 
+/*
+ * Whether a slice boost on @cpuc would delay a waiting task.
+ *
+ * A task that only this CPU can run waits for it however short its wait
+ * so far: a pinned task, a task in this CPU's local DSQ, or one in its
+ * per-CPU queue. A task in a compute domain's queue may be picked up by
+ * any CPU in the domain, so a brief wait there costs nothing. Only its
+ * head, the task due next, having waited longer than a regular slice
+ * shows that the domain is short of CPU. A task further back waits
+ * because of its vtime. The head may be a task that cannot run on @cpuc,
+ * which costs @cpuc a regular slice.
+ */
+__hidden
+bool boost_delays_waiter(struct cpu_ctx *cpuc, u64 now)
+{
+	u64 bound = sys_stat.slice_wall;
+
+	if (unlikely(!cpuc)) {
+		return false;
+	}
+
+	if (cpuc->nr_pinned_tasks ||
+	    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id) ||
+	    (use_per_cpu_dsq() && queue_nr_queued(cpu_to_dsq(cpuc->cpu_id)))) {
+		return true;
+	}
+
+	if (use_cpdom_dsq() &&
+	    ((queue_peek_wait(cpdom_to_dsq(cpuc->cpdom_id), now) > bound) ||
+	     (queue_peek_wait(cpdom_to_turb_dsq(cpuc->cpdom_id), now) > bound))) {
+		return true;
+	}
+
+	return false;
+}
+
 __hidden
 u16 get_nice_prio(struct task_struct __arg_trusted *p)
 {
