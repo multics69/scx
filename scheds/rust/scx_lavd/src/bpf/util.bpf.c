@@ -254,6 +254,70 @@ bool can_boost_slice(void)
 	       (sys_stat.nr_queued_task <= sys_stat.nr_active);
 }
 
+/*
+ * How long the head task of @dsq_id, the one due to run next, has waited
+ * since its enqueue, or 0 if the DSQ is empty.
+ */
+static __always_inline u64 dsq_peek_wait(u64 dsq_id, u64 now)
+{
+	struct task_struct *p;
+	task_ctx *taskc;
+	u64 wait = 0;
+
+	/*
+	 * The sys_stat timer callback is verified as part of the sleepable
+	 * ops.init(), and the DSQ iterator fallback of the peek needs an RCU
+	 * read-side section there. No caller holds one already.
+	 */
+	bpf_rcu_read_lock();
+	p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
+	if (p) {
+		taskc = (task_ctx *)__find_task_ctx(p, NULL, true);
+		if (taskc) {
+			wait = time_delta(now, READ_ONCE(taskc->last_enqueue_clk));
+		}
+	}
+	bpf_rcu_read_unlock();
+
+	return wait;
+}
+
+/*
+ * Whether a slice boost on @cpuc would delay a waiting task.
+ *
+ * A task that only this CPU can run waits for it however short its wait
+ * so far: a pinned task, a task in this CPU's local DSQ, or one in its
+ * per-CPU queue. A task in a compute domain's queue may be picked up by
+ * any CPU in the domain, so a brief wait there costs nothing. Only its
+ * head, the task due next, having waited longer than a regular slice
+ * shows that the domain is short of CPU. A task further back waits
+ * because of its vtime. The head may be a task that cannot run on @cpuc,
+ * which costs @cpuc a regular slice.
+ */
+__hidden
+bool boost_delays_waiter(struct cpu_ctx *cpuc, u64 now)
+{
+	u64 bound = sys_stat.slice_wall;
+
+	if (unlikely(!cpuc)) {
+		return false;
+	}
+
+	if (cpuc->nr_pinned_tasks ||
+	    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpuc->cpu_id) ||
+	    (use_per_cpu_dsq() && scx_bpf_dsq_nr_queued(cpu_to_dsq(cpuc->cpu_id)))) {
+		return true;
+	}
+
+	if (use_cpdom_dsq() &&
+	    ((dsq_peek_wait(cpdom_to_dsq(cpuc->cpdom_id), now) > bound) ||
+	     (dsq_peek_wait(cpdom_to_turb_dsq(cpuc->cpdom_id), now) > bound))) {
+		return true;
+	}
+
+	return false;
+}
+
 __hidden
 u16 get_nice_prio(struct task_struct __arg_trusted *p)
 {
