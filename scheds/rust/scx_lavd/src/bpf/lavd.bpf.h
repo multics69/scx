@@ -452,6 +452,7 @@ struct cpu_ctx {
 	volatile u32	max_perf_cri;	/* maximum performance criticality */
 	volatile u32	nr_sched;	/* number of schedules */
 	volatile u32	nr_preempt;
+	u32		nr_switch_ins;	/* switch-ins toward the next clock update */
 
 	/*
 	 * Per-CPU task_ctx lookup cache. Local-only writes/reads, never
@@ -1037,5 +1038,6 @@ bool consume_task(u64 cpdom_id, s32 cpu);
 
 extern u64 cur_logical_clk;
 u64 calc_when_to_run(struct task_struct *p, task_ctx *taskc);
+void advance_cur_logical_clk(struct task_struct *p, struct cpu_ctx *cpuc);
 
 #endif /* __LAVD_H */
