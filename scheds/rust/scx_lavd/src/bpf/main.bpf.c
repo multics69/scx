@@ -274,41 +274,6 @@ static volatile u64	nr_cpus_big;
  */
 static pid_t		lavd_pid;
 
-static void advance_cur_logical_clk(struct task_struct *p)
-{
-	u64 vlc, clc, ret_clc;
-	u64 nr_queued, delta, new_clk;
-	int i;
-
-	vlc = READ_ONCE(p->scx.dsq_vtime);
-	clc = READ_ONCE(cur_logical_clk);
-
-	bpf_for(i, 0, LAVD_MAX_RETRY) {
-		/*
-		 * The clock should not go backward, so do nothing.
-		 */
-		if (vlc <= clc)
-			return;
-
-		/*
-		 * Advance the clock up to the task's deadline. When overloaded,
-		 * advance the clock slower so other can jump in the run queue.
-		 */
-		nr_queued = max(sys_stat.nr_queued_task, 1);
-		delta = (vlc - clc) / nr_queued;
-		new_clk = clc + delta;
-
-		ret_clc = __sync_val_compare_and_swap(&cur_logical_clk, clc, new_clk);
-		if (ret_clc == clc) /* CAS success */
-			return;
-
-		/*
-		 * Retry with the updated clc
-		 */
-		clc = ret_clc;
-	}
-}
-
 static u64 calc_time_slice(task_ctx *taskc, struct cpu_ctx *cpuc)
 {
 	/*
@@ -1832,7 +1797,7 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	/*
 	 * Update the current logical clock.
 	 */
-	advance_cur_logical_clk(p);
+	advance_cur_logical_clk(p, cpuc);
 
 	/*
 	 * Update task statistics

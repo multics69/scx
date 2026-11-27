@@ -376,3 +376,55 @@ u64 calc_when_to_run(struct task_struct *p, task_ctx *taskc)
 	clc = READ_ONCE(cur_logical_clk) - calc_compete_window();
 	return clc + dl_delta;
 }
+
+__hidden
+void advance_cur_logical_clk(struct task_struct *p, struct cpu_ctx *cpuc)
+{
+	u64 vlc, clc, ret_clc;
+	u64 nr_queued, delta, new_clk, clk_batch;
+	int i;
+
+	vlc = READ_ONCE(p->scx.dsq_vtime);
+	clc = READ_ONCE(cur_logical_clk);
+
+	bpf_for(i, 0, LAVD_MAX_RETRY) {
+		/*
+		 * The task's deadline delta (dl_delta) was within the compete
+		 * window, so its deadline is behind the current clock. Still,
+		 * we should advance the clock to avoid worst-case starvation
+		 * of non-latency-critical tasks. We just advance the clock by
+		 * one.
+		 */
+		if (vlc <= clc) {
+			/*
+			 * Updating the global clock every time can create too
+			 * much overhead when there are hundreds of CPUs. So
+			 * each CPU counts its own switch-ins and updates the
+			 * clock in batches of half the online CPUs.
+			 */
+			clk_batch = max(READ_ONCE(nr_cpus_onln) / 2, 1);
+			if (unlikely(++cpuc->nr_switch_ins >= clk_batch)) {
+				cpuc->nr_switch_ins = 0;
+				__sync_fetch_and_add(&cur_logical_clk, clk_batch);
+			}
+			return;
+		}
+
+		/*
+		 * Advance the clock up to the task's deadline. When overloaded,
+		 * advance the clock slower so other can jump in the run queue.
+		 */
+		nr_queued = max(sys_stat.nr_queued_task, 1);
+		delta = (vlc - clc) / nr_queued;
+		new_clk = clc + delta;
+
+		ret_clc = __sync_val_compare_and_swap(&cur_logical_clk, clc, new_clk);
+		if (ret_clc == clc) /* CAS success */
+			return;
+
+		/*
+		 * Retry with the updated clc
+		 */
+		clc = ret_clc;
+	}
+}
